@@ -102,12 +102,13 @@ const (
 	Detach
 	Remove
 	On
+	Foreach
 )
 
 // kwStart and kwEnd bound the contiguous keyword Kind range for IsKeyword.
 const (
 	kwStart = Match
-	kwEnd   = On
+	kwEnd   = Foreach
 )
 
 // keywords maps the case-folded keyword text to its Kind. Identifiers are looked
@@ -153,6 +154,7 @@ var keywords = map[string]Kind{
 	"DETACH":   Detach,
 	"REMOVE":   Remove,
 	"ON":       On,
+	"FOREACH":  Foreach,
 }
 
 // IsKeyword reports whether a Kind is one of the reserved keywords.

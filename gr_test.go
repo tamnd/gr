@@ -1266,6 +1266,185 @@ func TestExecMergePersistsAcrossReopen(t *testing.T) {
 	}
 }
 
+// TestExecForeachCreatesPerElement confirms a leading FOREACH runs its body once
+// per list element: three elements create three nodes (doc 13 §10.1).
+func TestExecForeachCreatesPerElement(t *testing.T) {
+	db := openMem(t, "foreachcreate.gr")
+	defer func() { _ = db.Close() }()
+
+	sum, err := db.Exec("FOREACH (x IN [1, 2, 3] | CREATE (:Item {v: x}))", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesCreated != 3 || sum.LabelsAdded != 3 || sum.PropertiesSet != 3 {
+		t.Fatalf("summary = %+v, want 3 nodes, 3 labels, 3 props", sum)
+	}
+	rows := collectRows(t, db, "MATCH (i:Item) RETURN i.v AS v ORDER BY i.v", nil)
+	if len(rows) != 3 {
+		t.Fatalf("read back %d rows, want 3", len(rows))
+	}
+	for i, want := range []int64{1, 2, 3} {
+		if v, _ := rows[i]["v"].AsInt(); v != want {
+			t.Fatalf("row %d v = %v, want %d", i, rows[i]["v"], want)
+		}
+	}
+}
+
+// TestExecForeachUpdatesOuterNode confirms the body may reference an outer variable
+// and write through it, the loop running against the outer row (doc 13 §10.5). The
+// last element wins because every iteration sets the same property.
+func TestExecForeachUpdatesOuterNode(t *testing.T) {
+	db := openMem(t, "foreachset.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (:Person {name: 'Ada'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (a:Person) FOREACH (x IN [1, 2, 3] | SET a.age = x)", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	// The property is set once per element, so the counter accumulates (doc 13 §10.7).
+	if sum.PropertiesSet != 3 {
+		t.Fatalf("summary = %+v, want 3 property sets across the loop", sum)
+	}
+	rows := collectRows(t, db, "MATCH (p:Person) RETURN p.age AS age", nil)
+	if age, _ := rows[0]["age"].AsInt(); age != 3 {
+		t.Fatalf("age = %v, want 3 (the last element wins)", rows[0]["age"])
+	}
+}
+
+// TestExecForeachNullListRunsZeroTimes confirms a null list runs the body zero
+// times, the same null-is-empty rule UNWIND follows (doc 13 §10.8).
+func TestExecForeachNullListRunsZeroTimes(t *testing.T) {
+	db := openMem(t, "foreachnull.gr")
+	defer func() { _ = db.Close() }()
+
+	sum, err := db.Exec("FOREACH (x IN null | CREATE (:Item {v: x}))", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesCreated != 0 {
+		t.Fatalf("summary = %+v, want nothing created over a null list", sum)
+	}
+	rows := collectRows(t, db, "MATCH (i:Item) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 0 {
+		t.Fatalf("Item nodes = %d, want 0", n)
+	}
+}
+
+// TestExecForeachRunsPerInputRow confirms FOREACH runs once per input row: a MATCH
+// of two nodes feeds two rows, and the body's create runs the list over each.
+func TestExecForeachRunsPerInputRow(t *testing.T) {
+	db := openMem(t, "foreachperrow.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (:Person {name: 'A'}), (:Person {name: 'B'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (p:Person) FOREACH (x IN [1, 2] | CREATE (:Tag {v: x}))", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	// two input rows times two elements is four created nodes.
+	if sum.NodesCreated != 4 {
+		t.Fatalf("summary = %+v, want 4 nodes (2 rows x 2 elements)", sum)
+	}
+	rows := collectRows(t, db, "MATCH (t:Tag) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 4 {
+		t.Fatalf("Tag nodes = %d, want 4", n)
+	}
+}
+
+// TestExecForeachNested confirms a nested FOREACH is a Cartesian product of the two
+// loops, the inner body seeing the outer loop variable (doc 13 §10.10).
+func TestExecForeachNested(t *testing.T) {
+	db := openMem(t, "foreachnested.gr")
+	defer func() { _ = db.Close() }()
+
+	q := "FOREACH (r IN [1, 2] | FOREACH (c IN [10, 20, 30] | CREATE (:Cell {r: r, c: c})))"
+	sum, err := db.Exec(q, nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesCreated != 6 {
+		t.Fatalf("summary = %+v, want 6 nodes (2 x 3)", sum)
+	}
+	rows := collectRows(t, db, "MATCH (x:Cell) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 6 {
+		t.Fatalf("Cell nodes = %d, want 6", n)
+	}
+}
+
+// TestExecForeachBodyMergeDedup confirms a MERGE in a FOREACH body sees what an
+// earlier iteration created (read-your-writes within the batch): duplicate keys
+// collapse to one node across the loop.
+func TestExecForeachBodyMergeDedup(t *testing.T) {
+	db := openMem(t, "foreachmerge.gr")
+	defer func() { _ = db.Close() }()
+
+	sum, err := db.Exec("FOREACH (name IN ['a', 'a', 'b'] | MERGE (:Tag {name: name}))", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesCreated != 2 {
+		t.Fatalf("summary = %+v, want 2 nodes (the duplicate key collapses)", sum)
+	}
+	rows := collectRows(t, db, "MATCH (t:Tag) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 2 {
+		t.Fatalf("Tag nodes = %d, want 2", n)
+	}
+}
+
+// TestExecForeachListParam confirms the list may come from a parameter, evaluated
+// per the rules an expression follows everywhere else.
+func TestExecForeachListParam(t *testing.T) {
+	db := openMem(t, "foreachparam.gr")
+	defer func() { _ = db.Close() }()
+
+	params := map[string]value.Value{"xs": value.List(value.Int(7), value.Int(8))}
+	sum, err := db.Exec("FOREACH (x IN $xs | CREATE (:Item {v: x}))", params)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesCreated != 2 {
+		t.Fatalf("summary = %+v, want 2 nodes", sum)
+	}
+	rows := collectRows(t, db, "MATCH (i:Item) RETURN i.v AS v ORDER BY i.v", nil)
+	if len(rows) != 2 {
+		t.Fatalf("read back %d rows, want 2", len(rows))
+	}
+	if v, _ := rows[0]["v"].AsInt(); v != 7 {
+		t.Fatalf("first v = %v, want 7", rows[0]["v"])
+	}
+}
+
+// TestExecForeachPersistsAcrossReopen confirms FOREACH writes commit and survive a
+// close and reopen.
+func TestExecForeachPersistsAcrossReopen(t *testing.T) {
+	fsys := vfs.NewMem()
+	db, err := Open("foreachpersist.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("FOREACH (x IN [1, 2, 3] | CREATE (:Item {v: x}))", nil); err != nil {
+		t.Fatalf("foreach: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	db2, err := Open("foreachpersist.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db2.Close() }()
+	rows := collectRows(t, db2, "MATCH (i:Item) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 3 {
+		t.Fatalf("Item nodes = %d, want 3 after reopen", n)
+	}
+}
+
 // TestQueryRejectsWrites confirms Query refuses a write statement, directing the
 // caller to Exec, and that nothing is mutated.
 func TestQueryRejectsWrites(t *testing.T) {

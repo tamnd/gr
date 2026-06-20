@@ -159,15 +159,30 @@ type Merge struct {
 	OnMatch  []SetItem
 }
 
-func (*Match) clauseNode()  {}
-func (*With) clauseNode()   {}
-func (*Unwind) clauseNode() {}
-func (*Return) clauseNode() {}
-func (*Create) clauseNode() {}
-func (*Merge) clauseNode()  {}
-func (*Set) clauseNode()    {}
-func (*Remove) clauseNode() {}
-func (*Delete) clauseNode() {}
+// Foreach is a FOREACH clause: a write-only loop that runs its body's write
+// clauses once per element of a list (doc 13 §10). Var is the loop variable, List
+// the list expression evaluated against the input row (a null list runs the body
+// zero times), and Body the write clauses run per element. The loop variable and
+// any bindings the body introduces are scoped to the loop and do not leak to the
+// surrounding query, so the body may contain only write clauses (CREATE, MERGE,
+// SET, REMOVE, DELETE, and nested FOREACH), never MATCH or RETURN.
+type Foreach struct {
+	Pos
+	Var  string
+	List Expr
+	Body []Clause
+}
+
+func (*Match) clauseNode()   {}
+func (*With) clauseNode()    {}
+func (*Unwind) clauseNode()  {}
+func (*Return) clauseNode()  {}
+func (*Create) clauseNode()  {}
+func (*Merge) clauseNode()   {}
+func (*Set) clauseNode()     {}
+func (*Remove) clauseNode()  {}
+func (*Delete) clauseNode()  {}
+func (*Foreach) clauseNode() {}
 
 // Projection is the shared body of WITH and RETURN: the projected items (or a
 // star), DISTINCT, and the ORDER BY / SKIP / LIMIT tail.

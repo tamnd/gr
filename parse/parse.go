@@ -168,6 +168,8 @@ func (p *parser) singleQuery() (*ast.SingleQuery, error) {
 			c, err = p.deleteClause()
 		case lex.Merge:
 			c, err = p.mergeClause()
+		case lex.Foreach:
+			c, err = p.foreachClause()
 		default:
 			return nil, p.errAt(p.cur(), "expected a clause (MATCH, OPTIONAL MATCH, WITH, UNWIND, RETURN), found "+p.cur().Kind.String())
 		}
@@ -303,6 +305,71 @@ func (p *parser) mergeClause() (*ast.Merge, error) {
 		}
 	}
 	return m, nil
+}
+
+// foreachClause parses FOREACH ( var IN expr | writes ), the write-only loop.
+// The body is one or more write clauses, parsed up to the closing parenthesis;
+// a read clause inside the body is rejected, because FOREACH is write-only.
+func (p *parser) foreachClause() (*ast.Foreach, error) {
+	start := p.cur()
+	p.advance() // FOREACH
+	if _, err := p.expect(lex.Lparen); err != nil {
+		return nil, err
+	}
+	v, err := p.expect(lex.Ident)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(lex.In); err != nil {
+		return nil, err
+	}
+	list, err := p.expr()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(lex.Pipe); err != nil {
+		return nil, err
+	}
+	f := &ast.Foreach{Pos: pos(start), Var: v.Text, List: list}
+	for !p.at(lex.Rparen) {
+		if p.at(lex.EOF) {
+			return nil, p.errAt(p.cur(), "expected a write clause or ')' in FOREACH, found end of input")
+		}
+		c, err := p.foreachBodyClause()
+		if err != nil {
+			return nil, err
+		}
+		f.Body = append(f.Body, c)
+	}
+	if _, err := p.expect(lex.Rparen); err != nil {
+		return nil, err
+	}
+	if len(f.Body) == 0 {
+		return nil, p.errAt(p.cur(), "FOREACH body must contain at least one write clause")
+	}
+	return f, nil
+}
+
+// foreachBodyClause parses one clause inside a FOREACH body, accepting only the
+// write clauses (CREATE, MERGE, SET, REMOVE, DELETE/DETACH DELETE, and nested
+// FOREACH) and rejecting the read clauses, since a FOREACH body is write-only.
+func (p *parser) foreachBodyClause() (ast.Clause, error) {
+	switch p.cur().Kind {
+	case lex.Create:
+		return p.createClause()
+	case lex.Merge:
+		return p.mergeClause()
+	case lex.Set:
+		return p.setClause()
+	case lex.Remove:
+		return p.removeClause()
+	case lex.Delete, lex.Detach:
+		return p.deleteClause()
+	case lex.Foreach:
+		return p.foreachClause()
+	default:
+		return nil, p.errAt(p.cur(), "FOREACH body allows only write clauses, found "+p.cur().Kind.String())
+	}
 }
 
 // mergeSetItems parses the SET keyword and its comma-separated items, the body

@@ -194,6 +194,11 @@ func (bd *binder) single(sq *ast.SingleQuery) ([]string, error) {
 				return nil, err
 			}
 			writes = true
+		case *ast.Foreach:
+			if err := bd.foreach(cl, sc); err != nil {
+				return nil, err
+			}
+			writes = true
 		case *ast.Unwind:
 			if err := bd.unwind(cl, sc); err != nil {
 				return nil, err
@@ -494,6 +499,54 @@ func (bd *binder) merge(m *ast.Merge, sc scope) error {
 		return err
 	}
 	return bd.setItems(m.OnMatch, sc)
+}
+
+// foreach binds a FOREACH clause (doc 13 §10). The list expression is checked
+// against the outer scope (it may reference outer bindings, like p.tags). The
+// body binds in an inner scope that copies the outer scope and adds the loop
+// variable, so the body's clauses see the outer bindings and the loop variable;
+// the inner scope is discarded after, which enforces the scoping rule that the
+// loop variable and any binding the body introduces do not leak to the
+// surrounding query (doc 13 §10.3).
+func (bd *binder) foreach(f *ast.Foreach, sc scope) error {
+	if err := bd.checkExpr(f.List, sc, false); err != nil {
+		return err
+	}
+	inner := scope{}
+	for k, v := range sc {
+		inner[k] = v
+	}
+	if err := bindVar(inner, f.Var, vkValue, f.Pos); err != nil {
+		return err
+	}
+	for _, c := range f.Body {
+		if err := bd.foreachBodyClause(c, inner); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// foreachBodyClause binds one clause inside a FOREACH body, dispatching to the
+// write-clause binders. The parser already restricts the body to write clauses,
+// so the default arm is a defensive guard.
+func (bd *binder) foreachBodyClause(c ast.Clause, sc scope) error {
+	switch cl := c.(type) {
+	case *ast.Create:
+		return bd.create(cl, sc)
+	case *ast.Merge:
+		return bd.merge(cl, sc)
+	case *ast.Set:
+		return bd.set(cl, sc)
+	case *ast.Remove:
+		return bd.remove(cl, sc)
+	case *ast.Delete:
+		return bd.deleteClause(cl, sc)
+	case *ast.Foreach:
+		return bd.foreach(cl, sc)
+	default:
+		return &Error{"FOREACH body allows only write clauses", 0, 0}
+	}
 }
 
 // remove binds a REMOVE clause: every item's target must already be bound, a

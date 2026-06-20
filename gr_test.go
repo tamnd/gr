@@ -339,6 +339,47 @@ func TestQueryParams(t *testing.T) {
 	}
 }
 
+// TestQueryPlanCache asserts a repeated query shape compiles once: the second run
+// of the same text hits the plan cache, so the cache holds a single entry, and a
+// different text adds a second.
+func TestQueryPlanCache(t *testing.T) {
+	fsys := vfs.NewMem()
+	db, err := Open("pc.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	run := func(q string) {
+		res, err := db.Query(q, nil)
+		if err != nil {
+			t.Fatalf("query %q: %v", q, err)
+		}
+		for {
+			if _, ok, err := res.Next(); err != nil {
+				t.Fatal(err)
+			} else if !ok {
+				break
+			}
+		}
+		_ = res.Close()
+	}
+
+	run("RETURN 1 AS n")
+	run("RETURN 1 AS n") // same shape: a cache hit, no new entry
+	if got := db.cache.Len(); got != 1 {
+		t.Fatalf("after two runs of one shape, cache len = %d, want 1", got)
+	}
+	run("  RETURN 1 AS n  ") // only outer whitespace differs: still the same shape
+	if got := db.cache.Len(); got != 1 {
+		t.Fatalf("outer whitespace should normalize to the same key, len = %d, want 1", got)
+	}
+	run("RETURN 2 AS n") // a different shape: a new entry
+	if got := db.cache.Len(); got != 2 {
+		t.Fatalf("after a second distinct shape, cache len = %d, want 2", got)
+	}
+}
+
 // TestQueryOnClosed reports the closed-database error rather than panicking.
 func TestQueryOnClosed(t *testing.T) {
 	fsys := vfs.NewMem()

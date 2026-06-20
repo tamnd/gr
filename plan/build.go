@@ -54,6 +54,10 @@ func (bd *builder) single(sq *ast.SingleQuery) Op {
 			cur = bd.match(cl, cur, bound)
 		case *ast.Create:
 			cur = bd.create(cl, cur, bound)
+		case *ast.Set:
+			cur = bd.set(cl, cur)
+		case *ast.Remove:
+			cur = bd.remove(cl, cur)
 		case *ast.Unwind:
 			cur = &Unwind{Input: cur, Expr: cl.Expr, Var: cl.Var}
 			bound[cl.Var] = true
@@ -157,6 +161,65 @@ func (bd *builder) lowerCreatePattern(pp *ast.PathPattern, cr *Create, bound map
 		bound[rel] = true
 		prev = to
 	}
+}
+
+// set lowers a SET clause into a Set operator over the running tree, resolving
+// each item's property key or labels through the bound query.
+func (bd *builder) set(s *ast.Set, cur Op) Op {
+	if cur == nil {
+		cur = &Unit{}
+	}
+	op := &Set{Input: cur}
+	for _, it := range s.Items {
+		switch it.Op {
+		case ast.SetProperty:
+			op.Items = append(op.Items, SetItem{
+				Kind: SetItemProp,
+				Var:  it.Var,
+				Key:  bd.b.PropKey(it.Key),
+				Expr: it.Value,
+			})
+		case ast.SetLabels:
+			op.Items = append(op.Items, SetItem{
+				Kind:   SetItemLabels,
+				Var:    it.Var,
+				Labels: bd.labelRefs(it.Labels),
+			})
+		}
+	}
+	return op
+}
+
+// remove lowers a REMOVE clause into a Remove operator over the running tree.
+func (bd *builder) remove(r *ast.Remove, cur Op) Op {
+	if cur == nil {
+		cur = &Unit{}
+	}
+	op := &Remove{Input: cur}
+	for _, it := range r.Items {
+		if len(it.Labels) > 0 {
+			op.Items = append(op.Items, RemoveItem{
+				Var:    it.Var,
+				Labels: bd.labelRefs(it.Labels),
+			})
+		} else {
+			op.Items = append(op.Items, RemoveItem{
+				Var: it.Var,
+				Key: bd.b.PropKey(it.Key),
+			})
+		}
+	}
+	return op
+}
+
+// labelRefs resolves a SET/REMOVE label-name list to its NameRefs through the
+// bound query's label map.
+func (bd *builder) labelRefs(names []string) []bind.NameRef {
+	out := make([]bind.NameRef, len(names))
+	for i, n := range names {
+		out[i] = bd.b.Label(n)
+	}
+	return out
 }
 
 // addCreateNode appends a node creation unless the variable is already bound, in

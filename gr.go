@@ -239,12 +239,40 @@ func drain(op plan.Op, ctx *exec.Ctx) error {
 func (db *DB) internWriteNames(q *ast.Query) error {
 	for _, sq := range singleQueries(q) {
 		for _, c := range sq.Clauses {
-			cl, ok := c.(*ast.Create)
-			if !ok {
-				continue
+			switch cl := c.(type) {
+			case *ast.Create:
+				for _, pp := range cl.Patterns {
+					if err := db.internPatternNames(pp); err != nil {
+						return err
+					}
+				}
+			case *ast.Set:
+				if err := db.internSetNames(cl); err != nil {
+					return err
+				}
 			}
-			for _, pp := range cl.Patterns {
-				if err := db.internPatternNames(pp); err != nil {
+			// REMOVE interns nothing: an unknown label or key names no stored
+			// element, so it stays unresolved and removes nothing rather than
+			// being created (doc 13 §7).
+		}
+	}
+	return nil
+}
+
+// internSetNames interns the names a SET clause introduces: the property key of
+// each single-property assignment and every label of each label addition. The
+// map forms (SET n = m, SET n += m) introduce no static name to intern; they are
+// deferred at bind, so they cannot reach here.
+func (db *DB) internSetNames(s *ast.Set) error {
+	for _, it := range s.Items {
+		switch it.Op {
+		case ast.SetProperty:
+			if err := db.internName(catalog.KindPropKey, it.Key); err != nil {
+				return err
+			}
+		case ast.SetLabels:
+			for _, l := range it.Labels {
+				if err := db.internName(catalog.KindLabel, l); err != nil {
 					return err
 				}
 			}
@@ -307,7 +335,8 @@ func (db *DB) internName(kind catalog.Kind, name string) error {
 func queryHasWrites(q *ast.Query) bool {
 	for _, sq := range singleQueries(q) {
 		for _, c := range sq.Clauses {
-			if _, ok := c.(*ast.Create); ok {
+			switch c.(type) {
+			case *ast.Create, *ast.Set, *ast.Remove:
 				return true
 			}
 		}

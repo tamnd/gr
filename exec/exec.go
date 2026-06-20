@@ -175,6 +175,18 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 			return nil, nil, err
 		}
 		return &createOp{spec: x, input: input}, nil, nil
+	case *plan.Set:
+		input, err := compile(x.Input)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &setOp{spec: x, input: input}, nil, nil
+	case *plan.Remove:
+		input, err := compile(x.Input)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &removeOp{spec: x, input: input}, nil, nil
 	case *plan.Argument:
 		return &argumentOp{vars: x.Vars}, nil, nil
 	case *plan.NodeScan:

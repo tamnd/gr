@@ -135,6 +135,210 @@ func (o *createOp) setProps(props []plan.PropSet, row eval.Row, set func(engine.
 
 func (o *createOp) close() error { return o.input.close() }
 
+// setOp executes a SET clause (doc 13 §6). For each input row it applies every
+// update item to the bound element in order and passes the row on unchanged (SET
+// binds nothing new). A property assignment to a non-null value always counts a
+// property set, even when the value is unchanged (doc 13 §6.22); a property
+// assigned null is removed and counts only when the property was present, the
+// same rule REMOVE follows. A label is added only when the node does not already
+// carry it, so only net additions count (doc 13 §6.7).
+type setOp struct {
+	spec  *plan.Set
+	input operator
+	ctx   *Ctx
+}
+
+func (o *setOp) open(ctx *Ctx) error {
+	o.ctx = ctx
+	return o.input.open(ctx)
+}
+
+func (o *setOp) next() (eval.Row, bool, error) {
+	in, ok, err := o.input.next()
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	for _, it := range o.spec.Items {
+		switch it.Kind {
+		case plan.SetItemProp:
+			if err := o.setProp(it, in); err != nil {
+				return nil, false, err
+			}
+		case plan.SetItemLabels:
+			if err := o.setLabels(it, in); err != nil {
+				return nil, false, err
+			}
+		}
+	}
+	return in, true, nil
+}
+
+func (o *setOp) setProp(it plan.SetItem, row eval.Row) error {
+	v, err := eval.Eval(it.Expr, o.ctx.env(row))
+	if err != nil {
+		return err
+	}
+	if v.IsNull() {
+		return removeElementProp(o.ctx, row[it.Var], it.Key)
+	}
+	if !it.Key.Known {
+		return fmt.Errorf("exec: SET property key is unresolved")
+	}
+	return setElementProp(o.ctx, row[it.Var], it.Key.Token, v)
+}
+
+func (o *setOp) setLabels(it plan.SetItem, row eval.Row) error {
+	id, ok := row[it.Var].AsNode()
+	if !ok {
+		return fmt.Errorf("exec: SET label target %q is not a node", it.Var)
+	}
+	for _, l := range it.Labels {
+		if !l.Known {
+			return fmt.Errorf("exec: SET label is unresolved")
+		}
+		has, err := o.ctx.Tx.HasLabel(engine.NodeID(id), l.Token)
+		if err != nil {
+			return err
+		}
+		if has {
+			continue
+		}
+		if err := o.ctx.Tx.AddLabel(engine.NodeID(id), l.Token); err != nil {
+			return err
+		}
+		o.ctx.Effects.LabelsAdded++
+	}
+	return nil
+}
+
+func (o *setOp) close() error { return o.input.close() }
+
+// removeOp executes a REMOVE clause (doc 13 §7). For each input row it removes
+// every item's property or labels from the bound element and passes the row on
+// unchanged. A property removal counts only when the property was present (doc 13
+// §7.11), folded into PropertiesSet as Neo4j does; a label removal counts only
+// when the node carried it (doc 13 §7.3). An unknown label or key names nothing
+// in the catalog, so it is a no-op that counts nothing.
+type removeOp struct {
+	spec  *plan.Remove
+	input operator
+	ctx   *Ctx
+}
+
+func (o *removeOp) open(ctx *Ctx) error {
+	o.ctx = ctx
+	return o.input.open(ctx)
+}
+
+func (o *removeOp) next() (eval.Row, bool, error) {
+	in, ok, err := o.input.next()
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	for _, it := range o.spec.Items {
+		if len(it.Labels) > 0 {
+			if err := o.removeLabels(it, in); err != nil {
+				return nil, false, err
+			}
+			continue
+		}
+		if err := removeElementProp(o.ctx, in[it.Var], it.Key); err != nil {
+			return nil, false, err
+		}
+	}
+	return in, true, nil
+}
+
+func (o *removeOp) removeLabels(it plan.RemoveItem, row eval.Row) error {
+	id, ok := row[it.Var].AsNode()
+	if !ok {
+		return fmt.Errorf("exec: REMOVE label target %q is not a node", it.Var)
+	}
+	for _, l := range it.Labels {
+		if !l.Known {
+			continue // an unknown label names no node: nothing to remove
+		}
+		has, err := o.ctx.Tx.HasLabel(engine.NodeID(id), l.Token)
+		if err != nil {
+			return err
+		}
+		if !has {
+			continue
+		}
+		if err := o.ctx.Tx.RemoveLabel(engine.NodeID(id), l.Token); err != nil {
+			return err
+		}
+		o.ctx.Effects.LabelsRemoved++
+	}
+	return nil
+}
+
+func (o *removeOp) close() error { return o.input.close() }
+
+// setElementProp sets a non-null property on the node or relationship bound to an
+// element value and counts it. SET to the same value still counts (doc 13 §6.22).
+func setElementProp(ctx *Ctx, elem value.Value, key engine.Token, v value.Value) error {
+	switch {
+	case isNode(elem):
+		id, _ := elem.AsNode()
+		if err := ctx.Tx.SetNodeProperty(engine.NodeID(id), key, v); err != nil {
+			return err
+		}
+	case isRel(elem):
+		id, _ := elem.AsRel()
+		if err := ctx.Tx.SetRelProperty(engine.RelID(id), key, v); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("exec: SET property target is not a node or relationship")
+	}
+	ctx.Effects.PropertiesSet++
+	return nil
+}
+
+// removeElementProp removes a property from the node or relationship bound to an
+// element value, counting only when the property was actually present (doc 13
+// §7.11). An unknown key names no stored property, so it is a counted-as-nothing
+// no-op. Removal is a SET to null through the same SPI.
+func removeElementProp(ctx *Ctx, elem value.Value, key bind.NameRef) error {
+	if !key.Known {
+		return nil
+	}
+	switch {
+	case isNode(elem):
+		id, _ := elem.AsNode()
+		cur, err := ctx.Tx.NodeProperty(engine.NodeID(id), key.Token)
+		if err != nil {
+			return err
+		}
+		if cur.IsNull() {
+			return nil
+		}
+		if err := ctx.Tx.SetNodeProperty(engine.NodeID(id), key.Token, value.Null); err != nil {
+			return err
+		}
+	case isRel(elem):
+		id, _ := elem.AsRel()
+		cur, err := ctx.Tx.RelProperty(engine.RelID(id), key.Token)
+		if err != nil {
+			return err
+		}
+		if cur.IsNull() {
+			return nil
+		}
+		if err := ctx.Tx.SetRelProperty(engine.RelID(id), key.Token, value.Null); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("exec: REMOVE property target is not a node or relationship")
+	}
+	ctx.Effects.PropertiesSet++
+	return nil
+}
+
+func isNode(v value.Value) bool { _, ok := v.AsNode(); return ok }
+func isRel(v value.Value) bool  { _, ok := v.AsRel(); return ok }
+
 // knownTokens returns the resolved tokens of a name set, skipping any that are
 // unresolved. CREATE interns its names before binding, so in practice all are
 // known; the guard keeps a stray sentinel from creating a zero (wildcard) token.

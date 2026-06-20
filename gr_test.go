@@ -743,20 +743,150 @@ func TestExecSetRelProperty(t *testing.T) {
 	}
 }
 
-// TestExecSetMapDeferred confirms the map forms of SET are rejected for now,
-// pointing at the later M3 milestone rather than silently misbehaving.
-func TestExecSetMapDeferred(t *testing.T) {
-	db := openMem(t, "setmap.gr")
+// TestExecSetMapMerge confirms SET n += map sets the map's keys, leaves other
+// properties intact, and interns a new key inside the write transaction (doc 13
+// §6.4). It counts one property-set per map key.
+func TestExecSetMapMerge(t *testing.T) {
+	db := openMem(t, "setmerge.gr")
 	defer func() { _ = db.Close() }()
 
-	if _, err := db.Exec("CREATE (a:Person)", nil); err != nil {
+	if _, err := db.Exec("CREATE (a:Person {name: 'Ada', age: 30})", nil); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if _, err := db.Exec("MATCH (a:Person) SET a += {age: 1}", nil); err == nil {
-		t.Fatal("map-merge SET should be rejected for now")
+	// city is a brand-new key, interned during the write; age is overwritten.
+	sum, err := db.Exec("MATCH (a:Person) SET a += {age: 36, city: 'London'}", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
 	}
-	if _, err := db.Exec("MATCH (a:Person) SET a = {age: 1}", nil); err == nil {
-		t.Fatal("map-replace SET should be rejected for now")
+	if sum.PropertiesSet != 2 {
+		t.Fatalf("PropertiesSet = %d, want 2", sum.PropertiesSet)
+	}
+	rows := collectRows(t, db, "MATCH (a:Person) RETURN a.name AS name, a.age AS age, a.city AS city", nil)
+	if name, _ := rows[0]["name"].AsString(); name != "Ada" {
+		t.Fatalf("name = %q, want Ada (untouched by merge)", name)
+	}
+	if age, _ := rows[0]["age"].AsInt(); age != 36 {
+		t.Fatalf("age = %d, want 36", age)
+	}
+	if city, _ := rows[0]["city"].AsString(); city != "London" {
+		t.Fatalf("city = %q, want London", city)
+	}
+}
+
+// TestExecSetMapMergeNullRemoves confirms a key set to null in a merge map
+// removes that property, leaving the rest (doc 13 §6.4).
+func TestExecSetMapMergeNullRemoves(t *testing.T) {
+	db := openMem(t, "setmergenull.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'Ada', age: 30})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := db.Exec("MATCH (a:Person) SET a += {age: null}", nil); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	rows := collectRows(t, db, "MATCH (a:Person) RETURN a.name AS name, a.age AS age", nil)
+	if name, _ := rows[0]["name"].AsString(); name != "Ada" {
+		t.Fatalf("name = %q, want Ada (untouched)", name)
+	}
+	if !rows[0]["age"].IsNull() {
+		t.Fatalf("age = %v, want null after merge removal", rows[0]["age"])
+	}
+}
+
+// TestExecSetMapReplace confirms SET n = map drops every property not in the map
+// and sets the map's properties, so the element ends with exactly the map (doc 13
+// §6.5).
+func TestExecSetMapReplace(t *testing.T) {
+	db := openMem(t, "setreplace.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'Ada', age: 30, city: 'Paris'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := db.Exec("MATCH (a:Person) SET a = {name: 'Grace'}", nil); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	rows := collectRows(t, db, "MATCH (a:Person) RETURN a.name AS name, a.age AS age, a.city AS city", nil)
+	if name, _ := rows[0]["name"].AsString(); name != "Grace" {
+		t.Fatalf("name = %q, want Grace", name)
+	}
+	if !rows[0]["age"].IsNull() {
+		t.Fatalf("age = %v, want null (dropped by replace)", rows[0]["age"])
+	}
+	if !rows[0]["city"].IsNull() {
+		t.Fatalf("city = %v, want null (dropped by replace)", rows[0]["city"])
+	}
+}
+
+// TestExecSetMapReplaceNull confirms SET n = null clears every property (doc 13
+// §6.5).
+func TestExecSetMapReplaceNull(t *testing.T) {
+	db := openMem(t, "setreplacenull.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'Ada', age: 30})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := db.Exec("MATCH (a:Person) SET a = null", nil); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	rows := collectRows(t, db, "MATCH (a:Person) RETURN a.name AS name, a.age AS age", nil)
+	if !rows[0]["name"].IsNull() || !rows[0]["age"].IsNull() {
+		t.Fatalf("properties = %v/%v, want all null", rows[0]["name"], rows[0]["age"])
+	}
+}
+
+// TestExecSetElementCopy confirms SET a = b copies b's whole property set onto a,
+// replacing a's own (doc 13 §6.15).
+func TestExecSetElementCopy(t *testing.T) {
+	db := openMem(t, "setcopy.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (:Person {name: 'src', age: 40, city: 'Rome'})", nil); err != nil {
+		t.Fatalf("seed src: %v", err)
+	}
+	if _, err := db.Exec("CREATE (:Robot {name: 'dst', serial: 7})", nil); err != nil {
+		t.Fatalf("seed dst: %v", err)
+	}
+	if _, err := db.Exec("MATCH (a:Robot), (b:Person) SET a = b", nil); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	rows := collectRows(t, db, "MATCH (a:Robot) RETURN a.name AS name, a.age AS age, a.city AS city, a.serial AS serial", nil)
+	if name, _ := rows[0]["name"].AsString(); name != "src" {
+		t.Fatalf("name = %q, want src (copied from b)", name)
+	}
+	if age, _ := rows[0]["age"].AsInt(); age != 40 {
+		t.Fatalf("age = %d, want 40 (copied from b)", age)
+	}
+	if city, _ := rows[0]["city"].AsString(); city != "Rome" {
+		t.Fatalf("city = %q, want Rome (copied from b)", city)
+	}
+	if !rows[0]["serial"].IsNull() {
+		t.Fatalf("serial = %v, want null (a's own property dropped by replace)", rows[0]["serial"])
+	}
+}
+
+// TestExecSetMapMergeParam confirms a map passed as a parameter works the same as
+// a map literal, interning its keys during the write.
+func TestExecSetMapMergeParam(t *testing.T) {
+	db := openMem(t, "setmergeparam.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'Ada'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	params := map[string]value.Value{
+		"m": value.Map(map[string]value.Value{
+			"role": value.String("admin"),
+		}),
+	}
+	if _, err := db.Exec("MATCH (a:Person) SET a += $m", params); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	rows := collectRows(t, db, "MATCH (a:Person) RETURN a.role AS role", nil)
+	if role, _ := rows[0]["role"].AsString(); role != "admin" {
+		t.Fatalf("role = %q, want admin", role)
 	}
 }
 

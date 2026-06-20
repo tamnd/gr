@@ -286,6 +286,15 @@ func TestBuildSetMultiple(t *testing.T) {
 	eq(t, "raw", String(Build(b)), want)
 }
 
+func TestBuildSetMapForms(t *testing.T) {
+	b := bound(t, "MATCH (a) SET a += $m, a = $n")
+	want := `Set a += $m, a = $n
+  NodeScan a
+`
+	eq(t, "raw", String(Build(b)), want)
+	eq(t, "normalized", String(Plan(b)), want)
+}
+
 func TestBuildRemove(t *testing.T) {
 	b := bound(t, "MATCH (a:Person) REMOVE a.name, a:Movie")
 	want := `Remove a.#1, a:#2

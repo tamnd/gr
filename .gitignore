@@ -1,0 +1,14 @@
+# Build output
+/gr
+/dist/
+*.test
+*.out
+
+# Database files produced by examples or local runs
+*.gr
+*.gr-wal
+*.gr-shm
+
+# Editor and OS noise
+.DS_Store
+*.swp

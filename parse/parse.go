@@ -164,7 +164,9 @@ func (p *parser) singleQuery() (*ast.SingleQuery, error) {
 			c, err = p.setClause()
 		case lex.Remove:
 			c, err = p.removeClause()
-		case lex.Merge, lex.Delete, lex.Detach:
+		case lex.Delete, lex.Detach:
+			c, err = p.deleteClause()
+		case lex.Merge:
 			return nil, p.errAt(p.cur(), "this write clause arrives in a later M3 milestone")
 		default:
 			return nil, p.errAt(p.cur(), "expected a clause (MATCH, OPTIONAL MATCH, WITH, UNWIND, RETURN), found "+p.cur().Kind.String())
@@ -339,6 +341,30 @@ func (p *parser) setItem() (ast.SetItem, error) {
 		return ast.SetItem{}, p.errAt(p.cur(), "expected '.', ':', '=' or '+=' after a SET variable, found "+p.cur().Kind.String())
 	}
 	return it, nil
+}
+
+// deleteClause parses an optional DETACH, then DELETE, then one or more
+// comma-separated expressions naming the elements to delete.
+func (p *parser) deleteClause() (*ast.Delete, error) {
+	start := p.cur()
+	d := &ast.Delete{Pos: pos(start)}
+	if p.accept(lex.Detach) {
+		d.Detach = true
+	}
+	if _, err := p.expect(lex.Delete); err != nil {
+		return nil, err
+	}
+	for {
+		e, err := p.expr()
+		if err != nil {
+			return nil, err
+		}
+		d.Targets = append(d.Targets, e)
+		if !p.accept(lex.Comma) {
+			break
+		}
+	}
+	return d, nil
 }
 
 // removeClause parses REMOVE followed by one or more comma-separated targets,

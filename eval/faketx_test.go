@@ -54,6 +54,7 @@ func (f *fakeTx) RelPropertyKeys(id engine.RelID) ([]engine.Token, error) {
 }
 
 func (f *fakeTx) NodeExists(engine.NodeID) (bool, error) { return false, nil }
+func (f *fakeTx) RelExists(engine.RelID) (bool, error)   { return false, nil }
 func (f *fakeTx) NodeLabels(id engine.NodeID) ([]engine.Token, error) {
 	return f.nodeLabels[uint64(id)], nil
 }

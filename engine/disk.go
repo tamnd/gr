@@ -397,6 +397,15 @@ func (t *diskTx) NodeExists(id NodeID) (bool, error) {
 	return t.nodeLive(pos), nil
 }
 
+func (t *diskTx) RelExists(id RelID) (bool, error) {
+	defer t.rguard()()
+	pos, ok := t.e.ids.Pos(uint64(id))
+	if !ok {
+		return false, nil
+	}
+	return t.relLive(pos), nil
+}
+
 func (t *diskTx) NodeLabels(id NodeID) ([]Token, error) {
 	defer t.rguard()()
 	pos, err := t.nodePos(id)

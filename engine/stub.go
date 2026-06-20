@@ -82,6 +82,13 @@ func (t *memTx) NodeExists(id NodeID) (bool, error) {
 	return ok, nil
 }
 
+func (t *memTx) RelExists(id RelID) (bool, error) {
+	t.e.mu.Lock()
+	defer t.e.mu.Unlock()
+	_, ok := t.e.rels[id]
+	return ok, nil
+}
+
 func (t *memTx) NodeLabels(id NodeID) ([]Token, error) {
 	t.e.mu.Lock()
 	defer t.e.mu.Unlock()

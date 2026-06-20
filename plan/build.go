@@ -58,6 +58,8 @@ func (bd *builder) single(sq *ast.SingleQuery) Op {
 			cur = bd.set(cl, cur)
 		case *ast.Remove:
 			cur = bd.remove(cl, cur)
+		case *ast.Delete:
+			cur = bd.deleteClause(cl, cur)
 		case *ast.Unwind:
 			cur = &Unwind{Input: cur, Expr: cl.Expr, Var: cl.Var}
 			bound[cl.Var] = true
@@ -210,6 +212,16 @@ func (bd *builder) remove(r *ast.Remove, cur Op) Op {
 		}
 	}
 	return op
+}
+
+// deleteClause lowers a DELETE or DETACH DELETE into a Delete operator over the
+// running tree. It carries the target expressions through verbatim; the executor
+// evaluates each per row.
+func (bd *builder) deleteClause(d *ast.Delete, cur Op) Op {
+	if cur == nil {
+		cur = &Unit{}
+	}
+	return &Delete{Input: cur, Detach: d.Detach, Targets: d.Targets}
 }
 
 // labelRefs resolves a SET/REMOVE label-name list to its NameRefs through the

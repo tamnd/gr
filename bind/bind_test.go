@@ -259,3 +259,22 @@ func TestBindSetRemove(t *testing.T) {
 		t.Fatal("map-replace SET should be rejected for now")
 	}
 }
+
+func TestBindDelete(t *testing.T) {
+	// DELETE and DETACH DELETE bind their targets against bound variables.
+	mustBind(t, "MATCH (a) DELETE a")
+	mustBind(t, "MATCH (a) DETACH DELETE a")
+	mustBind(t, "MATCH (a)-[r:KNOWS]->(b) DELETE r")
+	mustBind(t, "MATCH (a)-[r:KNOWS]->(b) DELETE r, a, b")
+	// The targeted variable must be in scope.
+	if _, err := bindStr(t, "DELETE a", false); err == nil {
+		t.Fatal("DELETE of an unbound variable should be rejected")
+	}
+	if _, err := bindStr(t, "MATCH (a) DELETE b", false); err == nil {
+		t.Fatal("DELETE of an unbound variable should be rejected")
+	}
+	// A bare-variable target must be a node or relationship.
+	if _, err := bindStr(t, "MATCH (a) WITH a.name AS n DELETE n", false); err == nil {
+		t.Fatal("DELETE of a value should be rejected")
+	}
+}

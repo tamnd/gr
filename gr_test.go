@@ -760,6 +760,164 @@ func TestExecSetMapDeferred(t *testing.T) {
 	}
 }
 
+// TestExecDeleteNode deletes an unattached node and confirms the count and that
+// it is gone.
+func TestExecDeleteNode(t *testing.T) {
+	db := openMem(t, "delnode.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'Ada'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (a:Person) DELETE a", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesDeleted != 1 {
+		t.Fatalf("NodesDeleted = %d, want 1", sum.NodesDeleted)
+	}
+	rows := collectRows(t, db, "MATCH (a:Person) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 0 {
+		t.Fatalf("Person nodes = %d, want 0 after delete", n)
+	}
+}
+
+// TestExecDeleteRelationship deletes a relationship and confirms both endpoints
+// survive while the edge is gone.
+func TestExecDeleteRelationship(t *testing.T) {
+	db := openMem(t, "delrel.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'A'})-[:KNOWS]->(b:Person {name: 'B'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (:Person)-[r:KNOWS]->(:Person) DELETE r", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.RelationshipsDeleted != 1 {
+		t.Fatalf("RelationshipsDeleted = %d, want 1", sum.RelationshipsDeleted)
+	}
+	rows := collectRows(t, db, "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 0 {
+		t.Fatalf("KNOWS edges = %d, want 0 after delete", n)
+	}
+	rows = collectRows(t, db, "MATCH (p:Person) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 2 {
+		t.Fatalf("Person nodes = %d, want 2 (endpoints survive)", n)
+	}
+}
+
+// TestExecDeleteAttachedNodeFails confirms a plain DELETE of a node that still
+// has relationships fails the no-dangling check and leaves the graph untouched
+// (doc 13 §9.4).
+func TestExecDeleteAttachedNodeFails(t *testing.T) {
+	db := openMem(t, "delattached.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'A'})-[:KNOWS]->(b:Person {name: 'B'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := db.Exec("MATCH (a:Person)-[:KNOWS]->(:Person) DELETE a", nil); err == nil {
+		t.Fatal("plain DELETE of an attached node should fail")
+	}
+	// The aborted write must leave both nodes and the edge in place.
+	rows := collectRows(t, db, "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 1 {
+		t.Fatalf("KNOWS edges = %d, want 1 (write aborted)", n)
+	}
+}
+
+// TestExecDetachDelete confirms DETACH DELETE removes a node and its incident
+// relationship, leaving the neighbor intact but disconnected (doc 13 §9.5).
+func TestExecDetachDelete(t *testing.T) {
+	db := openMem(t, "detach.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'A'})-[:KNOWS]->(b:Person {name: 'B'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (a:Person {name: 'A'}) DETACH DELETE a", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesDeleted != 1 || sum.RelationshipsDeleted != 1 {
+		t.Fatalf("summary = %+v, want 1 node and 1 rel deleted", sum)
+	}
+	rows := collectRows(t, db, "MATCH (p:Person) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 1 {
+		t.Fatalf("Person nodes = %d, want 1 (neighbor survives)", n)
+	}
+	rows = collectRows(t, db, "MATCH ()-[r]->() RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 0 {
+		t.Fatalf("edges = %d, want 0 after detach delete", n)
+	}
+}
+
+// TestExecDeleteRelThenNode confirms a comma DELETE listing a relationship and
+// its endpoints deletes the relationship before the nodes, so no-dangling holds
+// (doc 13 §9.12).
+func TestExecDeleteRelThenNode(t *testing.T) {
+	db := openMem(t, "delrelnode.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'A'})-[:KNOWS]->(b:Person {name: 'B'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (a:Person)-[r:KNOWS]->(b:Person) DELETE r, a, b", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesDeleted != 2 || sum.RelationshipsDeleted != 1 {
+		t.Fatalf("summary = %+v, want 2 nodes and 1 rel deleted", sum)
+	}
+	rows := collectRows(t, db, "MATCH (p:Person) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 0 {
+		t.Fatalf("Person nodes = %d, want 0 after delete", n)
+	}
+}
+
+// TestExecDeleteIdempotent deletes one edge reached from both sides by an
+// undirected match; the second visit finds it already gone and counts nothing
+// (doc 13 §9.6).
+func TestExecDeleteIdempotent(t *testing.T) {
+	db := openMem(t, "delidem.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'A'})-[:KNOWS]->(b:Person {name: 'B'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (a:Person)-[r:KNOWS]-(b:Person) DELETE r", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.RelationshipsDeleted != 1 {
+		t.Fatalf("RelationshipsDeleted = %d, want 1 (idempotent)", sum.RelationshipsDeleted)
+	}
+}
+
+// TestExecDeleteNullNoop confirms deleting a null target deletes nothing and
+// raises no error.
+func TestExecDeleteNullNoop(t *testing.T) {
+	db := openMem(t, "delnull.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'A'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (a:Person) OPTIONAL MATCH (a)-[r:KNOWS]->() DELETE r", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.RelationshipsDeleted != 0 {
+		t.Fatalf("RelationshipsDeleted = %d, want 0 (null target)", sum.RelationshipsDeleted)
+	}
+	rows := collectRows(t, db, "MATCH (p:Person) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 1 {
+		t.Fatalf("Person nodes = %d, want 1 (node untouched)", n)
+	}
+}
+
 // TestQueryRejectsWrites confirms Query refuses a write statement, directing the
 // caller to Exec, and that nothing is mutated.
 func TestQueryRejectsWrites(t *testing.T) {

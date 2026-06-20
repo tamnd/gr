@@ -72,6 +72,16 @@ func sexpr(n any) string {
 			}
 		}
 		return "(remove " + strings.Join(parts, " ") + ")"
+	case *ast.Delete:
+		parts := make([]string, len(x.Targets))
+		for i, t := range x.Targets {
+			parts[i] = sexpr(t)
+		}
+		kw := "delete"
+		if x.Detach {
+			kw = "detach-delete"
+		}
+		return "(" + kw + " " + strings.Join(parts, " ") + ")"
 	case *ast.PathPattern:
 		s := "(path"
 		if x.Var != "" {
@@ -425,6 +435,18 @@ func TestParseSetRemove(t *testing.T) {
 		`(query (match (path (node a))) (remove a:Person:Admin a.x))`)
 }
 
+// TestParseDelete covers DELETE and DETACH DELETE with one or more targets.
+func TestParseDelete(t *testing.T) {
+	check(t, "MATCH (a) DELETE a",
+		`(query (match (path (node a))) (delete a))`)
+	check(t, "MATCH (a)-[r]->(b) DELETE r",
+		`(query (match (path (node a) (rel -> r) (node b))) (delete r))`)
+	check(t, "MATCH (a) DETACH DELETE a",
+		`(query (match (path (node a))) (detach-delete a))`)
+	check(t, "MATCH (a)-[r]->(b) DELETE r, a, b",
+		`(query (match (path (node a) (rel -> r) (node b))) (delete r a b))`)
+}
+
 // TestParseErrors confirms malformed queries are rejected with a parse.Error.
 func TestParseErrors(t *testing.T) {
 	bad := []string{
@@ -434,6 +456,8 @@ func TestParseErrors(t *testing.T) {
 		"MATCH (a) WHERE RETURN a",      // missing predicate
 		"MATCH (a) SET a RETURN a",      // SET target with no .key/:Label/=
 		"MATCH (a) REMOVE a RETURN a",   // REMOVE target with no .key/:Label
+		"MATCH (a) DETACH a",            // DETACH not followed by DELETE
+		"MATCH (a) DELETE",              // DELETE with no target
 		"MATCH (a)<-[:T]->(b) RETURN b", // both directions
 		"RETURN 1 +",                    // dangling operator
 		"FOO bar",                       // not a clause

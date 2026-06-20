@@ -275,6 +275,170 @@ func (o *removeOp) removeLabels(it plan.RemoveItem, row eval.Row) error {
 
 func (o *removeOp) close() error { return o.input.close() }
 
+// deleteOp executes a DELETE or DETACH DELETE clause (doc 13 §9). Within one row
+// it removes relationships before nodes so a plain DELETE that lists both an edge
+// and its endpoint does not trip the no-dangling check (doc 13 §9.12). A target
+// that evaluates to null deletes nothing. Deleting an element already gone is a
+// no-op and is not counted again (doc 13 §9.6). DETACH removes a node's
+// relationships first, then the node (doc 13 §9.5).
+//
+// The operator buffers its whole input before applying any delete. This is the
+// Eager barrier doc 13 §9.9 calls for: a lazy scan that kept pulling rows while
+// the delete tombstoned nodes would advance onto a deleted node and fault, so the
+// read must finish before the first delete. The planner will grow a general Eager
+// pass for the write path later (doc 11 §10); until then the barrier lives here.
+type deleteOp struct {
+	spec    *plan.Delete
+	input   operator
+	ctx     *Ctx
+	buf     []eval.Row
+	pos     int
+	applied bool
+}
+
+func (o *deleteOp) open(ctx *Ctx) error {
+	o.ctx = ctx
+	o.buf = nil
+	o.pos = 0
+	o.applied = false
+	return o.input.open(ctx)
+}
+
+func (o *deleteOp) next() (eval.Row, bool, error) {
+	if !o.applied {
+		if err := o.drainAndDelete(); err != nil {
+			return nil, false, err
+		}
+		o.applied = true
+	}
+	if o.pos >= len(o.buf) {
+		return nil, false, nil
+	}
+	row := o.buf[o.pos]
+	o.pos++
+	return row, true, nil
+}
+
+// drainAndDelete reads the entire input into the buffer, then applies the deletes
+// row by row. Reading first is the Eager barrier (see the type comment).
+func (o *deleteOp) drainAndDelete() error {
+	for {
+		in, ok, err := o.input.next()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+		o.buf = append(o.buf, in)
+	}
+	for _, row := range o.buf {
+		if err := o.deleteRow(row); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deleteRow evaluates one row's targets and removes them, relationships before
+// nodes (doc 13 §9.12).
+func (o *deleteOp) deleteRow(row eval.Row) error {
+	var nodes, rels []uint64
+	for _, t := range o.spec.Targets {
+		v, err := eval.Eval(t, o.ctx.env(row))
+		if err != nil {
+			return err
+		}
+		if v.IsNull() {
+			continue
+		}
+		if id, ok := v.AsRel(); ok {
+			rels = append(rels, id)
+			continue
+		}
+		if id, ok := v.AsNode(); ok {
+			nodes = append(nodes, id)
+			continue
+		}
+		return fmt.Errorf("exec: DELETE target is not a node or relationship")
+	}
+	for _, id := range rels {
+		if err := o.deleteRel(id); err != nil {
+			return err
+		}
+	}
+	for _, id := range nodes {
+		if err := o.deleteNode(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deleteRel removes a relationship, skipping one already gone so a re-delete is a
+// harmless no-op (doc 13 §9.6).
+func (o *deleteOp) deleteRel(id uint64) error {
+	live, err := o.ctx.Tx.RelExists(engine.RelID(id))
+	if err != nil {
+		return err
+	}
+	if !live {
+		return nil
+	}
+	if err := o.ctx.Tx.DeleteRel(engine.RelID(id)); err != nil {
+		return err
+	}
+	o.ctx.Effects.RelsDeleted++
+	return nil
+}
+
+// deleteNode removes a node. A plain DELETE leaves the engine's no-dangling check
+// to refuse a still-attached node; DETACH first removes every incident
+// relationship (doc 13 §9.5), then the node. A node already gone is a no-op (doc
+// 13 §9.6).
+func (o *deleteOp) deleteNode(id uint64) error {
+	live, err := o.ctx.Tx.NodeExists(engine.NodeID(id))
+	if err != nil {
+		return err
+	}
+	if !live {
+		return nil
+	}
+	if o.spec.Detach {
+		if err := o.detach(id); err != nil {
+			return err
+		}
+	}
+	if err := o.ctx.Tx.DeleteNode(engine.NodeID(id)); err != nil {
+		return err
+	}
+	o.ctx.Effects.NodesDeleted++
+	return nil
+}
+
+// detach removes every relationship incident to a node, both directions and all
+// types, before the node itself is deleted (doc 13 §9.5). The incident edges are
+// collected first, then deleted; deleteRel skips any seen twice (a self-loop
+// reached from both ends) or removed earlier.
+func (o *deleteOp) detach(id uint64) error {
+	var inc []uint64
+	err := o.ctx.Tx.Expand(engine.NodeID(id), 0, engine.Both, func(nb engine.Neighbor) error {
+		inc = append(inc, uint64(nb.Rel))
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, rid := range inc {
+		if err := o.deleteRel(rid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (o *deleteOp) close() error { return o.input.close() }
+
 // setElementProp sets a non-null property on the node or relationship bound to an
 // element value and counts it. SET to the same value still counts (doc 13 §6.22).
 func setElementProp(ctx *Ctx, elem value.Value, key engine.Token, v value.Value) error {

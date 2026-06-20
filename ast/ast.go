@@ -135,6 +135,16 @@ type RemoveItem struct {
 	Labels []string // labels to remove, nil for a property removal
 }
 
+// Delete is a DELETE or DETACH DELETE clause: a comma-separated list of
+// expressions naming the nodes and relationships to remove (doc 13 §9). A plain
+// DELETE of a node that still has relationships fails the no-dangling check;
+// DETACH DELETE removes the node's relationships first, then the node.
+type Delete struct {
+	Pos
+	Detach  bool
+	Targets []Expr
+}
+
 func (*Match) clauseNode()  {}
 func (*With) clauseNode()   {}
 func (*Unwind) clauseNode() {}
@@ -142,6 +152,7 @@ func (*Return) clauseNode() {}
 func (*Create) clauseNode() {}
 func (*Set) clauseNode()    {}
 func (*Remove) clauseNode() {}
+func (*Delete) clauseNode() {}
 
 // Projection is the shared body of WITH and RETURN: the projected items (or a
 // star), DISTINCT, and the ORDER BY / SKIP / LIMIT tail.

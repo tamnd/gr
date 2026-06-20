@@ -294,6 +294,23 @@ func TestBuildRemove(t *testing.T) {
 	eq(t, "raw", String(Build(b)), want)
 }
 
+func TestBuildDelete(t *testing.T) {
+	b := bound(t, "MATCH (a:Person) DELETE a")
+	want := `Delete a
+  NodeScan a:#1
+`
+	eq(t, "raw", String(Build(b)), want)
+	eq(t, "normalized", String(Plan(b)), want)
+}
+
+func TestBuildDetachDelete(t *testing.T) {
+	b := bound(t, "MATCH (a:Person) DETACH DELETE a")
+	want := `Delete DETACH a
+  NodeScan a:#1
+`
+	eq(t, "raw", String(Build(b)), want)
+}
+
 func TestBuildShortestPath(t *testing.T) {
 	b := bound(t, "MATCH (a:Person), (b:Person) MATCH p = shortestPath((a)-[:KNOWS*]-(b)) RETURN p")
 	want := `Project p

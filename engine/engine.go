@@ -77,6 +77,8 @@ type Tx interface {
 
 	// NodeExists reports whether a node is visible under this snapshot.
 	NodeExists(id NodeID) (bool, error)
+	// RelExists reports whether a relationship is visible under this snapshot.
+	RelExists(id RelID) (bool, error)
 	// NodeLabels returns the labels of a node as catalog tokens.
 	NodeLabels(id NodeID) ([]Token, error)
 	// HasLabel tests a single label without materializing the label set.

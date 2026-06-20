@@ -253,6 +253,10 @@ func (e *DiskEngine) Checkpoint() error {
 	return nil
 }
 
+// PageSize returns the file's page size in bytes, the value the library surface
+// reports without reaching past the engine into the pager.
+func (e *DiskEngine) PageSize() uint32 { return e.p.PageSize() }
+
 // Close releases the engine and its pager.
 func (e *DiskEngine) Close() error {
 	e.mu.Lock()

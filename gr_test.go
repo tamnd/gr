@@ -5,11 +5,17 @@ import (
 
 	"github.com/tamnd/gr/format"
 	"github.com/tamnd/gr/pager"
+	"github.com/tamnd/gr/value"
 	"github.com/tamnd/gr/vfs"
 	"github.com/tamnd/gr/wal"
 )
 
 const testPath = "campaign.gr"
+
+// The crash campaign is the durability guardrail: it drives the pager and WAL
+// directly (not the graph engine on top), because what it proves — that a crash
+// at any fault point recovers to a committed prefix — is a property of the
+// substrate Open mounts. The graph read path is exercised by TestQuery below.
 
 // encodePage writes commit number j into a data page: a u64 prefix plus a
 // byte(j) fill, so a torn page (a mix of two commits' bytes) is detectable and a
@@ -37,16 +43,16 @@ func decodePage(f *pager.Frame) (uint64, bool) {
 	return v, false
 }
 
-// buildClean creates a database with one data page committed at value 0 and
+// buildClean creates a pager file with one data page committed at value 0 and
 // returns the VFS holding it.
 func buildClean(t *testing.T) *vfs.Mem {
 	t.Helper()
 	fsys := vfs.NewMem()
-	db, err := Open(testPath, Options{VFS: fsys, Sync: wal.SyncFull, SaltSeed: 1})
+	p, err := pager.Open(fsys, testPath, pager.Options{Sync: wal.SyncFull, SaltSeed: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := db.pager.AllocPage(format.PageTypeData)
+	f, err := p.AllocPage(format.PageTypeData)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,35 +60,35 @@ func buildClean(t *testing.T) *vfs.Mem {
 		t.Fatalf("expected the data page to be page 1, got %d", f.ID())
 	}
 	encodePage(f, 0)
-	db.pager.MarkDirty(f)
-	db.pager.Unpin(f)
-	if err := db.pager.Commit(); err != nil {
+	p.MarkDirty(f)
+	p.Unpin(f)
+	if err := p.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Close(); err != nil {
+	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
 	return fsys
 }
 
-// runWorkload reopens the database on fsys and performs T commits, each
-// rewriting page 1 with the next value. It returns the first error (an injected
-// crash ends the workload early, which is expected during the campaign).
+// runWorkload reopens the pager on fsys and performs T commits, each rewriting
+// page 1 with the next value. It returns the first error (an injected crash ends
+// the workload early, which is expected during the campaign).
 func runWorkload(fsys vfs.VFS, T int) (err error) {
-	db, e := Open(testPath, Options{VFS: fsys, Sync: wal.SyncFull, SaltSeed: 7})
+	p, e := pager.Open(fsys, testPath, pager.Options{Sync: wal.SyncFull, SaltSeed: 7})
 	if e != nil {
 		return e
 	}
-	defer func() { _ = db.Close() }()
+	defer func() { _ = p.Close() }()
 	for j := 1; j <= T; j++ {
-		f, e := db.pager.ReadPage(1)
+		f, e := p.ReadPage(1)
 		if e != nil {
 			return e
 		}
 		encodePage(f, uint64(j))
-		db.pager.MarkDirty(f)
-		db.pager.Unpin(f)
-		if e := db.pager.Commit(); e != nil {
+		p.MarkDirty(f)
+		p.Unpin(f)
+		if e := p.Commit(); e != nil {
 			return e
 		}
 	}
@@ -96,24 +102,24 @@ func runWorkload(fsys vfs.VFS, T int) (err error) {
 // committed atomically (doc 05 §10 invariants 5, 6, 7).
 func verifyDurablePrefix(t *testing.T, crashed *vfs.Mem, T int, label string) uint64 {
 	t.Helper()
-	db, err := Open(testPath, Options{VFS: crashed})
+	p, err := pager.Open(crashed, testPath, pager.Options{})
 	if err != nil {
 		t.Fatalf("%s: reopen after crash failed: %v", label, err)
 	}
-	defer db.Close()
-	f, err := db.pager.ReadPage(1)
+	defer func() { _ = p.Close() }()
+	f, err := p.ReadPage(1)
 	if err != nil {
 		t.Fatalf("%s: ReadPage(1) after crash failed (torn page survived?): %v", label, err)
 	}
 	v, torn := decodePage(f)
-	db.pager.Unpin(f)
+	p.Unpin(f)
 	if torn {
 		t.Fatalf("%s: recovered page 1 is torn (value %d)", label, v)
 	}
 	if v > uint64(T) {
 		t.Fatalf("%s: recovered value %d exceeds committed max %d", label, v, T)
 	}
-	if c := db.pager.Header().ChangeCounter; c != v+1 {
+	if c := p.Header().ChangeCounter; c != v+1 {
 		t.Fatalf("%s: header/data disagree: ChangeCounter=%d, page value=%d (want c==v+1)", label, c, v)
 	}
 	return v
@@ -217,7 +223,7 @@ func TestDeterminismReplay(t *testing.T) {
 	}
 }
 
-// TestLifecycle is the M0 open/close demo: Open on a fresh path creates a valid
+// TestLifecycle is the open/close demo: Open on a fresh path creates a valid
 // file, Open again reads it, Close is clean and idempotent.
 func TestLifecycle(t *testing.T) {
 	fsys := vfs.NewMem()
@@ -247,7 +253,9 @@ func TestLifecycle(t *testing.T) {
 	}
 }
 
-// TestCustomPageSize exercises non-default page sizes through the lifecycle.
+// TestCustomPageSize exercises non-default page sizes through the lifecycle: the
+// engine creates and commits its structure at the chosen page size, and a reopen
+// reports the same size back.
 func TestCustomPageSize(t *testing.T) {
 	for _, ps := range []uint32{512, 1024, 8192, 16384} {
 		fsys := vfs.NewMem()
@@ -258,15 +266,90 @@ func TestCustomPageSize(t *testing.T) {
 		if db.PageSize() != ps {
 			t.Fatalf("ps=%d: got %d", ps, db.PageSize())
 		}
-		f, err := db.pager.AllocPage(format.PageTypeData)
+		if err := db.Close(); err != nil {
+			t.Fatalf("ps=%d: close: %v", ps, err)
+		}
+		db2, err := Open("p.gr", Options{VFS: fsys})
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("ps=%d: reopen: %v", ps, err)
 		}
-		db.pager.MarkDirty(f)
-		db.pager.Unpin(f)
-		if err := db.pager.Commit(); err != nil {
-			t.Fatal(err)
+		if db2.PageSize() != ps {
+			t.Fatalf("ps=%d: reopened size = %d", ps, db2.PageSize())
 		}
-		_ = db.Close()
+		_ = db2.Close()
+	}
+}
+
+// TestQuery is the M2 read-path demo through the library surface: a parameterless
+// RETURN, returning a literal computed with no graph access, streamed by column.
+func TestQuery(t *testing.T) {
+	fsys := vfs.NewMem()
+	db, err := Open("q.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	res, err := db.Query("RETURN 1 + 2 AS n", nil)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer func() { _ = res.Close() }()
+
+	if cols := res.Columns(); len(cols) != 1 || cols[0] != "n" {
+		t.Fatalf("columns = %v, want [n]", cols)
+	}
+	row, ok, err := res.Next()
+	if err != nil {
+		t.Fatalf("next: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected one row")
+	}
+	if n, ok := row[0].AsInt(); !ok || n != 3 {
+		t.Fatalf("row[0] = %v, want 3", row[0])
+	}
+	if _, ok, _ := res.Next(); ok {
+		t.Fatal("expected exactly one row")
+	}
+}
+
+// TestQueryParams threads a parameter through the read path and reads it back.
+func TestQueryParams(t *testing.T) {
+	fsys := vfs.NewMem()
+	db, err := Open("qp.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	params := map[string]value.Value{"x": value.Int(41)}
+	res, err := db.Query("RETURN $x + 1 AS y", params)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer func() { _ = res.Close() }()
+
+	row, ok, err := res.Next()
+	if err != nil || !ok {
+		t.Fatalf("next: ok=%v err=%v", ok, err)
+	}
+	if y, ok := row[0].AsInt(); !ok || y != 42 {
+		t.Fatalf("row[0] = %v, want 42", row[0])
+	}
+}
+
+// TestQueryOnClosed reports the closed-database error rather than panicking.
+func TestQueryOnClosed(t *testing.T) {
+	fsys := vfs.NewMem()
+	db, err := Open("c.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Query("RETURN 1", nil); err != ErrClosed {
+		t.Fatalf("query on closed db = %v, want ErrClosed", err)
 	}
 }

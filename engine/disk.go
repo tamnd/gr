@@ -489,10 +489,28 @@ func (t *diskTx) typeSlice(relType Token) []uint32 {
 	return out
 }
 
+// Degree returns a node's relationship count along a type and direction from the
+// adjacency's maintained degree statistic, in O(1) per (type, direction) slot
+// rather than by materializing the neighbor run (doc 04 §12.5). It is the planner
+// statistic: it reflects the latest committed state and the writer's own writes,
+// not a reader's snapshot. A zero relType sums all types; Both sums both directions.
 func (t *diskTx) Degree(id NodeID, relType Token, dir Direction) (int64, error) {
+	defer t.rguard()()
+	pos, err := t.nodePos(id)
+	if err != nil {
+		return 0, err
+	}
 	var c int64
-	err := t.Expand(id, relType, dir, func(Neighbor) error { c++; return nil })
-	return c, err
+	for _, ty := range t.typeSlice(relType) {
+		for _, d := range dirSlice(dir) {
+			n, err := t.e.adj.Degree(pos, ty, d)
+			if err != nil {
+				return 0, err
+			}
+			c += n
+		}
+	}
+	return c, nil
 }
 
 // --- writes ---
@@ -602,10 +620,17 @@ func (t *diskTx) DeleteRel(id RelID) error {
 	if err != nil {
 		return err
 	}
+	// Read the edge before tombstoning it so the adjacency can correct the degree
+	// statistic for its endpoints.
+	r, err := t.e.rels.Get(pos)
+	if err != nil {
+		return err
+	}
 	t.pending = append(t.pending, pendingPre{
 		key: mvcc.Key{Kind: mvcc.RelExist, Pos: pos},
 		pre: mvcc.Pre{Present: true},
 	})
+	t.e.adj.Remove(r.Type, r.Src, r.Dst)
 	return t.e.rels.Delete(pos)
 }
 

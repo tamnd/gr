@@ -9,6 +9,98 @@ import (
 	"github.com/tamnd/gr/vfs"
 )
 
+// TestDenseNodeDegreeEngine drives the dense-node mechanism through the engine
+// SPI (doc 04 §12; doc 25 deliverable 10): a supernode with high degree across
+// two types reports per-type, per-direction degree in O(1) without scanning all
+// its edges, a typed expand sees only that type's slice, and the count tracks
+// writes, deletes, the writer's own uncommitted work, and a checkpoint.
+func TestDenseNodeDegreeEngine(t *testing.T) {
+	const degKnows, degLikes = 600, 150
+	fsys := vfs.NewMem()
+	e := openDisk(t, fsys, "dense.gr")
+	defer e.Close()
+
+	person, _ := e.Intern(catalog.KindLabel, "Person")
+	knows, _ := e.Intern(catalog.KindRelType, "KNOWS")
+	likes, _ := e.Intern(catalog.KindRelType, "LIKES")
+
+	w, _ := e.Begin(true)
+	s, _ := w.CreateNode([]Token{person})
+	nbr := make([]NodeID, 0, degKnows)
+	for range degKnows {
+		n, _ := w.CreateNode([]Token{person})
+		nbr = append(nbr, n)
+	}
+	var firstKnows RelID
+	for i, n := range nbr {
+		r, _ := w.CreateRel(s, n, knows)
+		if i == 0 {
+			firstKnows = r
+		}
+	}
+	for i := range degLikes {
+		w.CreateRel(s, nbr[i], likes)
+	}
+	// Read-your-writes: the writer sees its own uncommitted degree.
+	if d, _ := w.Degree(s, knows, Outgoing); d != degKnows {
+		t.Fatalf("read-your-writes degree(KNOWS) = %d, want %d", d, degKnows)
+	}
+	w.Commit()
+
+	// A committed reader sees the per-type, per-direction degrees and the wildcard sum.
+	r, _ := e.Begin(false)
+	defer r.Abort()
+	if d, _ := r.Degree(s, knows, Outgoing); d != degKnows {
+		t.Fatalf("degree(KNOWS,out) = %d, want %d", d, degKnows)
+	}
+	if d, _ := r.Degree(s, likes, Outgoing); d != degLikes {
+		t.Fatalf("degree(LIKES,out) = %d, want %d", d, degLikes)
+	}
+	if d, _ := r.Degree(s, knows, Incoming); d != 0 {
+		t.Fatalf("degree(KNOWS,in) = %d, want 0", d)
+	}
+	if d, _ := r.Degree(s, 0, Outgoing); d != degKnows+degLikes {
+		t.Fatalf("degree(all types,out) = %d, want %d", d, degKnows+degLikes)
+	}
+	// Typed expand selectivity: a KNOWS expand yields only the KNOWS slice.
+	var seen int
+	r.Expand(s, knows, Outgoing, func(n Neighbor) error {
+		if n.Type != knows {
+			t.Fatalf("KNOWS expand yielded a %v edge", n.Type)
+		}
+		seen++
+		return nil
+	})
+	if seen != degKnows {
+		t.Fatalf("KNOWS expand saw %d edges, want %d", seen, degKnows)
+	}
+
+	// Deleting one KNOWS edge drops the KNOWS degree by one, LIKES untouched.
+	w2, _ := e.Begin(true)
+	w2.DeleteRel(firstKnows)
+	if d, _ := w2.Degree(s, knows, Outgoing); d != degKnows-1 {
+		t.Fatalf("degree after delete = %d, want %d", d, degKnows-1)
+	}
+	if d, _ := w2.Degree(s, likes, Outgoing); d != degLikes {
+		t.Fatalf("LIKES degree after KNOWS delete = %d, want %d", d, degLikes)
+	}
+	w2.Commit()
+
+	// A checkpoint folds the tail into the base; degree comes from the offset
+	// arrays and stays correct.
+	if err := e.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	r2, _ := e.Begin(false)
+	defer r2.Abort()
+	if d, _ := r2.Degree(s, knows, Outgoing); d != degKnows-1 {
+		t.Fatalf("degree(KNOWS) after checkpoint = %d, want %d", d, degKnows-1)
+	}
+	if d, _ := r2.Degree(s, likes, Outgoing); d != degLikes {
+		t.Fatalf("degree(LIKES) after checkpoint = %d, want %d", d, degLikes)
+	}
+}
+
 // TestMVCCSnapshotIsolation is the M1 MVCC gate: a snapshot taken before a writer
 // commits does not see the writer's change; a snapshot taken after does; a write
 // transaction reads its own uncommitted writes.

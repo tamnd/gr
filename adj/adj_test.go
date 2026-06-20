@@ -183,6 +183,105 @@ func TestDeleteDropsEdge(t *testing.T) {
 	}
 }
 
+// TestDenseNodeDegree builds a supernode with high degree across two types and
+// checks the dense-node mechanism (doc 04 §12): a typed, directed expand touches
+// only that type's run, degree is reported without materializing the run, and the
+// count stays correct across deletes, a checkpoint, and a reopen.
+func TestDenseNodeDegree(t *testing.T) {
+	const typeA, typeB = 1, 2
+	const degA, degB = 2000, 500
+	fsys := vfs.NewMem()
+	pg, ns, rs, a := open(t, fsys, path, true)
+
+	// One supernode (position 0) plus degA distinct neighbors.
+	for range degA + 1 {
+		if _, err := ns.Create(nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var firstA uint64
+	for k := uint64(1); k <= degA; k++ {
+		pos := addEdge(t, rs, a, typeA, 0, k)
+		if k == 1 {
+			firstA = pos
+		}
+	}
+	for k := uint64(1); k <= degB; k++ {
+		addEdge(t, rs, a, typeB, 0, k)
+	}
+
+	// Typed selectivity: each type's expand and degree see only that type.
+	check := func(when string, wantA, wantB int64) {
+		if d, _ := a.Degree(0, typeA, adj.Out); d != wantA {
+			t.Fatalf("%s: degree(A,out) = %d, want %d", when, d, wantA)
+		}
+		if d, _ := a.Degree(0, typeB, adj.Out); d != wantB {
+			t.Fatalf("%s: degree(B,out) = %d, want %d", when, d, wantB)
+		}
+		if d, _ := a.Degree(0, typeA, adj.In); d != 0 {
+			t.Fatalf("%s: degree(A,in) = %d, want 0", when, d)
+		}
+		outA, _ := a.Expand(0, typeA, adj.Out)
+		if int64(len(outA)) != wantA {
+			t.Fatalf("%s: expand(A,out) = %d edges, want %d", when, len(outA), wantA)
+		}
+		outB, _ := a.Expand(0, typeB, adj.Out)
+		if int64(len(outB)) != wantB {
+			t.Fatalf("%s: expand(B,out) = %d edges, want %d", when, len(outB), wantB)
+		}
+	}
+	check("delta", degA, degB)
+
+	// Each neighbor carries exactly one incoming type-A edge from the supernode.
+	if d, _ := a.Degree(1, typeA, adj.In); d != 1 {
+		t.Fatalf("neighbor in-degree = %d, want 1", d)
+	}
+
+	// Delete one type-A edge from the delta: degree drops and expand omits it.
+	if err := rs.Delete(firstA); err != nil {
+		t.Fatal(err)
+	}
+	a.Remove(typeA, 0, 1)
+	check("after delta delete", degA-1, degB)
+
+	// Checkpoint folds the live edges into the base; degree comes from the offset
+	// array now, and the tail adjustment resets.
+	if err := a.Checkpoint(uint64(ns.Count())); err != nil {
+		t.Fatal(err)
+	}
+	check("after checkpoint", degA-1, degB)
+
+	// Delete a base edge (a type-B edge, now folded) and confirm the count tracks it.
+	bEdge := uint64(degA + 5) // a type-B edge position created after the degA type-A ones
+	r, err := rs.Get(bEdge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.Delete(bEdge); err != nil {
+		t.Fatal(err)
+	}
+	a.Remove(r.Type, r.Src, r.Dst)
+	check("after base delete", degA-1, degB-1)
+
+	// Reopen and confirm the base degree survives (folded edges, minus the
+	// pre-reopen base delete healed by a checkpoint).
+	if err := a.Checkpoint(uint64(ns.Count())); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	pg.Close()
+	pg, _, _, a = open(t, fsys, path, false)
+	defer pg.Close()
+	if d, _ := a.Degree(0, typeA, adj.Out); d != degA-1 {
+		t.Fatalf("after reopen: degree(A,out) = %d, want %d", d, degA-1)
+	}
+	if d, _ := a.Degree(0, typeB, adj.Out); d != degB-1 {
+		t.Fatalf("after reopen: degree(B,out) = %d, want %d", d, degB-1)
+	}
+}
+
 // --- headline crash campaign over the adjacency ---
 
 const cpath = "adjcrash.gr"

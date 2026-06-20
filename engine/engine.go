@@ -85,6 +85,15 @@ type Tx interface {
 	NodeProperty(id NodeID, key Token) (value.Value, error)
 	// RelProperty reads one property of a relationship.
 	RelProperty(id RelID, key Token) (value.Value, error)
+	// RelType returns the type token of a relationship (the read behind the
+	// type() function, doc 09 §7).
+	RelType(id RelID) (Token, error)
+	// NodePropertyKeys returns the property keys a node carries under this
+	// snapshot, the enumeration behind keys() and properties() (doc 09 §7).
+	NodePropertyKeys(id NodeID) ([]Token, error)
+	// RelPropertyKeys returns the property keys a relationship carries under this
+	// snapshot.
+	RelPropertyKeys(id RelID) ([]Token, error)
 
 	// ScanLabel yields the visible nodes carrying a label, in position order. A
 	// zero label scans all nodes.

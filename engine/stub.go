@@ -127,6 +127,44 @@ func (t *memTx) RelProperty(id RelID, key Token) (value.Value, error) {
 	return r.props[key], nil
 }
 
+func (t *memTx) RelType(id RelID) (Token, error) {
+	t.e.mu.Lock()
+	defer t.e.mu.Unlock()
+	r, ok := t.e.rels[id]
+	if !ok {
+		return 0, ErrNoSuchRel
+	}
+	return r.typ, nil
+}
+
+func (t *memTx) NodePropertyKeys(id NodeID) ([]Token, error) {
+	t.e.mu.Lock()
+	defer t.e.mu.Unlock()
+	n, ok := t.e.nodes[id]
+	if !ok {
+		return nil, ErrNoSuchNode
+	}
+	out := make([]Token, 0, len(n.props))
+	for k := range n.props {
+		out = append(out, k)
+	}
+	return out, nil
+}
+
+func (t *memTx) RelPropertyKeys(id RelID) ([]Token, error) {
+	t.e.mu.Lock()
+	defer t.e.mu.Unlock()
+	r, ok := t.e.rels[id]
+	if !ok {
+		return nil, ErrNoSuchRel
+	}
+	out := make([]Token, 0, len(r.props))
+	for k := range r.props {
+		out = append(out, k)
+	}
+	return out, nil
+}
+
 func (t *memTx) ScanLabel(label Token, fn func(NodeID) error) error {
 	t.e.mu.Lock()
 	ids := make([]NodeID, 0, len(t.e.nodes))

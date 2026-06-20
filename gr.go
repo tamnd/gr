@@ -13,6 +13,7 @@ import (
 	"errors"
 
 	"github.com/tamnd/gr/bind"
+	"github.com/tamnd/gr/catalog"
 	"github.com/tamnd/gr/engine"
 	"github.com/tamnd/gr/eval"
 	"github.com/tamnd/gr/exec"
@@ -112,9 +113,12 @@ func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, erro
 		return nil, err
 	}
 	ctx := &exec.Ctx{
-		Tx:      tx,
-		Params:  params,
-		Resolve: exec.ResolverFromBound(entry.Bound),
+		Tx:          tx,
+		Params:      params,
+		Resolve:     exec.ResolverFromBound(entry.Bound),
+		LabelName:   db.tokenNamer(catalog.KindLabel),
+		RelTypeName: db.tokenNamer(catalog.KindRelType),
+		PropKeyName: db.tokenNamer(catalog.KindPropKey),
 	}
 	cur, err := exec.Open(entry.Op, ctx)
 	if err != nil {
@@ -144,6 +148,15 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 	entry := &plan.Entry{Bound: b, Op: plan.Plan(b)}
 	db.cache.Put(key, entry)
 	return entry, nil
+}
+
+// tokenNamer returns a reverse resolver for one catalog kind: a token to the name
+// it interns. It backs eval's entity functions (labels, type, keys, properties),
+// which return names rather than tokens (doc 09 §7).
+func (db *DB) tokenNamer(kind catalog.Kind) func(t engine.Token) (string, bool) {
+	return func(t engine.Token) (string, bool) {
+		return db.eng.TokenName(kind, t)
+	}
 }
 
 // Result is a streaming Cypher query result: the output column names in order and

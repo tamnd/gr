@@ -261,8 +261,9 @@ func (db *DB) internWriteNames(q *ast.Query) error {
 
 // internSetNames interns the names a SET clause introduces: the property key of
 // each single-property assignment and every label of each label addition. The
-// map forms (SET n = m, SET n += m) introduce no static name to intern; they are
-// deferred at bind, so they cannot reach here.
+// map forms (SET n = m, SET n += m) carry no static key, so the switch skips
+// them; their keys come from the value at run time and the executor interns them
+// inside the write transaction through Tx.InternPropKey (doc 13 §6.4).
 func (db *DB) internSetNames(s *ast.Set) error {
 	for _, it := range s.Items {
 		switch it.Op {

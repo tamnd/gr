@@ -161,12 +161,13 @@ type Set struct {
 
 // SetItem is one lowered SET assignment. Kind selects the shape: SetItemProp
 // assigns Key from Expr on the element bound to Var; SetItemLabels adds Labels to
-// the node bound to Var.
+// the node bound to Var; SetItemMerge and SetItemReplace apply the map (or source
+// element) Expr evaluates to, merging or replacing the target's properties.
 type SetItem struct {
 	Kind   SetItemKind
 	Var    string
 	Key    bind.NameRef   // SetItemProp
-	Expr   ast.Expr       // SetItemProp
+	Expr   ast.Expr       // SetItemProp, SetItemMerge, SetItemReplace
 	Labels []bind.NameRef // SetItemLabels
 }
 
@@ -178,6 +179,10 @@ const (
 	SetItemProp SetItemKind = iota
 	// SetItemLabels is a label addition (n:A:B).
 	SetItemLabels
+	// SetItemMerge is a map merge (n += m): set the map's keys, keep the rest.
+	SetItemMerge
+	// SetItemReplace is a map replace (n = m): the target ends with exactly m.
+	SetItemReplace
 )
 
 // Remove is the write operator for a REMOVE clause: it removes each item's
@@ -590,6 +595,10 @@ func setLabel(x *Set) string {
 			parts[i] = it.Var + "." + tokenLabel(it.Key) + " = " + ast.Print(it.Expr)
 		case SetItemLabels:
 			parts[i] = it.Var + labelSuffix(it.Labels)
+		case SetItemMerge:
+			parts[i] = it.Var + " += " + ast.Print(it.Expr)
+		case SetItemReplace:
+			parts[i] = it.Var + " = " + ast.Print(it.Expr)
 		}
 	}
 	return strings.Join(parts, ", ")

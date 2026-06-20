@@ -187,6 +187,18 @@ func (bd *builder) set(s *ast.Set, cur Op) Op {
 				Var:    it.Var,
 				Labels: bd.labelRefs(it.Labels),
 			})
+		case ast.SetMerge:
+			op.Items = append(op.Items, SetItem{
+				Kind: SetItemMerge,
+				Var:  it.Var,
+				Expr: it.Value,
+			})
+		case ast.SetReplace:
+			op.Items = append(op.Items, SetItem{
+				Kind: SetItemReplace,
+				Var:  it.Var,
+				Expr: it.Value,
+			})
 		}
 	}
 	return op

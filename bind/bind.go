@@ -422,9 +422,12 @@ func (bd *binder) bindCreatePath(pp *ast.PathPattern, sc scope) error {
 
 // set binds a SET clause: every item's target must already be bound, a property
 // target must be a node or relationship, and a label target must be a node. The
-// names a SET introduces (the property keys it assigns, the labels it adds) are
-// interned before binding (the executor's write-setup, doc 13 §9), so they
-// resolve to known tokens. The map forms (+= and =) arrive in a later milestone.
+// static names a SET introduces (the property keys of single assignments, the
+// labels it adds) are interned before binding (the executor's write-setup, doc 13
+// §9), so they resolve to known tokens. The map forms (n += m and n = m) carry no
+// static key; their keys come from the value at run time and the executor interns
+// them inside the write transaction (doc 13 §6.4), so the binder only checks the
+// target is a node or relationship and that the right-hand side is well-formed.
 func (bd *binder) set(s *ast.Set, sc scope) error {
 	for _, it := range s.Items {
 		kind, ok := sc[it.Var]
@@ -452,7 +455,12 @@ func (bd *binder) set(s *ast.Set, sc scope) error {
 				}
 			}
 		case ast.SetMerge, ast.SetReplace:
-			return &Error{"map-form SET arrives in a later M3 milestone", it.Line, it.Col}
+			if kind != vkNode && kind != vkRel {
+				return &Error{"SET of properties applies only to a node or relationship", it.Line, it.Col}
+			}
+			if err := bd.checkExpr(it.Value, sc, false); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

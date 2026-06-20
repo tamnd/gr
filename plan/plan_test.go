@@ -151,6 +151,58 @@ func TestExpandInto(t *testing.T) {
 `)
 }
 
+func TestReanchorOnPinnedLabel(t *testing.T) {
+	// (a) is unlabeled, (b) is labeled and pinned by name = $x, so the planner
+	// anchors at b and reverses the expand to radiate from it; Normalize then
+	// pushes the pin to b's scan.
+	b := bound(t, "MATCH (a)-[:KNOWS]->(b:Person {name: $x}) RETURN a")
+	eq(t, "normalized", String(Plan(b)), `Project a
+  Expand b <-[@r0:#1]- a
+    Filter b.name = $x
+      NodeScan b:#1
+`)
+}
+
+func TestReanchorLabeledEnd(t *testing.T) {
+	// The labeled end is the cheaper scan, so the planner anchors there even with
+	// no property pin.
+	b := bound(t, "MATCH (a)-[:KNOWS]->(b:Person) RETURN a")
+	eq(t, "normalized", String(Plan(b)), `Project a
+  Expand b <-[@r0:#1]- a
+    NodeScan b:#1
+`)
+}
+
+func TestNoReanchorWhenLeftmostBest(t *testing.T) {
+	// The leftmost node is already the most selective, so the plan is unchanged.
+	b := bound(t, "MATCH (a:Person)-[:KNOWS]->(b) RETURN b")
+	eq(t, "normalized", String(Plan(b)), `Project b
+  Expand a -[@r0:#1]-> b
+    NodeScan a:#1
+`)
+}
+
+func TestReanchorBailsVarLength(t *testing.T) {
+	// A variable-length step is not safely reversible by the simple subset, so the
+	// chain is left anchored as built even though b is the labeled end.
+	b := bound(t, "MATCH (a)-[:KNOWS*1..2]->(b:Person) RETURN a")
+	eq(t, "normalized", String(Plan(b)), `Project a
+  Expand a -[@r0*:#1]-> b:#1
+    NodeScan a
+`)
+}
+
+func TestReanchorBailsCycle(t *testing.T) {
+	// The pattern cycles back to a (an expand-into), which the simple subset does
+	// not re-anchor; the built anchor stands.
+	b := bound(t, "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(a) RETURN a")
+	eq(t, "normalized", String(Plan(b)), `Project a
+  Expand b -[@r1:#1]-> a (into)
+    Expand a -[@r0:#1]-> b
+      NodeScan a:#1
+`)
+}
+
 func TestProjectionTail(t *testing.T) {
 	b := bound(t, "MATCH (p:Person) RETURN p.name AS n ORDER BY p.age DESC SKIP 5 LIMIT 10")
 	eq(t, "raw", String(Build(b)), `Limit 10

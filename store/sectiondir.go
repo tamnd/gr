@@ -20,6 +20,8 @@ type Section uint32
 const (
 	// SecCatalog is the catalog token-dictionary Log.
 	SecCatalog Section = iota
+	// SecIDMap is the id-map Log (element id <-> dense position).
+	SecIDMap
 	// numSectionsInUse is the count of section ids currently defined. It must
 	// stay <= MaxSections; later milestones add ids before this marker.
 	numSectionsInUse

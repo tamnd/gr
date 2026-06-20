@@ -168,6 +168,14 @@ func (o *setOp) next() (eval.Row, bool, error) {
 			if err := o.setLabels(it, in); err != nil {
 				return nil, false, err
 			}
+		case plan.SetItemMerge:
+			if err := o.setMap(it, in, false); err != nil {
+				return nil, false, err
+			}
+		case plan.SetItemReplace:
+			if err := o.setMap(it, in, true); err != nil {
+				return nil, false, err
+			}
 		}
 	}
 	return in, true, nil
@@ -209,6 +217,157 @@ func (o *setOp) setLabels(it plan.SetItem, row eval.Row) error {
 		o.ctx.Effects.LabelsAdded++
 	}
 	return nil
+}
+
+// setMap applies a map-form SET: n += m (merge) or n = m (replace). Each of the
+// map's keys is set on the target, with a key set to null removing that property
+// (the null-is-removal rule single SET follows, doc 13 §6.4). For replace, every
+// property the target currently carries whose key is not in the map is removed
+// first, so the target ends with exactly the map's properties (doc 13 §6.5). The
+// right-hand side may be a literal or parameter map, or another bound element
+// whose properties are read and copied (doc 13 §6.15). A null right-hand side
+// clears the target on replace and is a no-op on merge.
+func (o *setOp) setMap(it plan.SetItem, row eval.Row, replace bool) error {
+	v, err := eval.Eval(it.Expr, o.ctx.env(row))
+	if err != nil {
+		return err
+	}
+	target := row[it.Var]
+	if !isNode(target) && !isRel(target) {
+		return fmt.Errorf("exec: SET of properties applies only to a node or relationship")
+	}
+	if v.IsNull() {
+		if replace {
+			return o.clearProps(target)
+		}
+		return nil
+	}
+	pairs, err := o.mapPairs(v)
+	if err != nil {
+		return err
+	}
+	if replace {
+		if err := o.removeAbsent(target, pairs); err != nil {
+			return err
+		}
+	}
+	for _, p := range pairs {
+		if p.val.IsNull() {
+			if err := removeElementProp(o.ctx, target, bind.NameRef{Known: true, Token: p.key}); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := setElementProp(o.ctx, target, p.key, p.val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// propPair is one property entry to apply in a map-form SET, the key already
+// resolved to its token.
+type propPair struct {
+	key engine.Token
+	val value.Value
+}
+
+// mapPairs turns a map-form SET right-hand side into the property entries to
+// apply. A map value interns each of its keys in this transaction (the keys are
+// only known now, doc 13 §6.4); an element value reads the source element's
+// current properties under the writer's snapshot (read-your-writes, doc 13 §6.15).
+func (o *setOp) mapPairs(v value.Value) ([]propPair, error) {
+	if m, ok := v.AsMap(); ok {
+		pairs := make([]propPair, 0, len(m))
+		for name, val := range m {
+			tok, err := o.ctx.Tx.InternPropKey(name)
+			if err != nil {
+				return nil, err
+			}
+			pairs = append(pairs, propPair{key: tok, val: val})
+		}
+		return pairs, nil
+	}
+	if isNode(v) || isRel(v) {
+		return o.elementProps(v)
+	}
+	return nil, fmt.Errorf("exec: SET of properties requires a map or a node or relationship")
+}
+
+// elementProps reads every property a source element carries, as the entries to
+// copy onto the target (doc 13 §6.15). The source keys already exist as tokens,
+// so no interning is needed.
+func (o *setOp) elementProps(v value.Value) ([]propPair, error) {
+	keys, err := o.currentKeys(v)
+	if err != nil {
+		return nil, err
+	}
+	pairs := make([]propPair, 0, len(keys))
+	for _, k := range keys {
+		val, err := o.readProp(v, k)
+		if err != nil {
+			return nil, err
+		}
+		if val.IsNull() {
+			continue
+		}
+		pairs = append(pairs, propPair{key: k, val: val})
+	}
+	return pairs, nil
+}
+
+// removeAbsent removes every property the target currently carries whose key is
+// not among the replacement entries, the first half of map-replace (doc 13 §6.5).
+func (o *setOp) removeAbsent(target value.Value, pairs []propPair) error {
+	keep := make(map[engine.Token]struct{}, len(pairs))
+	for _, p := range pairs {
+		keep[p.key] = struct{}{}
+	}
+	cur, err := o.currentKeys(target)
+	if err != nil {
+		return err
+	}
+	for _, k := range cur {
+		if _, ok := keep[k]; ok {
+			continue
+		}
+		if err := removeElementProp(o.ctx, target, bind.NameRef{Known: true, Token: k}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// clearProps removes every property the target carries, the effect of SET n = null.
+func (o *setOp) clearProps(target value.Value) error {
+	cur, err := o.currentKeys(target)
+	if err != nil {
+		return err
+	}
+	for _, k := range cur {
+		if err := removeElementProp(o.ctx, target, bind.NameRef{Known: true, Token: k}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// currentKeys returns the property keys the node or relationship currently carries.
+func (o *setOp) currentKeys(elem value.Value) ([]engine.Token, error) {
+	if id, ok := elem.AsNode(); ok {
+		return o.ctx.Tx.NodePropertyKeys(engine.NodeID(id))
+	}
+	id, _ := elem.AsRel()
+	return o.ctx.Tx.RelPropertyKeys(engine.RelID(id))
+}
+
+// readProp reads one property of the node or relationship bound to an element value.
+func (o *setOp) readProp(elem value.Value, key engine.Token) (value.Value, error) {
+	if id, ok := elem.AsNode(); ok {
+		return o.ctx.Tx.NodeProperty(engine.NodeID(id), key)
+	}
+	id, _ := elem.AsRel()
+	return o.ctx.Tx.RelProperty(engine.RelID(id), key)
 }
 
 func (o *setOp) close() error { return o.input.close() }

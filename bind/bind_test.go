@@ -251,12 +251,15 @@ func TestBindSetRemove(t *testing.T) {
 	if _, err := bindStr(t, "MATCH (a)-[r:KNOWS]->(b) REMOVE r:Person", false); err == nil {
 		t.Fatal("REMOVE label on a relationship should be rejected")
 	}
-	// The map forms of SET are deferred to a later M3 milestone.
-	if _, err := bindStr(t, "MATCH (a) SET a += {x: 1}", false); err == nil {
-		t.Fatal("map-merge SET should be rejected for now")
-	}
-	if _, err := bindStr(t, "MATCH (a) SET a = {x: 1}", false); err == nil {
-		t.Fatal("map-replace SET should be rejected for now")
+	// The map forms of SET bind: a map merge, a map replace, and an
+	// element-to-element copy onto a node or relationship.
+	mustBind(t, "MATCH (a) SET a += {x: 1}")
+	mustBind(t, "MATCH (a) SET a = {x: 1}")
+	mustBind(t, "MATCH (a)-[r:KNOWS]->(b) SET r += $m")
+	mustBind(t, "MATCH (a), (b) SET a = b")
+	// A map-form target must be a node or relationship, not a value.
+	if _, err := bindStr(t, "MATCH (a) WITH a.name AS n SET n += {x: 1}", false); err == nil {
+		t.Fatal("map-form SET onto a value should be rejected")
 	}
 }
 

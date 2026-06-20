@@ -375,3 +375,65 @@ func TestReturnConstant(t *testing.T) {
 		t.Fatalf("x = %v, want 3", rows[0]["x"])
 	}
 }
+
+func TestVarLengthRange(t *testing.T) {
+	e, _ := graph(t)
+	// From Alice over 1..2 KNOWS hops: Alice->Bob, Alice->Carol, Alice->Bob->Carol.
+	// Each trail is one row, so Carol appears twice.
+	rows, _ := run(t, e, "MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..2]->(b) RETURN b.name AS name", nil)
+	eqStrings(t, strCol(rows, "name"), []string{"Bob", "Carol", "Carol"})
+}
+
+func TestVarLengthZeroHop(t *testing.T) {
+	e, _ := graph(t)
+	// *0..1 includes the zero-hop path (a equals b), so Alice reaches herself.
+	rows, _ := run(t, e, "MATCH (a:Person {name: 'Alice'})-[:KNOWS*0..1]->(b) RETURN b.name AS name", nil)
+	eqStrings(t, strCol(rows, "name"), []string{"Alice", "Bob", "Carol"})
+}
+
+func TestVarLengthExact(t *testing.T) {
+	e, _ := graph(t)
+	// Exactly two hops from Alice: only Alice->Bob->Carol, and the relationship
+	// variable binds the two-edge path.
+	rows, _ := run(t, e, "MATCH (a:Person {name: 'Alice'})-[r:KNOWS*2..2]->(b) RETURN b.name AS name, size(r) AS hops", nil)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if name, _ := rows[0]["name"].AsString(); name != "Carol" {
+		t.Fatalf("name = %v, want Carol", rows[0]["name"])
+	}
+	if hops, _ := rows[0]["hops"].AsInt(); hops != 2 {
+		t.Fatalf("hops = %v, want 2", rows[0]["hops"])
+	}
+}
+
+func TestVarLengthUnbounded(t *testing.T) {
+	e, _ := graph(t)
+	// Unbounded * terminates because relationship-uniqueness forbids reusing an
+	// edge: Alice->Bob, Alice->Carol, Alice->Bob->Carol.
+	rows, _ := run(t, e, "MATCH (a:Person {name: 'Alice'})-[:KNOWS*]->(b) RETURN b.name AS name", nil)
+	eqStrings(t, strCol(rows, "name"), []string{"Bob", "Carol", "Carol"})
+}
+
+func TestVarLengthCycleTerminates(t *testing.T) {
+	// A two-node cycle: Ann -KNOWS-> Ben -KNOWS-> Ann (two distinct edges).
+	e := engine.NewMemEngine()
+	tx, err := e.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ann, _ := tx.CreateNode([]engine.Token{lblPerson})
+	ben, _ := tx.CreateNode([]engine.Token{lblPerson})
+	tx.SetNodeProperty(ann, keyName, value.String("Ann"))
+	tx.SetNodeProperty(ben, keyName, value.String("Ben"))
+	r1, _ := tx.CreateRel(ann, ben, typKnows)
+	r2, _ := tx.CreateRel(ben, ann, typKnows)
+	_, _ = r1, r2
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	// Unbounded from Ann: Ann->Ben, then Ben->Ann (the other edge); the first edge
+	// cannot be reused, so the walk stops. Two trails: to Ben, back to Ann.
+	rows, _ := run(t, e, "MATCH (a:Person {name: 'Ann'})-[:KNOWS*]->(b) RETURN b.name AS name", nil)
+	eqStrings(t, strCol(rows, "name"), []string{"Ann", "Ben"})
+}

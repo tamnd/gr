@@ -35,6 +35,11 @@ func Plan(b *bind.Bound) Op { return Normalize(Optimize(Build(b))) }
 type builder struct {
 	b    *bind.Bound
 	anon int
+	// nodeNames and relNames memoize the synthetic names assigned to anonymous
+	// pattern elements, keyed by the AST node, so every reference to one element
+	// (the expand that binds it and the path that lists it) sees the same name.
+	nodeNames map[*ast.NodePattern]string
+	relNames  map[*ast.RelPattern]string
 }
 
 // single lowers one UNION arm's clause sequence. bound tracks the variables in
@@ -100,7 +105,23 @@ func (bd *builder) path(pp *ast.PathPattern, cur Op, bound map[string]bool) Op {
 			cur = &Join{Left: cur, Right: leaf, On: sharedVars(cur, leaf)}
 		}
 	}
-	return bd.expandChain(cur, start, pp.Chain, bound)
+	cur = bd.expandChain(cur, start, pp.Chain, bound)
+	if pp.Var != "" {
+		cur = &BindPath{Input: cur, Var: pp.Var, Elems: bd.pathElems(pp)}
+	}
+	return cur
+}
+
+// pathElems returns a pattern's element variable names in traversal order: the
+// start node, then each step's relationship and node. The names are the binder's
+// (synthetic for anonymous elements), so a path materializes even when the
+// pattern names none of its elements.
+func (bd *builder) pathElems(pp *ast.PathPattern) []string {
+	elems := []string{bd.nodeName(pp.Start)}
+	for _, step := range pp.Chain {
+		elems = append(elems, bd.relName(step.Rel), bd.nodeName(step.Node))
+	}
+	return elems
 }
 
 // pathCorrelated lowers a pattern for the inner side of an OPTIONAL MATCH. A
@@ -120,6 +141,10 @@ func (bd *builder) pathCorrelated(pp *ast.PathPattern, outer map[string]bool) Op
 		inner[start] = true
 	}
 	cur = bd.expandChain(cur, start, pp.Chain, inner)
+	if pp.Var != "" {
+		cur = &BindPath{Input: cur, Var: pp.Var, Elems: bd.pathElems(pp)}
+		inner[pp.Var] = true
+	}
 	// the outer scope gains the pattern's variables (they are visible, possibly
 	// null, after the optional match).
 	for v := range inner {
@@ -267,8 +292,15 @@ func (bd *builder) nodeName(np *ast.NodePattern) string {
 	if np.Var != "" {
 		return np.Var
 	}
+	if n, ok := bd.nodeNames[np]; ok {
+		return n
+	}
 	n := "@n" + itoa(bd.anon)
 	bd.anon++
+	if bd.nodeNames == nil {
+		bd.nodeNames = map[*ast.NodePattern]string{}
+	}
+	bd.nodeNames[np] = n
 	return n
 }
 
@@ -276,8 +308,15 @@ func (bd *builder) relName(rp *ast.RelPattern) string {
 	if rp.Var != "" {
 		return rp.Var
 	}
+	if n, ok := bd.relNames[rp]; ok {
+		return n
+	}
 	n := "@r" + itoa(bd.anon)
 	bd.anon++
+	if bd.relNames == nil {
+		bd.relNames = map[*ast.RelPattern]string{}
+	}
+	bd.relNames[rp] = n
 	return n
 }
 

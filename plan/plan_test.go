@@ -21,9 +21,15 @@ func newCatalog() *fakeCatalog {
 	}
 }
 
-func (c *fakeCatalog) LabelToken(n string) (engine.Token, bool)   { t, ok := c.labels[n]; return t, ok }
-func (c *fakeCatalog) RelTypeToken(n string) (engine.Token, bool) { t, ok := c.relTypes[n]; return t, ok }
-func (c *fakeCatalog) PropKeyToken(n string) (engine.Token, bool) { t, ok := c.propKeys[n]; return t, ok }
+func (c *fakeCatalog) LabelToken(n string) (engine.Token, bool) { t, ok := c.labels[n]; return t, ok }
+func (c *fakeCatalog) RelTypeToken(n string) (engine.Token, bool) {
+	t, ok := c.relTypes[n]
+	return t, ok
+}
+func (c *fakeCatalog) PropKeyToken(n string) (engine.Token, bool) {
+	t, ok := c.propKeys[n]
+	return t, ok
+}
 
 func bound(t *testing.T, src string) *bind.Bound {
 	t.Helper()
@@ -211,4 +217,15 @@ func TestProjectionTail(t *testing.T) {
       Project p.name AS n
         NodeScan p:#1
 `)
+}
+
+func TestBuildNamedPath(t *testing.T) {
+	b := bound(t, "MATCH p = (a:Person)-[:KNOWS]->(b) RETURN p")
+	want := `Project p
+  BindPath p = [a,@r0,b]
+    Expand a -[@r0:#1]-> b
+      NodeScan a:#1
+`
+	eq(t, "raw", String(Build(b)), want)
+	eq(t, "normalized", String(Plan(b)), want)
 }

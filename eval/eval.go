@@ -8,9 +8,9 @@
 // not aggregate: an aggregate (count, sum, collect …) is computed by the
 // Aggregate operator over a stream of rows, not here. The entity functions that
 // name a node's or relationship's catalog facts (labels, type, keys, properties)
-// live in entity.go and read through the Tx plus the reverse name resolvers on
-// the Env; the path functions (nodes, relationships) are deferred until the Path
-// value type lands with shortestPath (deliverable 8b).
+// and the path functions (nodes, relationships, length) live in entity.go: the
+// first group reads through the Tx plus the reverse name resolvers on the Env,
+// the second projects a path value the executor materialized.
 //
 // Evaluation distinguishes null from error. A comparison or arithmetic step over
 // a null operand yields null (three-valued logic); a genuine type misuse (adding

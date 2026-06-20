@@ -113,6 +113,58 @@ func fnProperties(args []value.Value, env *Env) (value.Value, error) {
 	}
 }
 
+// fnNodes returns the nodes of a path as a list, in traversal order.
+func fnNodes(args []value.Value, _ *Env) (value.Value, error) {
+	if err := arity("nodes", args, 1); err != nil {
+		return value.Null, err
+	}
+	a := args[0]
+	if a.IsNull() {
+		return value.Null, nil
+	}
+	if a.Type() != value.TypePath {
+		return value.Null, fmt.Errorf("eval: nodes requires a path, got %s", a.Type())
+	}
+	return value.List(a.PathNodes()...), nil
+}
+
+// fnRelationships returns the relationships of a path as a list, in order.
+func fnRelationships(args []value.Value, _ *Env) (value.Value, error) {
+	if err := arity("relationships", args, 1); err != nil {
+		return value.Null, err
+	}
+	a := args[0]
+	if a.IsNull() {
+		return value.Null, nil
+	}
+	if a.Type() != value.TypePath {
+		return value.Null, fmt.Errorf("eval: relationships requires a path, got %s", a.Type())
+	}
+	return value.List(a.PathRels()...), nil
+}
+
+// fnLength returns a path's length: its number of relationships. For leniency it
+// also measures a list or string, matching the historical Cypher length().
+func fnLength(args []value.Value, _ *Env) (value.Value, error) {
+	if err := arity("length", args, 1); err != nil {
+		return value.Null, err
+	}
+	a := args[0]
+	if a.IsNull() {
+		return value.Null, nil
+	}
+	if a.Type() == value.TypePath {
+		return value.Int(int64(a.PathLen())), nil
+	}
+	if l, ok := a.AsList(); ok {
+		return value.Int(int64(len(l))), nil
+	}
+	if s, ok := a.AsString(); ok {
+		return value.Int(int64(len([]rune(s)))), nil
+	}
+	return value.Null, fmt.Errorf("eval: length requires a path, list, or string, got %s", a.Type())
+}
+
 // entityKeys returns the property-key tokens of a node or relationship value.
 func entityKeys(env *Env, a value.Value) ([]engine.Token, error) {
 	if env.Tx == nil {

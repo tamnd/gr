@@ -80,6 +80,18 @@ type Filter struct {
 	Pred  ast.Expr
 }
 
+// BindPath binds a named path variable to the path value assembled from the
+// pattern's element variables in traversal order: the start node, then each
+// step's relationship and node (MATCH p = (a)-[r]->(b), doc 09 §3.4). It is
+// added above a path pattern's expand chain when the pattern names a path. Elems
+// lists the element variable names in order (node, rel, node, ...); each is
+// already bound below.
+type BindPath struct {
+	Input Op
+	Var   string
+	Elems []string
+}
+
 // Col is one computed output column: an expression and the variable name it
 // binds (an alias, a carried variable name, or an implicit name).
 type Col struct {
@@ -166,6 +178,7 @@ func (*Argument) op()  {}
 func (*NodeScan) op()  {}
 func (*Expand) op()    {}
 func (*Filter) op()    {}
+func (*BindPath) op()  {}
 func (*Project) op()   {}
 func (*Aggregate) op() {}
 func (*Join) op()      {}
@@ -199,6 +212,10 @@ func outputVars(o Op) map[string]bool {
 		return s
 	case *Filter:
 		return outputVars(x.Input)
+	case *BindPath:
+		s := outputVars(x.Input)
+		s[x.Var] = true
+		return s
 	case *Project:
 		return colNames(x.Cols)
 	case *Aggregate:
@@ -284,6 +301,9 @@ func write(b *strings.Builder, o Op, depth int) {
 		write(b, x.Input, depth+1)
 	case *Filter:
 		b.WriteString("Filter " + ast.Print(x.Pred) + "\n")
+		write(b, x.Input, depth+1)
+	case *BindPath:
+		b.WriteString("BindPath " + x.Var + " = [" + strings.Join(x.Elems, ",") + "]\n")
 		write(b, x.Input, depth+1)
 	case *Project:
 		b.WriteString("Project" + distinct(x.Distinct) + " " + colList(x.Cols) + "\n")

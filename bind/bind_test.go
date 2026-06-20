@@ -25,9 +25,15 @@ func newCatalog() *fakeCatalog {
 	}
 }
 
-func (c *fakeCatalog) LabelToken(n string) (engine.Token, bool)   { t, ok := c.labels[n]; return t, ok }
-func (c *fakeCatalog) RelTypeToken(n string) (engine.Token, bool) { t, ok := c.relTypes[n]; return t, ok }
-func (c *fakeCatalog) PropKeyToken(n string) (engine.Token, bool) { t, ok := c.propKeys[n]; return t, ok }
+func (c *fakeCatalog) LabelToken(n string) (engine.Token, bool) { t, ok := c.labels[n]; return t, ok }
+func (c *fakeCatalog) RelTypeToken(n string) (engine.Token, bool) {
+	t, ok := c.relTypes[n]
+	return t, ok
+}
+func (c *fakeCatalog) PropKeyToken(n string) (engine.Token, bool) {
+	t, ok := c.propKeys[n]
+	return t, ok
+}
 
 func bindStr(t *testing.T, src string, strict bool) (*Bound, error) {
 	t.Helper()
@@ -174,5 +180,14 @@ func TestStarColumns(t *testing.T) {
 	got := strings.Join(b.Columns, ",")
 	if got != "a,b,r" {
 		t.Fatalf("star columns = %q, want a,b,r", got)
+	}
+}
+
+func TestBindNamedPath(t *testing.T) {
+	// A named path over fixed-length steps binds the path variable.
+	mustBind(t, "MATCH p = (a:Person)-[:KNOWS]->(b) RETURN p")
+	// A named path over a variable-length step is rejected for now.
+	if _, err := bindStr(t, "MATCH p = (a:Person)-[:KNOWS*]->(b) RETURN p", false); err == nil {
+		t.Fatal("named var-length path should be rejected")
 	}
 }

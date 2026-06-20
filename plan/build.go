@@ -23,9 +23,12 @@ func Build(b *bind.Bound) Op {
 	return left
 }
 
-// Plan builds and then normalizes: the pipeline's full logical-planning output,
-// the canonical tree handed to the cost-based planner (doc 10 §8.1).
-func Plan(b *bind.Bound) Op { return Normalize(Build(b)) }
+// Plan is the read path's full planning output: build the raw logical tree,
+// apply the rule-based planner subset (anchor and direction choice, doc 11 §3,
+// §6 simple form), then normalize to canonical form. In M2 this is the whole
+// planner; the cost-based planner that would replace Optimize is M4 (doc 10
+// §8.1).
+func Plan(b *bind.Bound) Op { return Normalize(Optimize(Build(b))) }
 
 // builder carries the per-build state: the bound query (for resolved tokens) and
 // the counter that names anonymous pattern elements.

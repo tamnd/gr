@@ -197,6 +197,16 @@ type RemoveItem struct {
 	Labels []bind.NameRef // label removal
 }
 
+// Delete is the write operator for a DELETE or DETACH DELETE clause: for each
+// input row it evaluates every target expression and removes the node or
+// relationship it names, then passes the row on unchanged (doc 13 §9). It binds
+// nothing new. Detach cascades to a node's relationships before removing it.
+type Delete struct {
+	Input   Op
+	Detach  bool
+	Targets []ast.Expr
+}
+
 // Col is one computed output column: an expression and the variable name it
 // binds (an alias, a carried variable name, or an implicit name).
 type Col struct {
@@ -282,6 +292,7 @@ func (*Unit) op()         {}
 func (*Create) op()       {}
 func (*Set) op()          {}
 func (*Remove) op()       {}
+func (*Delete) op()       {}
 func (*Argument) op()     {}
 func (*NodeScan) op()     {}
 func (*Expand) op()       {}
@@ -318,6 +329,8 @@ func outputVars(o Op) map[string]bool {
 	case *Set:
 		return outputVars(x.Input)
 	case *Remove:
+		return outputVars(x.Input)
+	case *Delete:
 		return outputVars(x.Input)
 	case *Argument:
 		s := make(map[string]bool, len(x.Vars))
@@ -429,6 +442,9 @@ func write(b *strings.Builder, o Op, depth int) {
 		write(b, x.Input, depth+1)
 	case *Remove:
 		b.WriteString("Remove " + removeLabel(x) + "\n")
+		write(b, x.Input, depth+1)
+	case *Delete:
+		b.WriteString("Delete " + deleteLabel(x) + "\n")
 		write(b, x.Input, depth+1)
 	case *Argument:
 		b.WriteString("Argument [" + strings.Join(x.Vars, ",") + "]\n")
@@ -591,6 +607,20 @@ func removeLabel(x *Remove) string {
 		}
 	}
 	return strings.Join(parts, ", ")
+}
+
+// deleteLabel renders a Delete operator: a DETACH marker when present, then the
+// target expressions.
+func deleteLabel(x *Delete) string {
+	parts := make([]string, len(x.Targets))
+	for i, t := range x.Targets {
+		parts[i] = ast.Print(t)
+	}
+	s := strings.Join(parts, ", ")
+	if x.Detach {
+		return "DETACH " + s
+	}
+	return s
 }
 
 // tokenLabel renders a resolved name as its #token, or #? when unresolved.

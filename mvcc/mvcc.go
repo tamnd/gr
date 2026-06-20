@@ -1,0 +1,224 @@
+// Package mvcc realizes graph-element multi-version concurrency control for the
+// storage engine in its single-writer-first form (doc 06; doc 25 §4 deliverable
+// 9). It provides the three pieces the engine composes into snapshot isolation:
+//
+//   - the [Oracle], the global commit-sequence clock and the watermark over live
+//     snapshots that governs version reclamation (doc 06 §2.1, §4);
+//   - the [Snapshot], a captured read sequence that defines a transaction's
+//     stable, point-in-time view (doc 06 §2.2);
+//   - the [Overlay], an in-memory retention of pre-images that lets a snapshot
+//     resolve a datum as of its read sequence even after a later writer has
+//     overwritten the durable base (doc 06 §2.3; doc 04 §11).
+//
+// The model here is retention of superseded values: the durable base stores
+// always hold the latest committed state (so recovery needs nothing extra and a
+// fresh open with no live readers reads straight through), and the overlay keeps
+// the value a datum had *before* each committed write, tagged with the sequence
+// at which the new value took effect. A reader at read sequence r resolves a
+// datum by finding the earliest committed write with sequence greater than r and
+// returning the pre-image it saved — the value as of r — falling back to the
+// base when no such write exists. The watermark bounds how long a pre-image must
+// be kept: once no live snapshot can read below a write's sequence, its
+// pre-image is dropped.
+//
+// Single-writer-first means one writer at a time creates versions, so version
+// creation is serialized and conflict-free; the concurrent-writer growth path
+// (doc 06 §6) adds only a commit-time disjointness check behind this same model
+// and is not part of M1.
+package mvcc
+
+import (
+	"sync"
+
+	"github.com/tamnd/gr/value"
+)
+
+// Seq is a commit sequence number, the monotonic global clock of the version
+// model (doc 06 §2.1). The engine derives it from the pager's durable change
+// counter, so it survives recovery and stays monotonic across reopens.
+type Seq = uint64
+
+// Kind names a versioned datum's category, so a [Key] is unambiguous across the
+// node and relationship stores and their property columns.
+type Kind uint8
+
+const (
+	// NodeExist versions a node's existence (created or deleted).
+	NodeExist Kind = iota
+	// NodeLabels versions a node's label set.
+	NodeLabels
+	// NodeProp versions one node property value (keyed by property token in Sub).
+	NodeProp
+	// RelExist versions a relationship's existence; the adjacency reads this to
+	// decide whether an edge is visible to a snapshot.
+	RelExist
+	// RelProp versions one relationship property value (keyed by token in Sub).
+	RelProp
+)
+
+// Key identifies a versioned datum: its kind, the dense position of the element
+// it belongs to, and a sub-key (a property token for the property kinds, zero
+// otherwise).
+type Key struct {
+	Kind Kind
+	Pos  uint64
+	Sub  uint32
+}
+
+// Pre is a datum's pre-image: the value it held before a write, retained so an
+// older snapshot can resolve it. Which fields are meaningful depends on the
+// key's kind: Present alone for the existence kinds, Present plus Val for the
+// property kinds, Labels for NodeLabels.
+type Pre struct {
+	Present bool
+	Val     value.Value
+	Labels  []uint32
+}
+
+// --- the oracle ---
+
+// Oracle is the commit-sequence clock and the watermark oracle (doc 06 §2.1,
+// §4). It hands read sequences to snapshots, advances the commit sequence as
+// writers commit, and reports the watermark — the oldest read sequence any live
+// snapshot holds — below which superseded versions can be reclaimed.
+type Oracle struct {
+	mu   sync.Mutex
+	seq  Seq
+	next uint64
+	live map[uint64]Seq // snapshot id -> read sequence
+}
+
+// NewOracle starts the clock at seq, the last durably committed sequence (the
+// engine passes the recovered change counter, so the clock continues monotonically).
+func NewOracle(seq Seq) *Oracle {
+	return &Oracle{seq: seq, live: map[uint64]Seq{}}
+}
+
+// Seq returns the current commit sequence.
+func (o *Oracle) Seq() Seq {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.seq
+}
+
+// SetSeq advances the commit sequence to s after a durable commit. It never goes
+// backwards (a commit that bumped the durable counter only moves it forward).
+func (o *Oracle) SetSeq(s Seq) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if s > o.seq {
+		o.seq = s
+	}
+}
+
+// Begin registers a new snapshot at the current commit sequence and returns its
+// id and read sequence. The id is passed back to End to deregister.
+func (o *Oracle) Begin() (id uint64, read Seq) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.next++
+	id = o.next
+	o.live[id] = o.seq
+	return id, o.seq
+}
+
+// End deregisters a snapshot, allowing the watermark to advance past it.
+func (o *Oracle) End(id uint64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.live, id)
+}
+
+// Watermark returns the oldest read sequence among live snapshots, or the
+// current commit sequence if none are live (nothing to retain). A version
+// superseded at sequence s is needed only by snapshots whose read sequence is
+// below s, so once the watermark reaches s its pre-image can be dropped.
+func (o *Oracle) Watermark() Seq {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	wm := o.seq
+	for _, r := range o.live {
+		if r < wm {
+			wm = r
+		}
+	}
+	return wm
+}
+
+// --- the retention overlay ---
+
+type entry struct {
+	seq Seq
+	pre Pre
+}
+
+// Overlay retains pre-images of superseded datums so older snapshots resolve the
+// value as of their read sequence (doc 04 §11.3). It is purely in-memory: it
+// holds only versions superseded since the base last reflected them, and it
+// starts empty after a crash (a fresh open has no live old snapshots, so the
+// base is the whole truth).
+type Overlay struct {
+	mu     sync.RWMutex
+	chains map[Key][]entry // each chain ascending by seq
+}
+
+// NewOverlay returns an empty overlay.
+func NewOverlay() *Overlay {
+	return &Overlay{chains: map[Key][]entry{}}
+}
+
+// Record saves a datum's pre-image, tagged with the sequence at which the new
+// value took effect. Commits are monotonic, so the per-key chain stays ascending
+// by sequence with a plain append.
+func (ov *Overlay) Record(seq Seq, key Key, pre Pre) {
+	ov.mu.Lock()
+	defer ov.mu.Unlock()
+	ov.chains[key] = append(ov.chains[key], entry{seq: seq, pre: pre})
+}
+
+// Resolve returns the value of a datum as of read sequence r: the pre-image of
+// the earliest committed write whose sequence is greater than r (that write
+// replaced the value the snapshot should see). ok is false when no retained
+// write supersedes the base for this snapshot, meaning the caller reads the base.
+func (ov *Overlay) Resolve(key Key, r Seq) (Pre, bool) {
+	ov.mu.RLock()
+	defer ov.mu.RUnlock()
+	for _, e := range ov.chains[key] {
+		if e.seq > r {
+			return e.pre, true
+		}
+	}
+	return Pre{}, false
+}
+
+// GC drops pre-images no live snapshot can need: an entry tagged seq serves
+// snapshots whose read sequence is below seq, so once the watermark reaches seq
+// it is reclaimable (doc 06 §4.3).
+func (ov *Overlay) GC(watermark Seq) {
+	ov.mu.Lock()
+	defer ov.mu.Unlock()
+	for k, ch := range ov.chains {
+		kept := ch[:0]
+		for _, e := range ch {
+			if e.seq > watermark {
+				kept = append(kept, e)
+			}
+		}
+		if len(kept) == 0 {
+			delete(ov.chains, k)
+		} else {
+			ov.chains[k] = kept
+		}
+	}
+}
+
+// Len reports the number of retained pre-images, for tests and observability.
+func (ov *Overlay) Len() int {
+	ov.mu.RLock()
+	defer ov.mu.RUnlock()
+	var n int
+	for _, ch := range ov.chains {
+		n += len(ch)
+	}
+	return n
+}

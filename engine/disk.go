@@ -9,6 +9,7 @@ import (
 	"github.com/tamnd/gr/catalog"
 	"github.com/tamnd/gr/column"
 	"github.com/tamnd/gr/idmap"
+	"github.com/tamnd/gr/mvcc"
 	"github.com/tamnd/gr/node"
 	"github.com/tamnd/gr/pager"
 	"github.com/tamnd/gr/rel"
@@ -26,21 +27,23 @@ var ErrIDMapDesync = errors.New("gr/engine: id-map and record store out of sync"
 
 // DiskEngine is the real, durable storage engine of M1: it composes the catalog,
 // id-map, node and relationship record stores, columnar property stores, and the
-// CSR adjacency over one pager, behind the frozen engine SPI ([engine.Engine]).
+// CSR adjacency over one pager, behind the frozen engine SPI ([engine.Engine]),
+// with graph-element MVCC ([mvcc]) layered on top for snapshot isolation.
 //
-// It is the single-writer-first realization (doc 06 §5, doc 25 §4 deliverable 9
-// in its first form): a write transaction holds the engine's write lock for its
-// duration and is made durable by the pager's commit; read transactions share a
-// read lock. Full MVCC snapshot isolation — readers that never block during a
-// write, version tags, the watermark oracle, and version GC — is the next PR; it
-// slots in behind this same interface without the query stack noticing, which is
-// the whole point of the SPI seam.
+// It is the single-writer-first realization (doc 06 §5; doc 25 §4 deliverable 9):
+// one write transaction at a time holds the engine's write lock and creates
+// versions; read transactions take a snapshot of the commit sequence and resolve
+// every read as of that point, so a reader never sees a writer's uncommitted work
+// and a reader's view is stable for its whole life. The durable base stores hold
+// the latest committed state; an in-memory retention overlay ([mvcc.Overlay])
+// keeps the pre-images older snapshots still need, reclaimed by the watermark.
+// Full concurrent writers (doc 06 §6) add only a commit-time disjointness check
+// behind this same model and are post-M1.
 //
-// Catalog interning (mapping label/type/property-key strings to tokens) is a
-// setup-time concern outside the per-transaction SPI, exposed as Intern and
-// TokenName on the concrete type. SPI tokens are one-based: token 0 is the
-// SPI's "all labels"/"all types" wildcard (see ScanLabel and Expand), so the
-// engine offsets catalog tokens by one at the boundary.
+// Catalog interning is a setup-time concern outside the per-transaction SPI,
+// exposed as Intern and TokenName on the concrete type. SPI tokens are one-based:
+// token 0 is the SPI's "all labels"/"all types" wildcard (see ScanLabel and
+// Expand), so the engine offsets catalog tokens by one at the boundary.
 type DiskEngine struct {
 	mu     sync.RWMutex
 	p      *pager.Pager
@@ -52,18 +55,23 @@ type DiskEngine struct {
 	ncols  *column.Columns
 	rcols  *column.Columns
 	adj    *adj.Adj
+	oracle *mvcc.Oracle
+	ov     *mvcc.Overlay
 	closed bool
 }
 
 // Open opens or creates a graph database at path. A fresh file gets empty stores,
 // committed so the structure is durable; an existing file reopens its stores,
-// recovering to the committed prefix via the pager.
+// recovering to the committed prefix via the pager. The MVCC clock starts at the
+// pager's durable change counter, so commit sequences continue monotonically
+// across reopens; the retention overlay starts empty (a fresh open has no live
+// old snapshots, so the base is the whole truth).
 func Open(fsys vfs.VFS, path string, opt pager.Options) (*DiskEngine, error) {
 	p, err := pager.Open(fsys, path, opt)
 	if err != nil {
 		return nil, err
 	}
-	e := &DiskEngine{p: p}
+	e := &DiskEngine{p: p, ov: mvcc.NewOverlay()}
 	fresh := p.SectionDir() == 0
 	if err := e.load(fresh); err != nil {
 		_ = p.Close()
@@ -75,12 +83,14 @@ func Open(fsys vfs.VFS, path string, opt pager.Options) (*DiskEngine, error) {
 			return nil, err
 		}
 	}
+	e.oracle = mvcc.NewOracle(p.Header().ChangeCounter)
 	return e, nil
 }
 
 // load (re)builds the store handles over the current pager state, creating the
 // stores when fresh and opening them otherwise. It is also used to rebuild state
-// after a rollback.
+// after a rollback. It does not touch the oracle or overlay, which outlive a
+// transaction abort.
 func (e *DiskEngine) load(create bool) error {
 	var err error
 	if create {
@@ -133,6 +143,17 @@ func (e *DiskEngine) load(create bool) error {
 	return err
 }
 
+// commitPager makes the pager durable and advances the MVCC clock to the new
+// durable change counter, the single source of commit sequences.
+func (e *DiskEngine) commitPager() (mvcc.Seq, error) {
+	if err := e.p.Commit(); err != nil {
+		return 0, err
+	}
+	seq := e.p.Header().ChangeCounter
+	e.oracle.SetSeq(seq)
+	return seq, nil
+}
+
 // Intern maps a label/relationship-type/property-key name to its token, assigning
 // one if new. It is its own durable transaction (it takes the write lock and
 // commits), so call it for schema setup between graph transactions. The returned
@@ -144,14 +165,14 @@ func (e *DiskEngine) Intern(kind catalog.Kind, name string) (Token, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := e.p.Commit(); err != nil {
+	if _, err := e.commitPager(); err != nil {
 		return 0, err
 	}
 	return Token(t + 1), nil
 }
 
 // Lookup returns the one-based token for an already-interned name, or false. It
-// takes no lock beyond a read lock and does not commit.
+// takes a read lock and does not commit.
 func (e *DiskEngine) Lookup(kind catalog.Kind, name string) (Token, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -170,27 +191,34 @@ func (e *DiskEngine) TokenName(kind catalog.Kind, t Token) (string, bool) {
 	return e.cat.Name(kind, uint32(t-1))
 }
 
-// Begin opens a transaction, taking the write lock for a write transaction or the
-// read lock otherwise, held until Commit or Abort.
+// Begin opens a transaction. A write transaction takes the engine's write lock
+// for its whole duration (single-writer-first) and reads its own writes through
+// the live base. A read transaction takes a snapshot of the commit sequence and
+// holds no lock between operations, so it never blocks a writer for its lifetime;
+// each read briefly shares the lock only to read the base coherently.
 func (e *DiskEngine) Begin(write bool) (Tx, error) {
 	if write {
 		e.mu.Lock()
-	} else {
-		e.mu.RLock()
 	}
-	return &diskTx{e: e, write: write}, nil
+	snap, read := e.oracle.Begin()
+	return &diskTx{e: e, write: write, snap: snap, readSeq: read}, nil
 }
 
-// Checkpoint folds the adjacency delta into the base CSR and makes everything
-// durable. It takes the write lock, so it does not run concurrently with a write
-// transaction.
+// Checkpoint folds the adjacency delta into the base CSR, makes everything
+// durable, and reclaims overlay pre-images no live snapshot can see (the
+// watermark bound). It takes the write lock, so it does not run concurrently
+// with a write transaction.
 func (e *DiskEngine) Checkpoint() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.adj.Checkpoint(uint64(e.nodes.Count())); err != nil {
 		return err
 	}
-	return e.p.Commit()
+	if _, err := e.commitPager(); err != nil {
+		return err
+	}
+	e.ov.GC(e.oracle.Watermark())
+	return nil
 }
 
 // Close releases the engine and its pager.
@@ -204,13 +232,35 @@ func (e *DiskEngine) Close() error {
 	return e.p.Close()
 }
 
-// diskTx is a transaction over the disk engine. It holds the lock acquired in
-// Begin; the read methods consult the committed stores, and the write methods
-// mutate them, made durable at Commit.
+// diskTx is a transaction over the disk engine. A read transaction resolves every
+// read as of readSeq through the overlay, falling back to the base; a write
+// transaction mutates the base in place under the held write lock, records each
+// datum's pre-image, and publishes them to the overlay at commit so older
+// snapshots keep resolving the values they saw.
 type diskTx struct {
-	e     *DiskEngine
-	write bool
-	done  bool
+	e       *DiskEngine
+	write   bool
+	done    bool
+	snap    uint64
+	readSeq mvcc.Seq
+	pending []pendingPre
+}
+
+// pendingPre is a captured pre-image awaiting publication at commit.
+type pendingPre struct {
+	key mvcc.Key
+	pre mvcc.Pre
+}
+
+// rguard takes the engine read lock for a read transaction's physical base
+// access and returns the matching unlock; under a write transaction the
+// exclusive lock is already held, so it is a no-op.
+func (t *diskTx) rguard() func() {
+	if t.write {
+		return func() {}
+	}
+	t.e.mu.RLock()
+	return t.e.mu.RUnlock
 }
 
 // --- token and id helpers ---
@@ -227,19 +277,61 @@ func labelsToCat(ts []Token) []uint32 {
 	return out
 }
 
-// nodePos resolves a node id to its dense position, requiring it to be live.
+// --- snapshot-scoped resolution: overlay first, then base ---
+
+// nodeLive reports whether a node position is visible to this snapshot.
+func (t *diskTx) nodeLive(pos uint64) bool {
+	if pre, ok := t.e.ov.Resolve(mvcc.Key{Kind: mvcc.NodeExist, Pos: pos}, t.readSeq); ok {
+		return pre.Present
+	}
+	return t.e.nodes.Exists(pos)
+}
+
+// relLive reports whether a relationship position is visible to this snapshot.
+func (t *diskTx) relLive(pos uint64) bool {
+	if pre, ok := t.e.ov.Resolve(mvcc.Key{Kind: mvcc.RelExist, Pos: pos}, t.readSeq); ok {
+		return pre.Present
+	}
+	return t.e.rels.Exists(pos)
+}
+
+// snapLabels returns the node's label set as of the snapshot.
+func (t *diskTx) snapLabels(pos uint64) ([]uint32, error) {
+	if pre, ok := t.e.ov.Resolve(mvcc.Key{Kind: mvcc.NodeLabels, Pos: pos}, t.readSeq); ok {
+		return pre.Labels, nil
+	}
+	return t.e.nodes.Labels(pos)
+}
+
+// snapNodeProp returns a node property value (and presence) as of the snapshot.
+func (t *diskTx) snapNodeProp(pos uint64, key uint32) (value.Value, bool, error) {
+	if pre, ok := t.e.ov.Resolve(mvcc.Key{Kind: mvcc.NodeProp, Pos: pos, Sub: key}, t.readSeq); ok {
+		return pre.Val, pre.Present, nil
+	}
+	return t.e.ncols.Get(key, pos)
+}
+
+// snapRelProp returns a relationship property value (and presence) as of the snapshot.
+func (t *diskTx) snapRelProp(pos uint64, key uint32) (value.Value, bool, error) {
+	if pre, ok := t.e.ov.Resolve(mvcc.Key{Kind: mvcc.RelProp, Pos: pos, Sub: key}, t.readSeq); ok {
+		return pre.Val, pre.Present, nil
+	}
+	return t.e.rcols.Get(key, pos)
+}
+
+// nodePos resolves a node id to its dense position, requiring it visible.
 func (t *diskTx) nodePos(id NodeID) (uint64, error) {
 	pos, ok := t.e.ids.Pos(uint64(id))
-	if !ok || !t.e.nodes.Exists(pos) {
+	if !ok || !t.nodeLive(pos) {
 		return 0, ErrNoSuchNode
 	}
 	return pos, nil
 }
 
-// relPos resolves a relationship id to its dense position, requiring it live.
+// relPos resolves a relationship id to its dense position, requiring it visible.
 func (t *diskTx) relPos(id RelID) (uint64, error) {
 	pos, ok := t.e.ids.Pos(uint64(id))
-	if !ok || !t.e.rels.Exists(pos) {
+	if !ok || !t.relLive(pos) {
 		return 0, ErrNoSuchRel
 	}
 	return pos, nil
@@ -248,19 +340,21 @@ func (t *diskTx) relPos(id RelID) (uint64, error) {
 // --- reads ---
 
 func (t *diskTx) NodeExists(id NodeID) (bool, error) {
+	defer t.rguard()()
 	pos, ok := t.e.ids.Pos(uint64(id))
 	if !ok {
 		return false, nil
 	}
-	return t.e.nodes.Exists(pos), nil
+	return t.nodeLive(pos), nil
 }
 
 func (t *diskTx) NodeLabels(id NodeID) ([]Token, error) {
+	defer t.rguard()()
 	pos, err := t.nodePos(id)
 	if err != nil {
 		return nil, err
 	}
-	cats, err := t.e.nodes.Labels(pos)
+	cats, err := t.snapLabels(pos)
 	if err != nil {
 		return nil, err
 	}
@@ -272,19 +366,25 @@ func (t *diskTx) NodeLabels(id NodeID) ([]Token, error) {
 }
 
 func (t *diskTx) HasLabel(id NodeID, label Token) (bool, error) {
+	defer t.rguard()()
 	pos, err := t.nodePos(id)
 	if err != nil {
 		return false, err
 	}
-	return t.e.nodes.HasLabel(pos, toCat(label))
+	cats, err := t.snapLabels(pos)
+	if err != nil {
+		return false, err
+	}
+	return slices.Contains(cats, toCat(label)), nil
 }
 
 func (t *diskTx) NodeProperty(id NodeID, key Token) (value.Value, error) {
+	defer t.rguard()()
 	pos, err := t.nodePos(id)
 	if err != nil {
 		return value.Null, err
 	}
-	v, ok, err := t.e.ncols.Get(toCat(key), pos)
+	v, ok, err := t.snapNodeProp(pos, toCat(key))
 	if err != nil || !ok {
 		return value.Null, err
 	}
@@ -292,11 +392,12 @@ func (t *diskTx) NodeProperty(id NodeID, key Token) (value.Value, error) {
 }
 
 func (t *diskTx) RelProperty(id RelID, key Token) (value.Value, error) {
+	defer t.rguard()()
 	pos, err := t.relPos(id)
 	if err != nil {
 		return value.Null, err
 	}
-	v, ok, err := t.e.rcols.Get(toCat(key), pos)
+	v, ok, err := t.snapRelProp(pos, toCat(key))
 	if err != nil || !ok {
 		return value.Null, err
 	}
@@ -304,16 +405,17 @@ func (t *diskTx) RelProperty(id RelID, key Token) (value.Value, error) {
 }
 
 func (t *diskTx) ScanLabel(label Token, fn func(NodeID) error) error {
+	defer t.rguard()()
 	for pos := range uint64(t.e.nodes.Count()) {
-		if !t.e.nodes.Exists(pos) {
+		if !t.nodeLive(pos) {
 			continue
 		}
 		if label != 0 {
-			has, err := t.e.nodes.HasLabel(pos, toCat(label))
+			cats, err := t.snapLabels(pos)
 			if err != nil {
 				return err
 			}
-			if !has {
+			if !slices.Contains(cats, toCat(label)) {
 				continue
 			}
 		}
@@ -329,15 +431,17 @@ func (t *diskTx) ScanLabel(label Token, fn func(NodeID) error) error {
 }
 
 func (t *diskTx) Expand(id NodeID, relType Token, dir Direction, fn func(Neighbor) error) error {
+	defer t.rguard()()
 	pos, err := t.nodePos(id)
 	if err != nil {
 		return err
 	}
+	visible := func(edge uint64) bool { return t.relLive(edge) }
 	dirs := dirSlice(dir)
 	types := t.typeSlice(relType)
 	for _, ty := range types {
 		for _, d := range dirs {
-			nbrs, err := t.e.adj.Expand(pos, ty, d)
+			nbrs, err := t.e.adj.ExpandWith(pos, ty, d, visible)
 			if err != nil {
 				return err
 			}
@@ -401,6 +505,11 @@ func (t *diskTx) CreateNode(labels []Token) (NodeID, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Before this node existed, an older snapshot saw it as absent.
+	t.pending = append(t.pending, pendingPre{
+		key: mvcc.Key{Kind: mvcc.NodeExist, Pos: pos},
+		pre: mvcc.Pre{Present: false},
+	})
 	npos, err := t.e.nodes.Create(labelsToCat(labels))
 	if err != nil {
 		return 0, err
@@ -426,14 +535,18 @@ func (t *diskTx) DeleteNode(id NodeID) error {
 	if attached {
 		return ErrDetachRequired
 	}
-	if err := t.e.nodes.Delete(pos); err != nil {
-		return err
-	}
-	return t.e.ids.Delete(uint64(id))
+	// An older snapshot still sees the node, so retain its existence pre-image.
+	t.pending = append(t.pending, pendingPre{
+		key: mvcc.Key{Kind: mvcc.NodeExist, Pos: pos},
+		pre: mvcc.Pre{Present: true},
+	})
+	// The id-map mapping is kept (not removed) so older snapshots can still
+	// resolve the position from the element id; id reclamation is deferred.
+	return t.e.nodes.Delete(pos)
 }
 
 // hasAnyRel reports whether a node position has any live relationship in either
-// direction across all known types.
+// direction across all known types, from the writer's latest view.
 func (t *diskTx) hasAnyRel(pos uint64) (bool, error) {
 	for ty := range uint32(t.e.cat.Count(catalog.KindRelType)) {
 		for _, d := range []adj.Dir{adj.Out, adj.In} {
@@ -466,6 +579,10 @@ func (t *diskTx) CreateRel(src, dst NodeID, relType Token) (RelID, error) {
 	if err != nil {
 		return 0, err
 	}
+	t.pending = append(t.pending, pendingPre{
+		key: mvcc.Key{Kind: mvcc.RelExist, Pos: pos},
+		pre: mvcc.Pre{Present: false},
+	})
 	rpos, err := t.e.rels.Create(ty, spos, dpos)
 	if err != nil {
 		return 0, err
@@ -485,10 +602,11 @@ func (t *diskTx) DeleteRel(id RelID) error {
 	if err != nil {
 		return err
 	}
-	if err := t.e.rels.Delete(pos); err != nil {
-		return err
-	}
-	return t.e.ids.Delete(uint64(id))
+	t.pending = append(t.pending, pendingPre{
+		key: mvcc.Key{Kind: mvcc.RelExist, Pos: pos},
+		pre: mvcc.Pre{Present: true},
+	})
+	return t.e.rels.Delete(pos)
 }
 
 func (t *diskTx) SetNodeProperty(id NodeID, key Token, v value.Value) error {
@@ -499,10 +617,19 @@ func (t *diskTx) SetNodeProperty(id NodeID, key Token, v value.Value) error {
 	if err != nil {
 		return err
 	}
-	if v.IsNull() {
-		return t.e.ncols.Remove(toCat(key), pos)
+	c := toCat(key)
+	old, present, err := t.e.ncols.Get(c, pos)
+	if err != nil {
+		return err
 	}
-	return t.e.ncols.Set(toCat(key), pos, v)
+	t.pending = append(t.pending, pendingPre{
+		key: mvcc.Key{Kind: mvcc.NodeProp, Pos: pos, Sub: c},
+		pre: mvcc.Pre{Present: present, Val: old},
+	})
+	if v.IsNull() {
+		return t.e.ncols.Remove(c, pos)
+	}
+	return t.e.ncols.Set(c, pos, v)
 }
 
 func (t *diskTx) SetRelProperty(id RelID, key Token, v value.Value) error {
@@ -513,10 +640,19 @@ func (t *diskTx) SetRelProperty(id RelID, key Token, v value.Value) error {
 	if err != nil {
 		return err
 	}
-	if v.IsNull() {
-		return t.e.rcols.Remove(toCat(key), pos)
+	c := toCat(key)
+	old, present, err := t.e.rcols.Get(c, pos)
+	if err != nil {
+		return err
 	}
-	return t.e.rcols.Set(toCat(key), pos, v)
+	t.pending = append(t.pending, pendingPre{
+		key: mvcc.Key{Kind: mvcc.RelProp, Pos: pos, Sub: c},
+		pre: mvcc.Pre{Present: present, Val: old},
+	})
+	if v.IsNull() {
+		return t.e.rcols.Remove(c, pos)
+	}
+	return t.e.rcols.Set(c, pos, v)
 }
 
 func (t *diskTx) AddLabel(id NodeID, label Token) error {
@@ -535,9 +671,10 @@ func (t *diskTx) AddLabel(id NodeID, label Token) error {
 	if slices.Contains(cats, c) {
 		return nil
 	}
-	cats = append(cats, c)
-	slices.Sort(cats)
-	return t.e.nodes.SetLabels(pos, cats)
+	t.recordLabels(pos, cats)
+	next := append(slices.Clone(cats), c)
+	slices.Sort(next)
+	return t.e.nodes.SetLabels(pos, next)
 }
 
 func (t *diskTx) RemoveLabel(id NodeID, label Token) error {
@@ -557,8 +694,17 @@ func (t *diskTx) RemoveLabel(id NodeID, label Token) error {
 	if idx < 0 {
 		return nil
 	}
-	cats = slices.Delete(cats, idx, idx+1)
-	return t.e.nodes.SetLabels(pos, cats)
+	t.recordLabels(pos, cats)
+	next := slices.Delete(slices.Clone(cats), idx, idx+1)
+	return t.e.nodes.SetLabels(pos, next)
+}
+
+// recordLabels retains the current label set as the pre-image for older snapshots.
+func (t *diskTx) recordLabels(pos uint64, cats []uint32) {
+	t.pending = append(t.pending, pendingPre{
+		key: mvcc.Key{Kind: mvcc.NodeLabels, Pos: pos},
+		pre: mvcc.Pre{Present: true, Labels: slices.Clone(cats)},
+	})
 }
 
 // --- lifecycle ---
@@ -568,12 +714,23 @@ func (t *diskTx) Commit() error {
 		return nil
 	}
 	t.done = true
+	t.e.oracle.End(t.snap)
 	if !t.write {
-		t.e.mu.RUnlock()
 		return nil
 	}
 	defer t.e.mu.Unlock()
-	return t.e.p.Commit()
+	seq, err := t.e.commitPager()
+	if err != nil {
+		return err
+	}
+	// Publish pre-images at the commit sequence (durable-before-visible: the
+	// pager commit above is the durability point, this publication the visibility
+	// point). Older snapshots now resolve the retained values; newer ones read
+	// the freshly committed base.
+	for _, pp := range t.pending {
+		t.e.ov.Record(seq, pp.key, pp.pre)
+	}
+	return nil
 }
 
 func (t *diskTx) Abort() error {
@@ -581,15 +738,16 @@ func (t *diskTx) Abort() error {
 		return nil
 	}
 	t.done = true
+	t.e.oracle.End(t.snap)
 	if !t.write {
-		t.e.mu.RUnlock()
 		return nil
 	}
 	defer t.e.mu.Unlock()
+	// Nothing was published to the overlay, so the abort only rewinds the pager
+	// and rebuilds the in-memory store state (id-map maps, record counts, the
+	// adjacency delta) from the rolled-back, last-committed prefix.
 	if err := t.e.p.Rollback(); err != nil {
 		return err
 	}
-	// In-memory store state (id-map maps, record counts, the adjacency delta)
-	// was mutated during the transaction; rebuild it from the rolled-back pager.
 	return t.e.load(false)
 }

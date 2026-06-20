@@ -186,11 +186,20 @@ func cmpNeighbor(a, b Neighbor) int {
 	}
 }
 
-// Expand returns the snapshot-visible neighbors of src along the given type and
-// direction, base and delta merged, sorted by neighbor then edge. An edge that
-// is no longer live in the relationship store is dropped, which is how a delete
-// takes effect against both the base and the delta.
+// Expand returns the live neighbors of src along the given type and direction,
+// base and delta merged, sorted by neighbor then edge. An edge that is no longer
+// live in the relationship store is dropped, which is how a delete takes effect
+// against both the base and the delta.
 func (a *Adj) Expand(src uint64, relType uint32, d Dir) ([]Neighbor, error) {
+	return a.ExpandWith(src, relType, d, a.rels.Exists)
+}
+
+// ExpandWith is Expand with a caller-supplied edge-visibility predicate in place
+// of the default liveness test. The engine passes a snapshot-scoped predicate so
+// an edge appears only if its relationship is visible to the reader's snapshot
+// (doc 04 §11.3), folding MVCC visibility into the same merge that handles
+// deletes — a deleted or not-yet-visible edge is simply one the predicate drops.
+func (a *Adj) ExpandWith(src uint64, relType uint32, d Dir, visible func(edge uint64) bool) ([]Neighbor, error) {
 	s := slot(relType, d)
 	var out []Neighbor
 
@@ -199,12 +208,12 @@ func (a *Adj) Expand(src uint64, relType uint32, d Dir) ([]Neighbor, error) {
 		return nil, err
 	}
 	for _, nb := range run {
-		if a.rels.Exists(nb.Edge) {
+		if visible(nb.Edge) {
 			out = append(out, nb)
 		}
 	}
 	for _, nb := range a.delta[s][src] {
-		if a.rels.Exists(nb.Edge) {
+		if visible(nb.Edge) {
 			out = append(out, nb)
 		}
 	}

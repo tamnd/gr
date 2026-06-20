@@ -246,6 +246,10 @@ func (db *DB) internWriteNames(q *ast.Query) error {
 						return err
 					}
 				}
+			case *ast.Merge:
+				if err := db.internMergeNames(cl); err != nil {
+					return err
+				}
 			case *ast.Set:
 				if err := db.internSetNames(cl); err != nil {
 					return err
@@ -265,7 +269,14 @@ func (db *DB) internWriteNames(q *ast.Query) error {
 // them; their keys come from the value at run time and the executor interns them
 // inside the write transaction through Tx.InternPropKey (doc 13 §6.4).
 func (db *DB) internSetNames(s *ast.Set) error {
-	for _, it := range s.Items {
+	return db.internSetItemNames(s.Items)
+}
+
+// internSetItemNames interns the static names a list of SET items introduces, the
+// shared body of internSetNames and the ON CREATE / ON MATCH parts of MERGE. The
+// map forms carry no static key (see internSetNames).
+func (db *DB) internSetItemNames(items []ast.SetItem) error {
+	for _, it := range items {
 		switch it.Op {
 		case ast.SetProperty:
 			if err := db.internName(catalog.KindPropKey, it.Key); err != nil {
@@ -280,6 +291,20 @@ func (db *DB) internSetNames(s *ast.Set) error {
 		}
 	}
 	return nil
+}
+
+// internMergeNames interns the names a MERGE clause introduces: the labels, types,
+// and property keys of its pattern (it may create the whole pattern, so its names
+// must resolve like CREATE's, doc 13 §11.2) and the static names of its ON CREATE
+// and ON MATCH set items.
+func (db *DB) internMergeNames(m *ast.Merge) error {
+	if err := db.internPatternNames(m.Pattern); err != nil {
+		return err
+	}
+	if err := db.internSetItemNames(m.OnCreate); err != nil {
+		return err
+	}
+	return db.internSetItemNames(m.OnMatch)
 }
 
 // internPatternNames interns the names of one CREATE path pattern: each node's
@@ -337,7 +362,7 @@ func queryHasWrites(q *ast.Query) bool {
 	for _, sq := range singleQueries(q) {
 		for _, c := range sq.Clauses {
 			switch c.(type) {
-			case *ast.Create, *ast.Set, *ast.Remove, *ast.Delete:
+			case *ast.Create, *ast.Merge, *ast.Set, *ast.Remove, *ast.Delete:
 				return true
 			}
 		}

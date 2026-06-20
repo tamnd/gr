@@ -34,6 +34,9 @@ func collectArguments(op operator) []*argumentOp {
 			walk(x.input)
 		case *createOp:
 			walk(x.input)
+		case *mergeOp:
+			walk(x.input)
+			walk(x.match)
 		case *setOp:
 			walk(x.input)
 		case *removeOp:

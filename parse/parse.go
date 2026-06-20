@@ -167,7 +167,7 @@ func (p *parser) singleQuery() (*ast.SingleQuery, error) {
 		case lex.Delete, lex.Detach:
 			c, err = p.deleteClause()
 		case lex.Merge:
-			return nil, p.errAt(p.cur(), "this write clause arrives in a later M3 milestone")
+			c, err = p.mergeClause()
 		default:
 			return nil, p.errAt(p.cur(), "expected a clause (MATCH, OPTIONAL MATCH, WITH, UNWIND, RETURN), found "+p.cur().Kind.String())
 		}
@@ -267,6 +267,62 @@ func (p *parser) createClause() (*ast.Create, error) {
 		}
 	}
 	return c, nil
+}
+
+// mergeClause parses MERGE followed by a single path pattern, then zero or more
+// ON CREATE SET / ON MATCH SET sub-clauses in any order. The pattern reuses the
+// MATCH grammar; the binder rejects the forms MERGE cannot express (the same set
+// CREATE rejects). Each sub-clause's items reuse the SET item grammar.
+func (p *parser) mergeClause() (*ast.Merge, error) {
+	start := p.cur()
+	p.advance() // MERGE
+	pp, err := p.pathPattern()
+	if err != nil {
+		return nil, err
+	}
+	m := &ast.Merge{Pos: pos(start), Pattern: pp}
+	for p.at(lex.On) {
+		p.advance() // ON
+		switch {
+		case p.at(lex.Create):
+			p.advance() // CREATE
+			items, err := p.mergeSetItems()
+			if err != nil {
+				return nil, err
+			}
+			m.OnCreate = append(m.OnCreate, items...)
+		case p.at(lex.Match):
+			p.advance() // MATCH
+			items, err := p.mergeSetItems()
+			if err != nil {
+				return nil, err
+			}
+			m.OnMatch = append(m.OnMatch, items...)
+		default:
+			return nil, p.errAt(p.cur(), "expected CREATE or MATCH after ON, found "+p.cur().Kind.String())
+		}
+	}
+	return m, nil
+}
+
+// mergeSetItems parses the SET keyword and its comma-separated items, the body
+// of an ON CREATE / ON MATCH sub-clause.
+func (p *parser) mergeSetItems() ([]ast.SetItem, error) {
+	if _, err := p.expect(lex.Set); err != nil {
+		return nil, err
+	}
+	var items []ast.SetItem
+	for {
+		it, err := p.setItem()
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, it)
+		if !p.accept(lex.Comma) {
+			break
+		}
+	}
+	return items, nil
 }
 
 // setClause parses SET followed by one or more comma-separated update items.

@@ -174,6 +174,11 @@ func (bd *binder) single(sq *ast.SingleQuery) ([]string, error) {
 				return nil, err
 			}
 			writes = true
+		case *ast.Merge:
+			if err := bd.merge(cl, sc); err != nil {
+				return nil, err
+			}
+			writes = true
 		case *ast.Set:
 			if err := bd.set(cl, sc); err != nil {
 				return nil, err
@@ -429,7 +434,14 @@ func (bd *binder) bindCreatePath(pp *ast.PathPattern, sc scope) error {
 // them inside the write transaction (doc 13 §6.4), so the binder only checks the
 // target is a node or relationship and that the right-hand side is well-formed.
 func (bd *binder) set(s *ast.Set, sc scope) error {
-	for _, it := range s.Items {
+	return bd.setItems(s.Items, sc)
+}
+
+// setItems binds a list of SET items against a scope, shared by the SET clause
+// and by MERGE's ON CREATE / ON MATCH sub-clauses (doc 13 §11.5). Each item's
+// target must already be bound; the per-shape rules match the SET clause.
+func (bd *binder) setItems(items []ast.SetItem, sc scope) error {
+	for _, it := range items {
 		kind, ok := sc[it.Var]
 		if !ok {
 			return &Error{"variable " + it.Var + " is not defined", it.Line, it.Col}
@@ -464,6 +476,24 @@ func (bd *binder) set(s *ast.Set, sc scope) error {
 		}
 	}
 	return nil
+}
+
+// merge binds a MERGE clause (doc 13 §11). The pattern binds like CREATE (it can
+// create the whole pattern, so it uses the same restrictions and introduces the
+// same new variables), and is also the match key. The ON CREATE and ON MATCH SET
+// items are bound against the post-pattern scope, so they may reference any
+// variable the pattern binds.
+func (bd *binder) merge(m *ast.Merge, sc scope) error {
+	if err := bd.bindCreatePath(m.Pattern, sc); err != nil {
+		return err
+	}
+	if err := bd.checkPathExprs(m.Pattern, sc); err != nil {
+		return err
+	}
+	if err := bd.setItems(m.OnCreate, sc); err != nil {
+		return err
+	}
+	return bd.setItems(m.OnMatch, sc)
 }
 
 // remove binds a REMOVE clause: every item's target must already be bound, a

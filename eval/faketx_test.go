@@ -70,6 +70,7 @@ func (f *fakeTx) CreateRel(engine.NodeID, engine.NodeID, engine.Token) (engine.R
 	return 0, nil
 }
 func (f *fakeTx) DeleteRel(engine.RelID) error                                   { return nil }
+func (f *fakeTx) InternPropKey(string) (engine.Token, error)                     { return 0, nil }
 func (f *fakeTx) SetNodeProperty(engine.NodeID, engine.Token, value.Value) error { return nil }
 func (f *fakeTx) SetRelProperty(engine.RelID, engine.Token, value.Value) error   { return nil }
 func (f *fakeTx) AddLabel(engine.NodeID, engine.Token) error                     { return nil }

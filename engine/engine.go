@@ -127,6 +127,13 @@ type Tx interface {
 	AddLabel(id NodeID, label Token) error
 	// RemoveLabel removes a label from a node.
 	RemoveLabel(id NodeID, label Token) error
+	// InternPropKey maps a property-key name to its token, assigning one if new,
+	// as part of this write transaction. A clause whose keys are only known at
+	// run time (a map-form SET over a parameter map, doc 13 §6.4) cannot intern
+	// them before the transaction opens, so it interns them here under the write
+	// lock the transaction already holds. The token becomes durable when the
+	// transaction commits. It errors on a read transaction.
+	InternPropKey(name string) (Token, error)
 
 	// --- lifecycle ---
 

@@ -22,12 +22,14 @@ var (
 // against the SPI before the real storage engine (M1) lands. M1 replaces this
 // with the durable, snapshot-isolated implementation behind the same interface.
 type MemEngine struct {
-	mu     sync.Mutex
-	nodes  map[NodeID]*memNode
-	rels   map[RelID]*memRel
-	nextN  NodeID
-	nextR  RelID
-	closed bool
+	mu      sync.Mutex
+	nodes   map[NodeID]*memNode
+	rels    map[RelID]*memRel
+	nextN   NodeID
+	nextR   RelID
+	propKey map[string]Token
+	nextTok Token
+	closed  bool
 }
 
 type memNode struct {
@@ -46,10 +48,14 @@ type memRel struct {
 // NewMemEngine returns an empty in-memory stub engine.
 func NewMemEngine() *MemEngine {
 	return &MemEngine{
-		nodes: make(map[NodeID]*memNode),
-		rels:  make(map[RelID]*memRel),
-		nextN: 1,
-		nextR: 1,
+		nodes:   make(map[NodeID]*memNode),
+		rels:    make(map[RelID]*memRel),
+		nextN:   1,
+		nextR:   1,
+		propKey: make(map[string]Token),
+		// Interned keys start well above the small tokens tests assign by hand,
+		// so a run-time intern never collides with a fixture's literal token.
+		nextTok: 1000,
 	}
 }
 
@@ -322,6 +328,21 @@ func removeRel(s []RelID, id RelID) []RelID {
 		}
 	}
 	return s
+}
+
+func (t *memTx) InternPropKey(name string) (Token, error) {
+	if !t.write {
+		return 0, ErrReadOnlyTx
+	}
+	t.e.mu.Lock()
+	defer t.e.mu.Unlock()
+	if tok, ok := t.e.propKey[name]; ok {
+		return tok, nil
+	}
+	tok := t.e.nextTok
+	t.e.nextTok++
+	t.e.propKey[name] = tok
+	return tok, nil
 }
 
 func (t *memTx) SetNodeProperty(id NodeID, key Token, v value.Value) error {

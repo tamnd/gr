@@ -29,9 +29,11 @@ var ErrClosed = errors.New("gr: database is closed")
 
 // DB is an open gr database. It owns the storage engine, which owns the pager
 // over the underlying file; queries run against snapshots the engine hands out.
+// It also owns the plan cache, so a repeated query shape reuses its compiled plan.
 type DB struct {
-	path string
-	eng  *engine.DiskEngine
+	path  string
+	eng   *engine.DiskEngine
+	cache *plan.Cache
 }
 
 // Options configure how a database is opened. The zero value is the default:
@@ -49,6 +51,10 @@ type Options struct {
 	// SaltSeed makes WAL salt generation deterministic for tests; 0 is fine in
 	// production where determinism is not required.
 	SaltSeed uint64
+	// PlanCacheSize bounds the plan cache in distinct query shapes; 0 uses the
+	// default ([plan.DefaultCacheSize]). A negative value is treated as the
+	// default, not as a disabled cache.
+	PlanCacheSize int
 }
 
 // Open opens the database at path, creating it with a fresh graph structure if it
@@ -68,7 +74,7 @@ func Open(path string, opt Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DB{path: path, eng: eng}, nil
+	return &DB{path: path, eng: eng, cache: plan.NewCache(opt.PlanCacheSize)}, nil
 }
 
 // Path returns the database file path.
@@ -84,6 +90,11 @@ func (db *DB) PageSize() uint32 { return db.eng.PageSize() }
 // ([exec]). The returned result holds that transaction open until it is closed,
 // so the caller must Close it.
 //
+// The compiled query (the bound query and its plan) is cached keyed by the query
+// text and the catalog version, so a repeated shape skips parse, bind, and plan
+// and only binds parameters and runs (doc 14 §8). Because parameters are
+// placeholders in the text, one cached plan serves every parameter value.
+//
 // params supplies the values for the query's $-parameters; a nil map is fine for
 // a parameterless query. Names the catalog never interned bind as unknown, which
 // the read path treats as the schema-optional empty result rather than an error
@@ -91,6 +102,36 @@ func (db *DB) PageSize() uint32 { return db.eng.PageSize() }
 func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, error) {
 	if db.eng == nil {
 		return nil, ErrClosed
+	}
+	entry, err := db.compile(cypher)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := db.eng.Begin(false)
+	if err != nil {
+		return nil, err
+	}
+	ctx := &exec.Ctx{
+		Tx:      tx,
+		Params:  params,
+		Resolve: exec.ResolverFromBound(entry.Bound),
+	}
+	cur, err := exec.Open(entry.Op, ctx)
+	if err != nil {
+		_ = tx.Abort()
+		return nil, err
+	}
+	return &Result{cols: cur.Cols(), cursor: cur, tx: tx}, nil
+}
+
+// compile returns the compiled query for the given text, from the plan cache on a
+// hit or by parsing, binding, and planning on a miss (then caching the result).
+// The cache key pairs the normalized text with the engine's catalog version, so a
+// schema change misses the entries bound against the old catalog (doc 14 §8.4).
+func (db *DB) compile(cypher string) (*plan.Entry, error) {
+	key := plan.Key{Text: plan.NormalizeText(cypher), Catalog: db.eng.CatalogVersion()}
+	if entry, ok := db.cache.Get(key); ok {
+		return entry, nil
 	}
 	q, err := parse.Parse(cypher)
 	if err != nil {
@@ -100,22 +141,9 @@ func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, erro
 	if err != nil {
 		return nil, err
 	}
-	p := plan.Plan(b)
-	tx, err := db.eng.Begin(false)
-	if err != nil {
-		return nil, err
-	}
-	ctx := &exec.Ctx{
-		Tx:      tx,
-		Params:  params,
-		Resolve: exec.ResolverFromBound(b),
-	}
-	cur, err := exec.Open(p, ctx)
-	if err != nil {
-		_ = tx.Abort()
-		return nil, err
-	}
-	return &Result{cols: cur.Cols(), cursor: cur, tx: tx}, nil
+	entry := &plan.Entry{Bound: b, Op: plan.Plan(b)}
+	db.cache.Put(key, entry)
+	return entry, nil
 }
 
 // Result is a streaming Cypher query result: the output column names in order and

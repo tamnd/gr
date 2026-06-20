@@ -199,6 +199,19 @@ func (e *DiskEngine) TokenName(kind catalog.Kind, t Token) (string, bool) {
 	return e.cat.Name(kind, uint32(t-1))
 }
 
+// CatalogVersion returns a monotonic version of the catalog: the total number of
+// interned names across the label, type, and property-key dictionaries. The
+// catalog is append-only (names are interned, never removed), so any schema
+// addition strictly increases this value, which is exactly what the plan cache
+// needs to key a compiled plan to the catalog it was bound against (doc 14 §8.4).
+func (e *DiskEngine) CatalogVersion() uint64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return uint64(e.cat.Count(catalog.KindLabel) +
+		e.cat.Count(catalog.KindRelType) +
+		e.cat.Count(catalog.KindPropKey))
+}
+
 // NodeCountByLabel returns the number of live nodes carrying a label, the
 // per-label cardinality the planner uses (doc 04 §19.1; doc 25 deliverable 11).
 // It is the latest committed count, maintained on the write path, not a snapshot

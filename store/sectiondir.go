@@ -22,6 +22,12 @@ const (
 	SecCatalog Section = iota
 	// SecIDMap is the id-map Log (element id <-> dense position).
 	SecIDMap
+	// SecNodeRec is the node record Vector (per dense node position).
+	SecNodeRec
+	// SecNodeLabels is the node label-set Log (sorted token lists).
+	SecNodeLabels
+	// SecRelRec is the relationship record Vector (per dense relationship position).
+	SecRelRec
 	// numSectionsInUse is the count of section ids currently defined. It must
 	// stay <= MaxSections; later milestones add ids before this marker.
 	numSectionsInUse

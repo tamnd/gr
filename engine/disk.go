@@ -13,6 +13,7 @@ import (
 	"github.com/tamnd/gr/node"
 	"github.com/tamnd/gr/pager"
 	"github.com/tamnd/gr/rel"
+	"github.com/tamnd/gr/stats"
 	"github.com/tamnd/gr/store"
 	"github.com/tamnd/gr/value"
 	"github.com/tamnd/gr/vfs"
@@ -55,6 +56,7 @@ type DiskEngine struct {
 	ncols  *column.Columns
 	rcols  *column.Columns
 	adj    *adj.Adj
+	st     *stats.Stats
 	oracle *mvcc.Oracle
 	ov     *mvcc.Overlay
 	closed bool
@@ -115,7 +117,10 @@ func (e *DiskEngine) load(create bool) error {
 		if e.rcols, err = column.Create(e.p, e.secs, store.SecRelCols); err != nil {
 			return err
 		}
-		e.adj, err = adj.Create(e.p, e.secs, e.rels)
+		if e.adj, err = adj.Create(e.p, e.secs, e.rels); err != nil {
+			return err
+		}
+		e.st, err = stats.Create(e.p, e.secs)
 		return err
 	}
 	if e.secs, err = store.OpenSections(e.p); err != nil {
@@ -139,7 +144,10 @@ func (e *DiskEngine) load(create bool) error {
 	if e.rcols, err = column.Open(e.p, e.secs, store.SecRelCols); err != nil {
 		return err
 	}
-	e.adj, err = adj.Open(e.p, e.secs, e.rels)
+	if e.adj, err = adj.Open(e.p, e.secs, e.rels); err != nil {
+		return err
+	}
+	e.st, err = stats.Open(e.p, e.secs)
 	return err
 }
 
@@ -189,6 +197,30 @@ func (e *DiskEngine) TokenName(kind catalog.Kind, t Token) (string, bool) {
 		return "", false
 	}
 	return e.cat.Name(kind, uint32(t-1))
+}
+
+// NodeCountByLabel returns the number of live nodes carrying a label, the
+// per-label cardinality the planner uses (doc 04 §19.1; doc 25 deliverable 11).
+// It is the latest committed count, maintained on the write path, not a snapshot
+// read. A zero label is not the wildcard here; pass a real label token.
+func (e *DiskEngine) NodeCountByLabel(label Token) (uint64, error) {
+	if label == 0 {
+		return 0, nil
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.st.LabelCount(toCat(label))
+}
+
+// RelCountByType returns the number of live relationships of a type, the per-type
+// cardinality the planner uses.
+func (e *DiskEngine) RelCountByType(relType Token) (uint64, error) {
+	if relType == 0 {
+		return 0, nil
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.st.RelTypeCount(toCat(relType))
 }
 
 // Begin opens a transaction. A write transaction takes the engine's write lock
@@ -528,12 +560,18 @@ func (t *diskTx) CreateNode(labels []Token) (NodeID, error) {
 		key: mvcc.Key{Kind: mvcc.NodeExist, Pos: pos},
 		pre: mvcc.Pre{Present: false},
 	})
-	npos, err := t.e.nodes.Create(labelsToCat(labels))
+	cats := labelsToCat(labels)
+	npos, err := t.e.nodes.Create(cats)
 	if err != nil {
 		return 0, err
 	}
 	if npos != pos {
 		return 0, ErrIDMapDesync
+	}
+	for _, c := range cats {
+		if err := t.e.st.AddLabel(c, +1); err != nil {
+			return 0, err
+		}
 	}
 	return NodeID(eid), nil
 }
@@ -558,6 +596,16 @@ func (t *diskTx) DeleteNode(id NodeID) error {
 		key: mvcc.Key{Kind: mvcc.NodeExist, Pos: pos},
 		pre: mvcc.Pre{Present: true},
 	})
+	// Decrement the per-label counts for the labels this node carried.
+	cats, err := t.e.nodes.Labels(pos)
+	if err != nil {
+		return err
+	}
+	for _, c := range cats {
+		if err := t.e.st.AddLabel(c, -1); err != nil {
+			return err
+		}
+	}
 	// The id-map mapping is kept (not removed) so older snapshots can still
 	// resolve the position from the element id; id reclamation is deferred.
 	return t.e.nodes.Delete(pos)
@@ -609,6 +657,9 @@ func (t *diskTx) CreateRel(src, dst NodeID, relType Token) (RelID, error) {
 		return 0, ErrIDMapDesync
 	}
 	t.e.adj.Insert(ty, spos, dpos, rpos)
+	if err := t.e.st.AddRelType(ty, +1); err != nil {
+		return 0, err
+	}
 	return RelID(eid), nil
 }
 
@@ -631,6 +682,9 @@ func (t *diskTx) DeleteRel(id RelID) error {
 		pre: mvcc.Pre{Present: true},
 	})
 	t.e.adj.Remove(r.Type, r.Src, r.Dst)
+	if err := t.e.st.AddRelType(r.Type, -1); err != nil {
+		return err
+	}
 	return t.e.rels.Delete(pos)
 }
 
@@ -699,7 +753,10 @@ func (t *diskTx) AddLabel(id NodeID, label Token) error {
 	t.recordLabels(pos, cats)
 	next := append(slices.Clone(cats), c)
 	slices.Sort(next)
-	return t.e.nodes.SetLabels(pos, next)
+	if err := t.e.nodes.SetLabels(pos, next); err != nil {
+		return err
+	}
+	return t.e.st.AddLabel(c, +1)
 }
 
 func (t *diskTx) RemoveLabel(id NodeID, label Token) error {
@@ -721,7 +778,10 @@ func (t *diskTx) RemoveLabel(id NodeID, label Token) error {
 	}
 	t.recordLabels(pos, cats)
 	next := slices.Delete(slices.Clone(cats), idx, idx+1)
-	return t.e.nodes.SetLabels(pos, next)
+	if err := t.e.nodes.SetLabels(pos, next); err != nil {
+		return err
+	}
+	return t.e.st.AddLabel(c, -1)
 }
 
 // recordLabels retains the current label set as the pre-image for older snapshots.

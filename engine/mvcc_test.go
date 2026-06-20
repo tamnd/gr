@@ -9,6 +9,100 @@ import (
 	"github.com/tamnd/gr/vfs"
 )
 
+// TestStatisticsMatchGraph is the M1 statistics-accuracy gate (doc 25 §4.4):
+// after a build the engine's per-label and per-type counts match the actual
+// graph, they track deletes and label changes, survive a reopen, and an aborted
+// transaction leaves them unchanged.
+func TestStatisticsMatchGraph(t *testing.T) {
+	fsys := vfs.NewMem()
+	e := openDisk(t, fsys, "stats.gr")
+
+	person, _ := e.Intern(catalog.KindLabel, "Person")
+	city, _ := e.Intern(catalog.KindLabel, "City")
+	knows, _ := e.Intern(catalog.KindRelType, "KNOWS")
+	livesin, _ := e.Intern(catalog.KindRelType, "LIVES_IN")
+
+	wantLabel := func(when string, label Token, want uint64) {
+		t.Helper()
+		got, err := e.NodeCountByLabel(label)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("%s: NodeCountByLabel = %d, want %d", when, got, want)
+		}
+	}
+	wantType := func(when string, ty Token, want uint64) {
+		t.Helper()
+		got, err := e.RelCountByType(ty)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("%s: RelCountByType = %d, want %d", when, got, want)
+		}
+	}
+
+	// Build: 3 Person nodes, 2 City nodes, one node carrying both labels, plus
+	// KNOWS and LIVES_IN edges.
+	w, _ := e.Begin(true)
+	p1, _ := w.CreateNode([]Token{person})
+	p2, _ := w.CreateNode([]Token{person})
+	p3, _ := w.CreateNode([]Token{person})
+	c1, _ := w.CreateNode([]Token{city})
+	c2, _ := w.CreateNode([]Token{city})
+	r1, _ := w.CreateRel(p1, p2, knows)
+	w.CreateRel(p2, p3, knows)
+	w.CreateRel(p1, c1, livesin)
+	w.CreateRel(p2, c2, livesin)
+	w.Commit()
+
+	wantLabel("after build", person, 3)
+	wantLabel("after build", city, 2)
+	wantType("after build", knows, 2)
+	wantType("after build", livesin, 2)
+
+	// A node gaining a second label bumps that label's count.
+	w2, _ := e.Begin(true)
+	w2.AddLabel(p3, city) // p3 is now Person and City
+	w2.Commit()
+	wantLabel("after add-label", person, 3)
+	wantLabel("after add-label", city, 3)
+
+	// Deleting a relationship and removing a label decrement their counts.
+	w3, _ := e.Begin(true)
+	w3.DeleteRel(r1)
+	w3.RemoveLabel(p3, city)
+	w3.Commit()
+	wantType("after rel delete", knows, 1)
+	wantLabel("after remove-label", city, 2)
+
+	// An aborted transaction leaves the counts unchanged.
+	w4, _ := e.Begin(true)
+	w4.CreateNode([]Token{person})
+	w4.CreateRel(p2, p3, knows)
+	w4.Abort()
+	wantLabel("after abort", person, 3)
+	wantType("after abort", knows, 1)
+
+	// The counts are durable across a reopen.
+	e.Close()
+	e2 := openDisk(t, fsys, "stats.gr")
+	defer e2.Close()
+	if got, _ := e2.NodeCountByLabel(person); got != 3 {
+		t.Fatalf("after reopen: Person = %d, want 3", got)
+	}
+	if got, _ := e2.NodeCountByLabel(city); got != 2 {
+		t.Fatalf("after reopen: City = %d, want 2", got)
+	}
+	if got, _ := e2.RelCountByType(knows); got != 1 {
+		t.Fatalf("after reopen: KNOWS = %d, want 1", got)
+	}
+	if got, _ := e2.RelCountByType(livesin); got != 2 {
+		t.Fatalf("after reopen: LIVES_IN = %d, want 2", got)
+	}
+}
+
 // TestDenseNodeDegreeEngine drives the dense-node mechanism through the engine
 // SPI (doc 04 §12; doc 25 deliverable 10): a supernode with high degree across
 // two types reports per-type, per-direction degree in O(1) without scanning all

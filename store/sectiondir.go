@@ -39,6 +39,12 @@ const (
 	// SecAdjMeta carries the adjacency's folded relationship count (the number of
 	// relationship positions already folded into the base CSR) in its meta field.
 	SecAdjMeta
+	// SecStatsLabel is the per-label node-count Vector (a count per label token;
+	// see package stats).
+	SecStatsLabel
+	// SecStatsRel is the per-type relationship-count Vector (a count per
+	// relationship-type token; see package stats).
+	SecStatsRel
 	// numSectionsInUse is the count of section ids currently defined. It must
 	// stay <= MaxSections; later milestones add ids before this marker.
 	numSectionsInUse

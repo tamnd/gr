@@ -28,6 +28,7 @@ const (
 	PageTypeDynamic  PageType = 14 // dynamic/blob store (M1)
 	PageTypeIDMap    PageType = 15 // id-map (M1)
 	PageTypeCatalog  PageType = 16 // catalog/token store (M1)
+	PageTypeStats    PageType = 17 // statistics counts (M1)
 )
 
 // PageHeaderSize is the size of the per-page header, and ChecksumSize is the

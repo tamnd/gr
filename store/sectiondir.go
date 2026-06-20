@@ -28,6 +28,11 @@ const (
 	SecNodeLabels
 	// SecRelRec is the relationship record Vector (per dense relationship position).
 	SecRelRec
+	// SecNodeCols is the node property-column directory (a Vector indexed by
+	// property-key token; see package column).
+	SecNodeCols
+	// SecRelCols is the relationship property-column directory.
+	SecRelCols
 	// numSectionsInUse is the count of section ids currently defined. It must
 	// stay <= MaxSections; later milestones add ids before this marker.
 	numSectionsInUse

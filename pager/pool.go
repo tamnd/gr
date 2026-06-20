@@ -1,0 +1,235 @@
+package pager
+
+import (
+	"hash/crc32"
+
+	"github.com/tamnd/gr/format"
+	"github.com/tamnd/gr/wal"
+)
+
+// checksumPage stamps the trailing CRC32 over the page body. The checksum
+// covers everything but the trailer itself (doc 03 §4, doc 05 §7); the pager
+// validates it on every read so a torn page in the database file is caught even
+// before the WAL repairs it.
+func checksumPage(buf []byte) {
+	sum := crc32.ChecksumIEEE(buf[:len(buf)-format.ChecksumSize])
+	format.PutU32(buf[len(buf)-format.ChecksumSize:], sum)
+}
+
+// verifyPage reports whether a page's trailing checksum matches its body.
+func verifyPage(buf []byte) bool {
+	sum := crc32.ChecksumIEEE(buf[:len(buf)-format.ChecksumSize])
+	return format.U32(buf[len(buf)-format.ChecksumSize:]) == sum
+}
+
+// ReadPage returns the frame for page id, reading it from the database file on a
+// miss, and pins it. The caller must Unpin when done. Page 0 (the header page)
+// is special: it carries the file Header rather than the generic page header and
+// checksum, so it is not checksum-validated here.
+func (p *Pager) ReadPage(id format.PageID) (*Frame, error) {
+	if f, ok := p.pool[id]; ok {
+		f.pin++
+		f.ref = true
+		return f, nil
+	}
+	buf := make([]byte, p.pageSize)
+	if _, err := p.db.ReadAt(buf, int64(id)*int64(p.pageSize)); err != nil {
+		return nil, err
+	}
+	if id != 0 && !verifyPage(buf) {
+		return nil, ErrBadChecksum
+	}
+	f := &Frame{id: id, Data: buf, pin: 1, ref: true}
+	p.admit(f)
+	return f, nil
+}
+
+// AllocPage grows the file by one page and returns a freshly zeroed, pinned
+// frame of the given type. The new page becomes durable at the next Commit.
+func (p *Pager) AllocPage(t format.PageType) (*Frame, error) {
+	if p.readOnly {
+		return nil, ErrReadOnly
+	}
+	id := format.PageID(p.header.PageCount)
+	p.header.PageCount++
+	p.headerDirty = true
+	buf := make([]byte, p.pageSize)
+	format.WriteHeader(buf, format.PageHeader{Type: t})
+	f := &Frame{id: id, Data: buf, pin: 1, dirty: true, ref: true}
+	p.admit(f)
+	return f, nil
+}
+
+// MarkDirty records that a frame's contents changed and must be written at the
+// next Commit.
+func (p *Pager) MarkDirty(f *Frame) { f.dirty = true }
+
+// Unpin releases one pin on a frame, making it eligible for eviction once clean.
+func (p *Pager) Unpin(f *Frame) {
+	if f.pin > 0 {
+		f.pin--
+	}
+}
+
+// admit inserts a frame into the pool and the clock ring, evicting first if the
+// pool is over capacity.
+func (p *Pager) admit(f *Frame) {
+	if len(p.pool) >= p.maxPool {
+		p.evict()
+	}
+	p.pool[f.id] = f
+	p.clock = append(p.clock, f)
+}
+
+// evict runs the clock algorithm to drop one clean, unpinned frame. A pinned
+// frame is never evicted (the headline buffer-pool invariant, doc 05 §3); a
+// dirty frame is also skipped because it has uncommitted contents — at most one
+// transaction's worth of dirty pages can pile up, so the pool simply grows past
+// its soft cap rather than lose data. If nothing is evictable the pool grows.
+func (p *Pager) evict() {
+	if len(p.clock) == 0 {
+		return
+	}
+	for scan := 0; scan < 2*len(p.clock); scan++ {
+		f := p.clock[p.hand]
+		p.hand = (p.hand + 1) % len(p.clock)
+		if f.pin > 0 || f.dirty {
+			continue
+		}
+		if f.ref {
+			f.ref = false
+			continue
+		}
+		// Evict f.
+		delete(p.pool, f.id)
+		p.clock = removeFrame(p.clock, f)
+		if len(p.clock) > 0 {
+			p.hand %= len(p.clock)
+		} else {
+			p.hand = 0
+		}
+		return
+	}
+}
+
+func removeFrame(ring []*Frame, f *Frame) []*Frame {
+	for i, x := range ring {
+		if x == f {
+			return append(ring[:i], ring[i+1:]...)
+		}
+	}
+	return ring
+}
+
+// Commit makes all dirty pages durable. It stamps each dirty page's checksum,
+// writes the dirty set (plus the header page if the header changed) to the WAL
+// as one atomic batch, fsyncs (the commit point), checkpoints the batch into the
+// database file, fsyncs the database, and resets the WAL. A crash anywhere in
+// this sequence recovers to either the old or the new state, never a mix — the
+// durable-prefix property the M0 crash campaign proves (doc 05 §10, doc 25 §3.4).
+func (p *Pager) Commit() error {
+	if p.readOnly {
+		return ErrReadOnly
+	}
+	// Gather dirty data pages in id order for deterministic WAL layout.
+	dirty := make([]*Frame, 0, len(p.pool))
+	for _, f := range p.pool {
+		if f.dirty {
+			dirty = append(dirty, f)
+		}
+	}
+	if len(dirty) == 0 && !p.headerDirty {
+		return nil // nothing to do
+	}
+	sortFramesByID(dirty)
+
+	// Stamp checksums on data pages before they are logged.
+	for _, f := range dirty {
+		checksumPage(f.Data)
+	}
+
+	// Build the WAL batch. The header page (page 0) goes last so that the commit
+	// frame — the one whose presence makes the batch durable — carries the new
+	// page count and change counter.
+	frames := make([]wal.Frame, 0, len(dirty)+1)
+	for _, f := range dirty {
+		if f.id == 0 {
+			continue // page 0 is appended explicitly below
+		}
+		frames = append(frames, wal.Frame{PageID: f.id, Image: f.Data})
+	}
+	p.header.ChangeCounter++
+	page0 := make([]byte, p.pageSize)
+	copy(page0, p.header.Marshal())
+	frames = append(frames, wal.Frame{PageID: 0, Image: page0})
+
+	if _, err := p.wal.Append(frames, true, p.header.PageCount); err != nil {
+		return err
+	}
+
+	// Checkpoint: copy the committed images into the database file.
+	for _, fr := range frames {
+		off := int64(fr.PageID) * int64(p.pageSize)
+		if _, err := p.db.WriteAt(fr.Image, off); err != nil {
+			return err
+		}
+	}
+	if err := p.db.Truncate(int64(p.header.PageCount) * int64(p.pageSize)); err != nil {
+		return err
+	}
+	if p.sync >= wal.SyncFull {
+		if err := p.db.Sync(); err != nil {
+			return err
+		}
+	}
+
+	// Reset the WAL for the next epoch with a fresh salt.
+	if err := p.wal.Reset(p.nextSalt()); err != nil {
+		return err
+	}
+
+	// Refresh the cached page-0 frame, if resident, and clear dirty flags.
+	if f, ok := p.pool[0]; ok {
+		copy(f.Data, page0)
+		f.dirty = false
+	}
+	for _, f := range dirty {
+		f.dirty = false
+	}
+	p.headerDirty = false
+	return nil
+}
+
+// sortFramesByID sorts frames ascending by page id (small n, insertion sort
+// keeps it allocation-free and dependency-free).
+func sortFramesByID(fs []*Frame) {
+	for i := 1; i < len(fs); i++ {
+		for j := i; j > 0 && fs[j-1].id > fs[j].id; j-- {
+			fs[j-1], fs[j] = fs[j], fs[j-1]
+		}
+	}
+}
+
+// Close flushes nothing (callers Commit explicitly), checks no pages are pinned,
+// and closes the WAL and database files.
+func (p *Pager) Close() error {
+	if p.closed {
+		return nil
+	}
+	p.closed = true
+	for _, f := range p.pool {
+		if f.pin > 0 {
+			return ErrPinned
+		}
+	}
+	var firstErr error
+	if p.wal != nil {
+		if err := p.wal.Close(); err != nil {
+			firstErr = err
+		}
+	}
+	if err := p.db.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}

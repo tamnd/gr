@@ -1,7 +1,7 @@
 // Package adj is gr's CSR index-free adjacency: the expand primitive that, given
 // a node and a relationship type and direction, yields its neighbors in
 // O(1)-to-the-run plus O(degree) (spec 2060 doc 04 §3, §5, §8; doc 25 §4
-// deliverables 3, 4, 7).
+// deliverables 3, 4, 7, 10).
 //
 // The design has three pieces that mirror the spec's base/delta/checkpoint:
 //
@@ -22,6 +22,17 @@
 // delta), and returns the sorted neighbor list. checkpoint folds the delta into
 // the base by rebuilding the CSR from every live relationship and advancing the
 // folded count, after which the delta is empty.
+//
+// Dense nodes (supernodes) need no special record (doc 04 §12; ADR-20): a
+// high-degree node's neighbors are a long contiguous CSR run, and a typed,
+// directed expand touches only that one (type, direction) slot's run, never all
+// of the node's edges, so a million-edge celebrity contributes only its
+// KNOWS-forward slice to a KNOWS-forward expand. Degree is exposed without
+// touching edges at all: a slot's base degree is the offset delta
+// offset[src+1]-offset[src] read straight from the offset array, plus an
+// in-memory tail adjustment for edges created or deleted since the last
+// checkpoint. This is the engine half of degree-aware planning (doc 04 §12.5):
+// the engine maintains and exposes accurate degree, the M4 planner uses it.
 //
 // This is the M1, single-writer, no-MVCC realization. A standalone durable delta
 // with its own pages and per-entry version tags, segmented and incremental
@@ -81,6 +92,12 @@ type Adj struct {
 	folded uint64
 	delta  map[uint32]map[uint64][]Neighbor // slot -> src -> sorted neighbors
 	cache  map[uint32]*base                 // opened base arrays, cleared on checkpoint
+	// degTail is the net live-degree change since the last checkpoint, per slot
+	// and source: edges inserted into the tail (counted +1) minus edges removed
+	// (counted -1, whether they sat in the base or the tail). A slot's degree is
+	// the base offset delta plus this. It is reset at checkpoint, when the base
+	// offsets again reflect every live edge.
+	degTail map[uint32]map[uint64]int64
 }
 
 // Create initializes a fresh adjacency: an empty base directory and a zero
@@ -98,8 +115,9 @@ func Create(p *pager.Pager, secs *store.Sections, rels *rel.Store) (*Adj, error)
 	}
 	return &Adj{
 		p: p, secs: secs, rels: rels, dir: dir,
-		delta: map[uint32]map[uint64][]Neighbor{},
-		cache: map[uint32]*base{},
+		delta:   map[uint32]map[uint64][]Neighbor{},
+		cache:   map[uint32]*base{},
+		degTail: map[uint32]map[uint64]int64{},
 	}, nil
 }
 
@@ -120,8 +138,9 @@ func Open(p *pager.Pager, secs *store.Sections, rels *rel.Store) (*Adj, error) {
 	}
 	a := &Adj{
 		p: p, secs: secs, rels: rels, dir: dir, folded: folded,
-		delta: map[uint32]map[uint64][]Neighbor{},
-		cache: map[uint32]*base{},
+		delta:   map[uint32]map[uint64][]Neighbor{},
+		cache:   map[uint32]*base{},
+		degTail: map[uint32]map[uint64]int64{},
 	}
 	if err := a.rebuildDelta(); err != nil {
 		return nil, err
@@ -155,6 +174,28 @@ func (a *Adj) Insert(relType uint32, src, dst, relPos uint64) {
 func (a *Adj) insertDelta(relType uint32, src, dst, relPos uint64) {
 	a.addDelta(slot(relType, Out), src, Neighbor{Node: dst, Edge: relPos})
 	a.addDelta(slot(relType, In), dst, Neighbor{Node: src, Edge: relPos})
+	a.adjustDeg(slot(relType, Out), src, +1)
+	a.adjustDeg(slot(relType, In), dst, +1)
+}
+
+// Remove records the deletion of an edge for degree accounting. The caller has
+// already (or is about to) tombstone the durable relationship record and supplies
+// its type and endpoints; the delta neighbor list is left untouched, because a
+// deleted edge is dropped by the expand merge's visibility test, not by removal
+// from the list. Degree, which does not consult that list, is corrected here.
+func (a *Adj) Remove(relType uint32, src, dst uint64) {
+	a.adjustDeg(slot(relType, Out), src, -1)
+	a.adjustDeg(slot(relType, In), dst, -1)
+}
+
+// adjustDeg adds delta to a slot's tail degree for a source.
+func (a *Adj) adjustDeg(s uint32, src uint64, delta int64) {
+	m := a.degTail[s]
+	if m == nil {
+		m = map[uint64]int64{}
+		a.degTail[s] = m
+	}
+	m[src] += delta
 }
 
 // addDelta inserts a neighbor into the sorted per-source delta list.
@@ -219,6 +260,52 @@ func (a *Adj) ExpandWith(src uint64, relType uint32, d Dir, visible func(edge ui
 	}
 	slices.SortFunc(out, cmpNeighbor)
 	return out, nil
+}
+
+// Degree returns the live degree of a source along a type and direction without
+// touching its edges: the base offset delta plus the tail adjustment (doc 04
+// §12.5). It is the engine-maintained degree statistic the planner reads, so it
+// reflects the latest committed state (and the current writer's own writes), not
+// a reader's snapshot; for a supernode this is O(1), where materializing the run
+// to count would be O(degree).
+//
+// Between a reopen and the next checkpoint the count can over-report base edges
+// that were deleted before the reopen, because the tail adjustment is in-memory
+// and a reopen rebuilds only the un-folded tail; the next checkpoint folds those
+// deletions out of the base and the count is exact again. This is acceptable for
+// a planner statistic and self-healing.
+func (a *Adj) Degree(src uint64, relType uint32, d Dir) (int64, error) {
+	s := slot(relType, d)
+	bd, err := a.baseDegree(s, src)
+	if err != nil {
+		return 0, err
+	}
+	return max(bd+a.degTail[s][src], 0), nil
+}
+
+// baseDegree reads a source's folded degree in a slot straight from the offset
+// array (offset[src+1]-offset[src]), or zero when the slot has no base or the
+// source is beyond the folded node range.
+func (a *Adj) baseDegree(s uint32, src uint64) (int64, error) {
+	if int(s) >= a.dir.Count() {
+		return 0, nil
+	}
+	b, offLen, err := a.openBase(s)
+	if err != nil {
+		return 0, err
+	}
+	if b == nil || src+1 >= offLen {
+		return 0, nil
+	}
+	lo, err := getU64(b.off, int(src))
+	if err != nil {
+		return 0, err
+	}
+	hi, err := getU64(b.off, int(src+1))
+	if err != nil {
+		return 0, err
+	}
+	return int64(hi - lo), nil
 }
 
 // baseRun returns the base CSR run for a source in a slot, or nil if the slot has
@@ -411,6 +498,9 @@ func (a *Adj) Checkpoint(nodeCount uint64) error {
 	}
 	a.delta = map[uint32]map[uint64][]Neighbor{}
 	a.cache = map[uint32]*base{}
+	// The rebuilt base offsets now reflect every live edge, so the tail
+	// adjustment starts fresh.
+	a.degTail = map[uint32]map[uint64]int64{}
 	return nil
 }
 

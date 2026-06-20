@@ -20,6 +20,7 @@
 package plan
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/tamnd/gr/ast"
@@ -236,6 +237,19 @@ func outputVars(o Op) map[string]bool {
 	default:
 		return map[string]bool{}
 	}
+}
+
+// OutputVars returns the variable names an operator's rows carry, sorted, for
+// consumers outside the package (the executor null-pads an unmatched OPTIONAL
+// MATCH against the inner's new variables, doc 09 §4.2).
+func OutputVars(o Op) []string {
+	m := outputVars(o)
+	out := make([]string, 0, len(m))
+	for v := range m {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func colNames(cols []Col) map[string]bool {

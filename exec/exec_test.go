@@ -1,0 +1,377 @@
+package exec
+
+import (
+	"sort"
+	"testing"
+
+	"github.com/tamnd/gr/bind"
+	"github.com/tamnd/gr/engine"
+	"github.com/tamnd/gr/eval"
+	"github.com/tamnd/gr/parse"
+	"github.com/tamnd/gr/plan"
+	"github.com/tamnd/gr/value"
+)
+
+// --- catalog and tokens shared by the test graph ---
+
+const (
+	lblPerson engine.Token = 1
+	lblCity   engine.Token = 2
+	typKnows  engine.Token = 1
+	typLikes  engine.Token = 2
+	keyName   engine.Token = 1
+	keyAge    engine.Token = 2
+	keySince  engine.Token = 3
+)
+
+// testCatalog resolves the names the test queries use to the tokens the test graph
+// is built with.
+type testCatalog struct{}
+
+func (testCatalog) LabelToken(n string) (engine.Token, bool) {
+	switch n {
+	case "Person":
+		return lblPerson, true
+	case "City":
+		return lblCity, true
+	}
+	return 0, false
+}
+func (testCatalog) RelTypeToken(n string) (engine.Token, bool) {
+	switch n {
+	case "KNOWS":
+		return typKnows, true
+	case "LIKES":
+		return typLikes, true
+	}
+	return 0, false
+}
+func (testCatalog) PropKeyToken(n string) (engine.Token, bool) {
+	switch n {
+	case "name":
+		return keyName, true
+	case "age":
+		return keyAge, true
+	case "since":
+		return keySince, true
+	}
+	return 0, false
+}
+
+// graph builds a small social graph: Alice(30) -KNOWS-> Bob(25), Bob -KNOWS->
+// Carol(35), Alice -KNOWS-> Carol. Returns the engine and the node ids by name.
+func graph(t *testing.T) (*engine.MemEngine, map[string]engine.NodeID) {
+	t.Helper()
+	e := engine.NewMemEngine()
+	tx, err := e.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]engine.NodeID{}
+	mk := func(name string, age int64) engine.NodeID {
+		id, err := tx.CreateNode([]engine.Token{lblPerson})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx.SetNodeProperty(id, keyName, value.String(name))
+		tx.SetNodeProperty(id, keyAge, value.Int(age))
+		ids[name] = id
+		return id
+	}
+	a, b, c := mk("Alice", 30), mk("Bob", 25), mk("Carol", 35)
+	knows := func(s, d engine.NodeID, since int64) {
+		r, err := tx.CreateRel(s, d, typKnows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx.SetRelProperty(r, keySince, value.Int(since))
+	}
+	knows(a, b, 2015)
+	knows(b, c, 2016)
+	knows(a, c, 2017)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return e, ids
+}
+
+// run executes a query against the graph and returns its rows.
+func run(t *testing.T, e *engine.MemEngine, cypher string, params map[string]value.Value) ([]eval.Row, []string) {
+	t.Helper()
+	q, err := parse.Parse(cypher)
+	if err != nil {
+		t.Fatalf("parse %q: %v", cypher, err)
+	}
+	b, err := bind.Bind(q, testCatalog{}, false)
+	if err != nil {
+		t.Fatalf("bind %q: %v", cypher, err)
+	}
+	root := plan.Plan(b)
+	tx, err := e.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Abort()
+	if params == nil {
+		params = map[string]value.Value{}
+	}
+	cur, err := Open(root, &Ctx{Tx: tx, Params: params, Resolve: ResolverFromBound(b)})
+	if err != nil {
+		t.Fatalf("open %q: %v", cypher, err)
+	}
+	defer cur.Close()
+	var rows []eval.Row
+	for {
+		row, ok, err := cur.Next()
+		if err != nil {
+			t.Fatalf("next %q: %v", cypher, err)
+		}
+		if !ok {
+			break
+		}
+		rows = append(rows, row)
+	}
+	return rows, cur.Cols()
+}
+
+// strCol pulls a string column from every row, sorted, for set comparison.
+func strCol(rows []eval.Row, col string) []string {
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if s, ok := r[col].AsString(); ok {
+			out = append(out, s)
+		} else if r[col].IsNull() {
+			out = append(out, "<null>")
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func eqStrings(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
+func TestNodeScan(t *testing.T) {
+	e, _ := graph(t)
+	rows, cols := run(t, e, "MATCH (n:Person) RETURN n.name AS name", nil)
+	if len(cols) != 1 || cols[0] != "name" {
+		t.Fatalf("cols = %v", cols)
+	}
+	eqStrings(t, strCol(rows, "name"), []string{"Alice", "Bob", "Carol"})
+}
+
+func TestNodeScanUnknownLabel(t *testing.T) {
+	e, _ := graph(t)
+	rows, _ := run(t, e, "MATCH (n:Ghost) RETURN n.name AS name", nil)
+	if len(rows) != 0 {
+		t.Fatalf("unknown label should scan nothing, got %d rows", len(rows))
+	}
+}
+
+func TestExpand(t *testing.T) {
+	e, _ := graph(t)
+	rows, _ := run(t, e, "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name AS a, b.name AS b", nil)
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(rows))
+	}
+	pairs := map[string]bool{}
+	for _, r := range rows {
+		a, _ := r["a"].AsString()
+		b, _ := r["b"].AsString()
+		pairs[a+"->"+b] = true
+	}
+	for _, want := range []string{"Alice->Bob", "Bob->Carol", "Alice->Carol"} {
+		if !pairs[want] {
+			t.Fatalf("missing pair %s in %v", want, pairs)
+		}
+	}
+}
+
+func TestFilter(t *testing.T) {
+	e, _ := graph(t)
+	rows, _ := run(t, e, "MATCH (n:Person) WHERE n.age > 28 RETURN n.name AS name", nil)
+	eqStrings(t, strCol(rows, "name"), []string{"Alice", "Carol"})
+}
+
+func TestFilterParam(t *testing.T) {
+	e, _ := graph(t)
+	rows, _ := run(t, e, "MATCH (n:Person) WHERE n.age >= $min RETURN n.name AS name",
+		map[string]value.Value{"min": value.Int(30)})
+	eqStrings(t, strCol(rows, "name"), []string{"Alice", "Carol"})
+}
+
+func TestTwoHopRelUniqueness(t *testing.T) {
+	e, _ := graph(t)
+	// a-KNOWS->b-KNOWS->c with distinct relationships. Only Alice-Bob-Carol fits.
+	rows, _ := run(t, e, "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN a.name AS a, b.name AS b, c.name AS c", nil)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1: %v", len(rows), rows)
+	}
+	if a, _ := rows[0]["a"].AsString(); a != "Alice" {
+		t.Fatalf("a = %v", rows[0]["a"])
+	}
+	if c, _ := rows[0]["c"].AsString(); c != "Carol" {
+		t.Fatalf("c = %v", rows[0]["c"])
+	}
+}
+
+func TestPropertyConstraint(t *testing.T) {
+	e, _ := graph(t)
+	rows, _ := run(t, e, `MATCH (n:Person {name: "Bob"}) RETURN n.age AS age`, nil)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if a, _ := rows[0]["age"].AsInt(); a != 25 {
+		t.Fatalf("age = %v", rows[0]["age"])
+	}
+}
+
+func TestAggregateCount(t *testing.T) {
+	e, _ := graph(t)
+	rows, cols := run(t, e, "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name AS name, count(*) AS c ORDER BY name", nil)
+	if len(cols) != 2 || cols[0] != "name" || cols[1] != "c" {
+		t.Fatalf("cols = %v", cols)
+	}
+	want := map[string]int64{"Alice": 2, "Bob": 1}
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	for _, r := range rows {
+		n, _ := r["name"].AsString()
+		c, _ := r["c"].AsInt()
+		if want[n] != c {
+			t.Fatalf("%s: got %d, want %d", n, c, want[n])
+		}
+	}
+}
+
+func TestAggregateGlobalCountOverEmpty(t *testing.T) {
+	e, _ := graph(t)
+	rows, _ := run(t, e, "MATCH (n:City) RETURN count(*) AS c", nil)
+	if len(rows) != 1 {
+		t.Fatalf("global count should yield one row, got %d", len(rows))
+	}
+	if c, _ := rows[0]["c"].AsInt(); c != 0 {
+		t.Fatalf("count = %v, want 0", rows[0]["c"])
+	}
+}
+
+func TestAggregateSumAvgCollect(t *testing.T) {
+	e, _ := graph(t)
+	rows, _ := run(t, e, "MATCH (n:Person) RETURN sum(n.age) AS s, avg(n.age) AS a, count(n) AS c", nil)
+	r := rows[0]
+	if s, _ := r["s"].AsInt(); s != 90 {
+		t.Fatalf("sum = %v, want 90", r["s"])
+	}
+	if a, _ := r["a"].AsFloat(); a != 30 {
+		t.Fatalf("avg = %v, want 30", r["a"])
+	}
+	if c, _ := r["c"].AsInt(); c != 3 {
+		t.Fatalf("count = %v, want 3", r["c"])
+	}
+}
+
+func TestCollectDistinct(t *testing.T) {
+	e, _ := graph(t)
+	rows, _ := run(t, e, "MATCH (a:Person)-[:KNOWS]->(b) RETURN collect(DISTINCT b.name) AS names", nil)
+	lst, ok := rows[0]["names"].AsList()
+	if !ok {
+		t.Fatalf("names not a list: %v", rows[0]["names"])
+	}
+	got := make([]string, 0, len(lst))
+	for _, v := range lst {
+		s, _ := v.AsString()
+		got = append(got, s)
+	}
+	sort.Strings(got)
+	eqStrings(t, got, []string{"Bob", "Carol"})
+}
+
+func TestOrderSkipLimit(t *testing.T) {
+	e, _ := graph(t)
+	rows, _ := run(t, e, "MATCH (n:Person) RETURN n.name AS name, n.age AS age ORDER BY age DESC LIMIT 2", nil)
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	if n, _ := rows[0]["name"].AsString(); n != "Carol" {
+		t.Fatalf("first = %v, want Carol", rows[0]["name"])
+	}
+	if n, _ := rows[1]["name"].AsString(); n != "Alice" {
+		t.Fatalf("second = %v, want Alice", rows[1]["name"])
+	}
+}
+
+func TestDistinct(t *testing.T) {
+	e, _ := graph(t)
+	rows, _ := run(t, e, "MATCH (a:Person)-[:KNOWS]->(b) RETURN DISTINCT a.name AS name", nil)
+	eqStrings(t, strCol(rows, "name"), []string{"Alice", "Bob"})
+}
+
+func TestUnwind(t *testing.T) {
+	e, _ := graph(t)
+	rows, _ := run(t, e, "UNWIND [10, 20, 30] AS x RETURN x AS x", nil)
+	if len(rows) != 3 {
+		t.Fatalf("got %d rows, want 3", len(rows))
+	}
+	var sum int64
+	for _, r := range rows {
+		i, _ := r["x"].AsInt()
+		sum += i
+	}
+	if sum != 60 {
+		t.Fatalf("sum = %d, want 60", sum)
+	}
+}
+
+func TestOptionalMatch(t *testing.T) {
+	e, _ := graph(t)
+	rows, _ := run(t, e, "MATCH (n:Person) OPTIONAL MATCH (n)-[:KNOWS]->(m) RETURN n.name AS n, m.name AS m", nil)
+	// Alice->Bob, Alice->Carol, Bob->Carol, Carol->(null) = 4 rows.
+	if len(rows) != 4 {
+		t.Fatalf("got %d rows, want 4: %v", len(rows), rows)
+	}
+	var nullCount int
+	for _, r := range rows {
+		if r["m"].IsNull() {
+			nullCount++
+			if n, _ := r["n"].AsString(); n != "Carol" {
+				t.Fatalf("null match on %v, want Carol", r["n"])
+			}
+		}
+	}
+	if nullCount != 1 {
+		t.Fatalf("got %d null matches, want 1", nullCount)
+	}
+}
+
+func TestUnion(t *testing.T) {
+	e, _ := graph(t)
+	all, _ := run(t, e, "RETURN 1 AS x UNION ALL RETURN 1 AS x", nil)
+	if len(all) != 2 {
+		t.Fatalf("UNION ALL got %d rows, want 2", len(all))
+	}
+	dedup, _ := run(t, e, "RETURN 1 AS x UNION RETURN 1 AS x", nil)
+	if len(dedup) != 1 {
+		t.Fatalf("UNION got %d rows, want 1", len(dedup))
+	}
+}
+
+func TestReturnConstant(t *testing.T) {
+	e, _ := graph(t)
+	rows, _ := run(t, e, "RETURN 1 + 2 AS x", nil)
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if x, _ := rows[0]["x"].AsInt(); x != 3 {
+		t.Fatalf("x = %v, want 3", rows[0]["x"])
+	}
+}

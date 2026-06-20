@@ -1,0 +1,433 @@
+// Package adj is gr's CSR index-free adjacency: the expand primitive that, given
+// a node and a relationship type and direction, yields its neighbors in
+// O(1)-to-the-run plus O(degree) (spec 2060 doc 04 §3, §5, §8; doc 25 §4
+// deliverables 3, 4, 7).
+//
+// The design has three pieces that mirror the spec's base/delta/checkpoint:
+//
+//   - The relationship store (package rel) is the durable edge log: every edge,
+//     live or tombstoned, is a record there. It is the source of truth.
+//   - The base CSR is a derived, foldable index: per (type, direction) slot, an
+//     offset array indexed by source node position plus parallel neighbor and
+//     edge-id arrays, with each source's run sorted by neighbor. It holds the
+//     edges folded so far, recorded by a folded relationship count.
+//   - The delta is the in-memory adjacency over the un-folded, live tail of the
+//     relationship store. It is rebuilt on open by scanning relationship
+//     positions at and beyond the folded count; it needs no durable pages of its
+//     own because the relationship store it derives from is already durable.
+//
+// expand merges base and delta: it reads the base run for the source and the
+// delta inserts for the source, drops any whose edge is no longer live in the
+// relationship store (which is how deletes take effect uniformly across base and
+// delta), and returns the sorted neighbor list. checkpoint folds the delta into
+// the base by rebuilding the CSR from every live relationship and advancing the
+// folded count, after which the delta is empty.
+//
+// This is the M1, single-writer, no-MVCC realization. A standalone durable delta
+// with its own pages and per-entry version tags, segmented and incremental
+// checkpointing, and dense-id reuse arrive in later PRs; the merge and checkpoint
+// here are written so those refinements slot in without changing the expand
+// contract.
+package adj
+
+import (
+	"slices"
+
+	"github.com/tamnd/gr/format"
+	"github.com/tamnd/gr/pager"
+	"github.com/tamnd/gr/rel"
+	"github.com/tamnd/gr/store"
+)
+
+// Dir is an expand direction.
+type Dir uint8
+
+const (
+	// Out expands a node's outgoing edges (source -> neighbor).
+	Out Dir = 0
+	// In expands a node's incoming edges (neighbor -> source).
+	In Dir = 1
+)
+
+// Neighbor is one entry of an expand result: the neighbor node's dense position
+// and the relationship's dense position (its edge id), so reaching the edge's
+// properties is O(1) after the neighbor (doc 04 §5.3).
+type Neighbor struct {
+	Node uint64
+	Edge uint64
+}
+
+// slot folds a relationship type token and a direction into one dense key. Type
+// tokens are dense, so slots are dense and the directory Vector packs tightly.
+func slot(relType uint32, d Dir) uint32 { return relType*2 + uint32(d) }
+
+// dirStride is one base-directory cell: the offset array's head and length, the
+// neighbor and edge arrays' heads, and the shared run length.
+const dirStride = 40
+
+// base holds the opened base CSR arrays for one slot.
+type base struct {
+	off *store.Vector // u64 offsets, length nodeCount+1
+	nbr *store.Vector // u64 neighbor node positions
+	edg *store.Vector // u64 edge (relationship) positions
+}
+
+// Adj is the adjacency index over a relationship store.
+type Adj struct {
+	p      *pager.Pager
+	secs   *store.Sections
+	rels   *rel.Store
+	dir    *store.Vector
+	folded uint64
+	delta  map[uint32]map[uint64][]Neighbor // slot -> src -> sorted neighbors
+	cache  map[uint32]*base                 // opened base arrays, cleared on checkpoint
+}
+
+// Create initializes a fresh adjacency: an empty base directory and a zero
+// folded count, recorded in the section directory (durable at the next commit).
+func Create(p *pager.Pager, secs *store.Sections, rels *rel.Store) (*Adj, error) {
+	dir, err := store.CreateVector(p, dirStride, format.PageTypeRelGroup)
+	if err != nil {
+		return nil, err
+	}
+	if err := secs.Set(store.SecAdjDir, dir.Head(), 0); err != nil {
+		return nil, err
+	}
+	if err := secs.Set(store.SecAdjMeta, 0, 0); err != nil {
+		return nil, err
+	}
+	return &Adj{
+		p: p, secs: secs, rels: rels, dir: dir,
+		delta: map[uint32]map[uint64][]Neighbor{},
+		cache: map[uint32]*base{},
+	}, nil
+}
+
+// Open reopens the adjacency from the section directory and rebuilds the
+// in-memory delta by scanning the un-folded tail of the relationship store.
+func Open(p *pager.Pager, secs *store.Sections, rels *rel.Store) (*Adj, error) {
+	head, count, err := secs.Get(store.SecAdjDir)
+	if err != nil {
+		return nil, err
+	}
+	dir, err := store.OpenVector(p, head, dirStride, int(count))
+	if err != nil {
+		return nil, err
+	}
+	_, folded, err := secs.Get(store.SecAdjMeta)
+	if err != nil {
+		return nil, err
+	}
+	a := &Adj{
+		p: p, secs: secs, rels: rels, dir: dir, folded: folded,
+		delta: map[uint32]map[uint64][]Neighbor{},
+		cache: map[uint32]*base{},
+	}
+	if err := a.rebuildDelta(); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// rebuildDelta scans relationship positions [folded, count) and indexes the live
+// ones into the in-memory delta, both directions.
+func (a *Adj) rebuildDelta() error {
+	for pos := a.folded; pos < uint64(a.rels.Count()); pos++ {
+		if !a.rels.Exists(pos) {
+			continue
+		}
+		r, err := a.rels.Get(pos)
+		if err != nil {
+			return err
+		}
+		a.insertDelta(r.Type, r.Src, r.Dst, pos)
+	}
+	return nil
+}
+
+// Insert records a freshly created edge in the in-memory delta. The caller has
+// already created the durable relationship record; this only indexes it, so a
+// reopen rebuilds the same delta from that record.
+func (a *Adj) Insert(relType uint32, src, dst, relPos uint64) {
+	a.insertDelta(relType, src, dst, relPos)
+}
+
+func (a *Adj) insertDelta(relType uint32, src, dst, relPos uint64) {
+	a.addDelta(slot(relType, Out), src, Neighbor{Node: dst, Edge: relPos})
+	a.addDelta(slot(relType, In), dst, Neighbor{Node: src, Edge: relPos})
+}
+
+// addDelta inserts a neighbor into the sorted per-source delta list.
+func (a *Adj) addDelta(s uint32, src uint64, nb Neighbor) {
+	m := a.delta[s]
+	if m == nil {
+		m = map[uint64][]Neighbor{}
+		a.delta[s] = m
+	}
+	list := m[src]
+	i, _ := slices.BinarySearchFunc(list, nb, cmpNeighbor)
+	m[src] = slices.Insert(list, i, nb)
+}
+
+func cmpNeighbor(a, b Neighbor) int {
+	if a.Node != b.Node {
+		if a.Node < b.Node {
+			return -1
+		}
+		return 1
+	}
+	switch {
+	case a.Edge < b.Edge:
+		return -1
+	case a.Edge > b.Edge:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// Expand returns the snapshot-visible neighbors of src along the given type and
+// direction, base and delta merged, sorted by neighbor then edge. An edge that
+// is no longer live in the relationship store is dropped, which is how a delete
+// takes effect against both the base and the delta.
+func (a *Adj) Expand(src uint64, relType uint32, d Dir) ([]Neighbor, error) {
+	s := slot(relType, d)
+	var out []Neighbor
+
+	run, err := a.baseRun(s, src)
+	if err != nil {
+		return nil, err
+	}
+	for _, nb := range run {
+		if a.rels.Exists(nb.Edge) {
+			out = append(out, nb)
+		}
+	}
+	for _, nb := range a.delta[s][src] {
+		if a.rels.Exists(nb.Edge) {
+			out = append(out, nb)
+		}
+	}
+	slices.SortFunc(out, cmpNeighbor)
+	return out, nil
+}
+
+// baseRun returns the base CSR run for a source in a slot, or nil if the slot has
+// no base or the source is beyond the folded node range.
+func (a *Adj) baseRun(s uint32, src uint64) ([]Neighbor, error) {
+	if int(s) >= a.dir.Count() {
+		return nil, nil
+	}
+	b, offLen, err := a.openBase(s)
+	if err != nil {
+		return nil, err
+	}
+	if b == nil || src+1 >= offLen {
+		return nil, nil
+	}
+	lo, err := getU64(b.off, int(src))
+	if err != nil {
+		return nil, err
+	}
+	hi, err := getU64(b.off, int(src+1))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Neighbor, 0, hi-lo)
+	for k := lo; k < hi; k++ {
+		node, err := getU64(b.nbr, int(k))
+		if err != nil {
+			return nil, err
+		}
+		edge, err := getU64(b.edg, int(k))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, Neighbor{Node: node, Edge: edge})
+	}
+	return out, nil
+}
+
+// openBase materializes and caches a slot's base arrays from its directory cell.
+// It returns the offset-array length so callers can bound the source range.
+func (a *Adj) openBase(s uint32) (*base, uint64, error) {
+	offHead, offLen, nbrHead, edgHead, runLen, err := a.readDir(s)
+	if err != nil {
+		return nil, 0, err
+	}
+	if offLen == 0 {
+		return nil, 0, nil
+	}
+	if b, ok := a.cache[s]; ok {
+		return b, offLen, nil
+	}
+	off, err := store.OpenVector(a.p, offHead, 8, int(offLen))
+	if err != nil {
+		return nil, 0, err
+	}
+	nbr, err := store.OpenVector(a.p, nbrHead, 8, int(runLen))
+	if err != nil {
+		return nil, 0, err
+	}
+	edg, err := store.OpenVector(a.p, edgHead, 8, int(runLen))
+	if err != nil {
+		return nil, 0, err
+	}
+	b := &base{off: off, nbr: nbr, edg: edg}
+	a.cache[s] = b
+	return b, offLen, nil
+}
+
+func (a *Adj) readDir(s uint32) (offHead format.PageID, offLen uint64, nbrHead, edgHead format.PageID, runLen uint64, err error) {
+	var buf [dirStride]byte
+	if err = a.dir.Get(int(s), buf[:]); err != nil {
+		return
+	}
+	offHead = format.PageID(format.U64(buf[0:8]))
+	offLen = format.U64(buf[8:16])
+	nbrHead = format.PageID(format.U64(buf[16:24]))
+	edgHead = format.PageID(format.U64(buf[24:32]))
+	runLen = format.U64(buf[32:40])
+	return
+}
+
+func (a *Adj) writeDir(s uint32, offHead format.PageID, offLen uint64, nbrHead, edgHead format.PageID, runLen uint64) error {
+	var buf [dirStride]byte
+	format.PutU64(buf[0:8], uint64(offHead))
+	format.PutU64(buf[8:16], offLen)
+	format.PutU64(buf[16:24], uint64(nbrHead))
+	format.PutU64(buf[24:32], uint64(edgHead))
+	format.PutU64(buf[32:40], runLen)
+	return a.dir.Set(int(s), buf[:])
+}
+
+// Checkpoint folds the delta into the base by rebuilding the CSR from every live
+// relationship and advancing the folded count to the current relationship count,
+// after which the delta is empty. nodeCount is the number of node positions, so
+// every node gets an offset entry even with zero degree. Durable when the
+// transaction commits; because the whole rebuild commits in one batch, a crash
+// mid-checkpoint recovers either the old base or the new one, never a mix.
+func (a *Adj) Checkpoint(nodeCount uint64) error {
+	relCount := uint64(a.rels.Count())
+
+	// Group live edges by slot and source, both directions.
+	group := map[uint32]map[uint64][]Neighbor{}
+	maxSlot := -1
+	add := func(s uint32, src uint64, nb Neighbor) {
+		m := group[s]
+		if m == nil {
+			m = map[uint64][]Neighbor{}
+			group[s] = m
+		}
+		m[src] = append(m[src], nb)
+		if int(s) > maxSlot {
+			maxSlot = int(s)
+		}
+	}
+	for pos := range relCount {
+		if !a.rels.Exists(pos) {
+			continue
+		}
+		r, err := a.rels.Get(pos)
+		if err != nil {
+			return err
+		}
+		add(slot(r.Type, Out), r.Src, Neighbor{Node: r.Dst, Edge: pos})
+		add(slot(r.Type, In), r.Dst, Neighbor{Node: r.Src, Edge: pos})
+	}
+
+	// Ensure the directory covers every slot up to the max (dense fill).
+	if a.dir.Count() <= maxSlot {
+		empty := make([]byte, dirStride)
+		for a.dir.Count() <= maxSlot {
+			if _, err := a.dir.Append(empty); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Rebuild each slot's arrays.
+	for s := range maxSlot + 1 {
+		perSrc := group[uint32(s)]
+		if len(perSrc) == 0 {
+			// No edges for this slot: write an empty cell.
+			if err := a.writeDir(uint32(s), 0, 0, 0, 0, 0); err != nil {
+				return err
+			}
+			continue
+		}
+		off, err := store.CreateVector(a.p, 8, format.PageTypeRelGroup)
+		if err != nil {
+			return err
+		}
+		nbr, err := store.CreateVector(a.p, 8, format.PageTypeRelGroup)
+		if err != nil {
+			return err
+		}
+		edg, err := store.CreateVector(a.p, 8, format.PageTypeRelGroup)
+		if err != nil {
+			return err
+		}
+		var running uint64
+		if err := appendU64(off, running); err != nil { // offset[0] = 0
+			return err
+		}
+		for i := range nodeCount {
+			list := perSrc[i]
+			slices.SortFunc(list, cmpNeighbor)
+			for _, nb := range list {
+				if err := appendU64(nbr, nb.Node); err != nil {
+					return err
+				}
+				if err := appendU64(edg, nb.Edge); err != nil {
+					return err
+				}
+			}
+			running += uint64(len(list))
+			if err := appendU64(off, running); err != nil {
+				return err
+			}
+		}
+		if err := a.writeDir(uint32(s), off.Head(), nodeCount+1, nbr.Head(), edg.Head(), running); err != nil {
+			return err
+		}
+	}
+
+	a.folded = relCount
+	if err := a.secs.Set(store.SecAdjDir, a.dir.Head(), uint64(a.dir.Count())); err != nil {
+		return err
+	}
+	if err := a.secs.Set(store.SecAdjMeta, 0, relCount); err != nil {
+		return err
+	}
+	a.delta = map[uint32]map[uint64][]Neighbor{}
+	a.cache = map[uint32]*base{}
+	return nil
+}
+
+// DeltaLen reports how many (source, slot) neighbor entries are pending in the
+// delta. It is zero immediately after a checkpoint.
+func (a *Adj) DeltaLen() int {
+	n := 0
+	for _, m := range a.delta {
+		for _, list := range m {
+			n += len(list)
+		}
+	}
+	return n
+}
+
+func getU64(v *store.Vector, i int) (uint64, error) {
+	var buf [8]byte
+	if err := v.Get(i, buf[:]); err != nil {
+		return 0, err
+	}
+	return format.U64(buf[:]), nil
+}
+
+func appendU64(v *store.Vector, x uint64) error {
+	var buf [8]byte
+	format.PutU64(buf[:], x)
+	_, err := v.Append(buf[:])
+	return err
+}

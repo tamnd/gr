@@ -33,6 +33,12 @@ const (
 	SecNodeCols
 	// SecRelCols is the relationship property-column directory.
 	SecRelCols
+	// SecAdjDir is the CSR adjacency base directory (a Vector indexed by
+	// type-and-direction slot; see package adj).
+	SecAdjDir
+	// SecAdjMeta carries the adjacency's folded relationship count (the number of
+	// relationship positions already folded into the base CSR) in its meta field.
+	SecAdjMeta
 	// numSectionsInUse is the count of section ids currently defined. It must
 	// stay <= MaxSections; later milestones add ids before this marker.
 	numSectionsInUse

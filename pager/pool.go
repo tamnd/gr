@@ -200,6 +200,28 @@ func (p *Pager) Commit() error {
 	return nil
 }
 
+// Rollback discards all uncommitted changes: it drops every dirty frame from the
+// pool and reloads the header from the database file, which holds the last
+// committed prefix (Commit writes committed images straight through). After
+// Rollback, reads fault committed pages back in from disk, so the pager presents
+// exactly the last-committed state. It is the page-level half of a transaction
+// abort; callers that cache derived state above the pager must rebuild it from
+// the rolled-back pager (the engine re-opens its stores).
+func (p *Pager) Rollback() error {
+	if p.readOnly {
+		return nil
+	}
+	for id, f := range p.pool {
+		if f.dirty {
+			delete(p.pool, id)
+			p.clock = removeFrame(p.clock, f)
+		}
+	}
+	p.hand = 0
+	p.headerDirty = false
+	return p.loadHeader()
+}
+
 // sortFramesByID sorts frames ascending by page id (small n, insertion sort
 // keeps it allocation-free and dependency-free).
 func sortFramesByID(fs []*Frame) {

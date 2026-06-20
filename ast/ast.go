@@ -85,11 +85,63 @@ type Create struct {
 	Patterns []*PathPattern
 }
 
+// Set is a SET clause: a list of update items applied in order to already-bound
+// elements (doc 13 §6). It binds nothing new; it mutates the matched elements
+// and passes its rows on.
+type Set struct {
+	Pos
+	Items []SetItem
+}
+
+// SetItem is one SET assignment. Op selects the shape; the other fields are
+// meaningful per shape: SetProperty uses Var, Key, Value; SetMerge and
+// SetReplace use Var and Value; SetLabels uses Var and Labels.
+type SetItem struct {
+	Pos
+	Op     SetOp
+	Var    string
+	Key    string   // SetProperty: the property key
+	Value  Expr     // SetProperty/SetMerge/SetReplace: the right-hand side
+	Labels []string // SetLabels: the labels to add
+}
+
+// SetOp classifies a SET item.
+type SetOp uint8
+
+const (
+	// SetProperty is n.key = expr, a single-property assignment.
+	SetProperty SetOp = iota
+	// SetMerge is n += map, merging the map's keys into the element.
+	SetMerge
+	// SetReplace is n = map, replacing the element's whole property set.
+	SetReplace
+	// SetLabels is n:Label[:Label2 ...], adding labels to a node.
+	SetLabels
+)
+
+// Remove is a REMOVE clause: a list of property and label removals applied in
+// order to already-bound elements (doc 13 §7).
+type Remove struct {
+	Pos
+	Items []RemoveItem
+}
+
+// RemoveItem is one REMOVE target: a property (Var, Key) or one or more labels
+// (Var, Labels). Labels is non-empty exactly for a label removal.
+type RemoveItem struct {
+	Pos
+	Var    string
+	Key    string   // property key, "" for a label removal
+	Labels []string // labels to remove, nil for a property removal
+}
+
 func (*Match) clauseNode()  {}
 func (*With) clauseNode()   {}
 func (*Unwind) clauseNode() {}
 func (*Return) clauseNode() {}
 func (*Create) clauseNode() {}
+func (*Set) clauseNode()    {}
+func (*Remove) clauseNode() {}
 
 // Projection is the shared body of WITH and RETURN: the projected items (or a
 // star), DISTINCT, and the ORDER BY / SKIP / LIMIT tail.

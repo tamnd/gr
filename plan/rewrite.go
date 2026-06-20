@@ -47,6 +47,22 @@ func rebuildChildren(o Op) (Op, bool) {
 		y := *x
 		y.Input = in
 		return &y, true
+	case *Set:
+		in, ch := apply(x.Input)
+		if !ch {
+			return x, false
+		}
+		y := *x
+		y.Input = in
+		return &y, true
+	case *Remove:
+		in, ch := apply(x.Input)
+		if !ch {
+			return x, false
+		}
+		y := *x
+		y.Input = in
+		return &y, true
 	case *Expand:
 		in, ch := apply(x.Input)
 		if !ch {

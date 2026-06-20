@@ -228,3 +228,34 @@ func TestBindCreate(t *testing.T) {
 		t.Fatal("shortestPath in CREATE should be rejected")
 	}
 }
+
+func TestBindSetRemove(t *testing.T) {
+	// SET and REMOVE bind their target against an already-bound variable.
+	mustBind(t, "MATCH (a) SET a.name = 'x'")
+	mustBind(t, "MATCH (a) SET a.name = 'x', a.age = 1")
+	mustBind(t, "MATCH (a) SET a:Person")
+	mustBind(t, "MATCH (a)-[r:KNOWS]->(b) SET r.since = 2020")
+	mustBind(t, "MATCH (a) REMOVE a.name")
+	mustBind(t, "MATCH (a) REMOVE a:Person")
+	// The targeted variable must be in scope.
+	if _, err := bindStr(t, "SET a.name = 'x'", false); err == nil {
+		t.Fatal("SET of an unbound variable should be rejected")
+	}
+	if _, err := bindStr(t, "MATCH (a) REMOVE b.name", false); err == nil {
+		t.Fatal("REMOVE of an unbound variable should be rejected")
+	}
+	// A label set or removal targets a node, not a relationship.
+	if _, err := bindStr(t, "MATCH (a)-[r:KNOWS]->(b) SET r:Person", false); err == nil {
+		t.Fatal("SET label on a relationship should be rejected")
+	}
+	if _, err := bindStr(t, "MATCH (a)-[r:KNOWS]->(b) REMOVE r:Person", false); err == nil {
+		t.Fatal("REMOVE label on a relationship should be rejected")
+	}
+	// The map forms of SET are deferred to a later M3 milestone.
+	if _, err := bindStr(t, "MATCH (a) SET a += {x: 1}", false); err == nil {
+		t.Fatal("map-merge SET should be rejected for now")
+	}
+	if _, err := bindStr(t, "MATCH (a) SET a = {x: 1}", false); err == nil {
+		t.Fatal("map-replace SET should be rejected for now")
+	}
+}

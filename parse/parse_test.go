@@ -56,6 +56,22 @@ func sexpr(n any) string {
 			parts[i] = sexpr(pp)
 		}
 		return "(create " + strings.Join(parts, " ") + ")"
+	case *ast.Set:
+		parts := make([]string, len(x.Items))
+		for i, it := range x.Items {
+			parts[i] = setItem(it)
+		}
+		return "(set " + strings.Join(parts, " ") + ")"
+	case *ast.Remove:
+		parts := make([]string, len(x.Items))
+		for i, it := range x.Items {
+			if len(it.Labels) > 0 {
+				parts[i] = it.Var + ":" + strings.Join(it.Labels, ":")
+			} else {
+				parts[i] = it.Var + "." + it.Key
+			}
+		}
+		return "(remove " + strings.Join(parts, " ") + ")"
 	case *ast.PathPattern:
 		s := "(path"
 		if x.Var != "" {
@@ -154,6 +170,20 @@ func sexpr(n any) string {
 	default:
 		return "?"
 	}
+}
+
+func setItem(it ast.SetItem) string {
+	switch it.Op {
+	case ast.SetProperty:
+		return "(prop " + it.Var + "." + it.Key + " " + sexpr(it.Value) + ")"
+	case ast.SetMerge:
+		return "(merge " + it.Var + " " + sexpr(it.Value) + ")"
+	case ast.SetReplace:
+		return "(replace " + it.Var + " " + sexpr(it.Value) + ")"
+	case ast.SetLabels:
+		return "(labels " + it.Var + ":" + strings.Join(it.Labels, ":") + ")"
+	}
+	return "?"
 }
 
 func projection(p ast.Projection) string {
@@ -369,17 +399,44 @@ func TestParseCreate(t *testing.T) {
 		`(query (create (path p= (node a) (rel -> :KNOWS) (node b))) (return p))`)
 }
 
+// TestParseSetRemove covers the SET and REMOVE write clauses in their four SET
+// shapes (single property, map merge, map replace, label addition) and the two
+// REMOVE shapes (property, labels).
+func TestParseSetRemove(t *testing.T) {
+	check(t, "MATCH (a) SET a.x = 1",
+		`(query (match (path (node a))) (set (prop a.x 1)))`)
+	check(t, "MATCH (a) SET a.x = 1, a.y = 2",
+		`(query (match (path (node a))) (set (prop a.x 1) (prop a.y 2)))`)
+	check(t, "MATCH (a) SET a += $m",
+		`(query (match (path (node a))) (set (merge a $m)))`)
+	check(t, "MATCH (a) SET a = $m",
+		`(query (match (path (node a))) (set (replace a $m)))`)
+	check(t, "MATCH (a) SET a:Person",
+		`(query (match (path (node a))) (set (labels a:Person)))`)
+	check(t, "MATCH (a) SET a:Person:Admin",
+		`(query (match (path (node a))) (set (labels a:Person:Admin)))`)
+	check(t, "MATCH (a)-[r]->(b) SET r.since = 2020",
+		`(query (match (path (node a) (rel -> r) (node b))) (set (prop r.since 2020)))`)
+	check(t, "MATCH (a) REMOVE a.x",
+		`(query (match (path (node a))) (remove a.x))`)
+	check(t, "MATCH (a) REMOVE a:Person",
+		`(query (match (path (node a))) (remove a:Person))`)
+	check(t, "MATCH (a) REMOVE a:Person:Admin, a.x",
+		`(query (match (path (node a))) (remove a:Person:Admin a.x))`)
+}
+
 // TestParseErrors confirms malformed queries are rejected with a parse.Error.
 func TestParseErrors(t *testing.T) {
 	bad := []string{
-		"MATCH (a",                       // missing )
-		"MATCH (a)-[:KNOWS]->",           // missing target node
-		"RETURN",                         // empty projection
-		"MATCH (a) WHERE RETURN a",       // missing predicate
-		"MATCH (a) SET a.x = 1 RETURN a", // a later M3 write clause
-		"MATCH (a)<-[:T]->(b) RETURN b",  // both directions
-		"RETURN 1 +",                     // dangling operator
-		"FOO bar",                        // not a clause
+		"MATCH (a",                      // missing )
+		"MATCH (a)-[:KNOWS]->",          // missing target node
+		"RETURN",                        // empty projection
+		"MATCH (a) WHERE RETURN a",      // missing predicate
+		"MATCH (a) SET a RETURN a",      // SET target with no .key/:Label/=
+		"MATCH (a) REMOVE a RETURN a",   // REMOVE target with no .key/:Label
+		"MATCH (a)<-[:T]->(b) RETURN b", // both directions
+		"RETURN 1 +",                    // dangling operator
+		"FOO bar",                       // not a clause
 	}
 	for _, src := range bad {
 		if _, err := parse.Parse(src); err == nil {

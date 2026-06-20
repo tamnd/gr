@@ -269,6 +269,31 @@ func TestBuildCreateIncoming(t *testing.T) {
 	eq(t, "raw", String(Build(b)), want)
 }
 
+func TestBuildSetProperty(t *testing.T) {
+	b := bound(t, "MATCH (a:Person) SET a.name = 'x'")
+	want := `Set a.#1 = "x"
+  NodeScan a:#1
+`
+	eq(t, "raw", String(Build(b)), want)
+	eq(t, "normalized", String(Plan(b)), want)
+}
+
+func TestBuildSetMultiple(t *testing.T) {
+	b := bound(t, "MATCH (a) SET a.name = 'x', a:Person")
+	want := `Set a.#1 = "x", a:#1
+  NodeScan a
+`
+	eq(t, "raw", String(Build(b)), want)
+}
+
+func TestBuildRemove(t *testing.T) {
+	b := bound(t, "MATCH (a:Person) REMOVE a.name, a:Movie")
+	want := `Remove a.#1, a:#2
+  NodeScan a:#1
+`
+	eq(t, "raw", String(Build(b)), want)
+}
+
 func TestBuildShortestPath(t *testing.T) {
 	b := bound(t, "MATCH (a:Person), (b:Person) MATCH p = shortestPath((a)-[:KNOWS*]-(b)) RETURN p")
 	want := `Project p

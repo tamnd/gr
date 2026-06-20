@@ -62,6 +62,7 @@ type Bound struct {
 	nodeLabels map[*ast.NodePattern][]NameRef
 	relTypes   map[*ast.RelPattern][]NameRef
 	propKeys   map[string]NameRef
+	labels     map[string]NameRef
 }
 
 // NodeLabels returns the resolved label set of a node pattern, one NameRef per
@@ -79,6 +80,12 @@ func (b *Bound) RelTypes(rp *ast.RelPattern) []NameRef { return b.relTypes[rp] }
 // never referenced as well as for one resolved leniently to null; callers that
 // need the difference should consult the bound tree, not this map.
 func (b *Bound) PropKey(name string) NameRef { return b.propKeys[name] }
+
+// Label returns the resolution of a label name a SET or REMOVE clause referenced
+// outside a pattern (a pattern's labels are looked up by pattern pointer through
+// NodeLabels). The zero NameRef is returned for a name resolved leniently to "no
+// such label", which a write treats as a no-op.
+func (b *Bound) Label(name string) NameRef { return b.labels[name] }
 
 // Error is a semantic or name-resolution failure, positioned at the offending
 // construct so the message can point at the source.
@@ -128,6 +135,7 @@ func Bind(q *ast.Query, cat Catalog, strict bool) (*Bound, error) {
 			nodeLabels: map[*ast.NodePattern][]NameRef{},
 			relTypes:   map[*ast.RelPattern][]NameRef{},
 			propKeys:   map[string]NameRef{},
+			labels:     map[string]NameRef{},
 		},
 	}
 	cols, err := bd.single(q.First)
@@ -163,6 +171,16 @@ func (bd *binder) single(sq *ast.SingleQuery) ([]string, error) {
 			}
 		case *ast.Create:
 			if err := bd.create(cl, sc); err != nil {
+				return nil, err
+			}
+			writes = true
+		case *ast.Set:
+			if err := bd.set(cl, sc); err != nil {
+				return nil, err
+			}
+			writes = true
+		case *ast.Remove:
+			if err := bd.remove(cl, sc); err != nil {
 				return nil, err
 			}
 			writes = true
@@ -394,6 +412,89 @@ func (bd *binder) bindCreatePath(pp *ast.PathPattern, sc scope) error {
 	if pp.Var != "" {
 		return bindVar(sc, pp.Var, vkPath, pp.Pos)
 	}
+	return nil
+}
+
+// set binds a SET clause: every item's target must already be bound, a property
+// target must be a node or relationship, and a label target must be a node. The
+// names a SET introduces (the property keys it assigns, the labels it adds) are
+// interned before binding (the executor's write-setup, doc 13 §9), so they
+// resolve to known tokens. The map forms (+= and =) arrive in a later milestone.
+func (bd *binder) set(s *ast.Set, sc scope) error {
+	for _, it := range s.Items {
+		kind, ok := sc[it.Var]
+		if !ok {
+			return &Error{"variable " + it.Var + " is not defined", it.Line, it.Col}
+		}
+		switch it.Op {
+		case ast.SetProperty:
+			if kind != vkNode && kind != vkRel {
+				return &Error{"SET of a property applies only to a node or relationship", it.Line, it.Col}
+			}
+			if err := bd.resolvePropKey(it.Key, it.Pos); err != nil {
+				return err
+			}
+			if err := bd.checkExpr(it.Value, sc, false); err != nil {
+				return err
+			}
+		case ast.SetLabels:
+			if kind != vkNode {
+				return &Error{"SET of a label applies only to a node", it.Line, it.Col}
+			}
+			for _, l := range it.Labels {
+				if err := bd.resolveLabelName(l, it.Pos); err != nil {
+					return err
+				}
+			}
+		case ast.SetMerge, ast.SetReplace:
+			return &Error{"map-form SET arrives in a later M3 milestone", it.Line, it.Col}
+		}
+	}
+	return nil
+}
+
+// remove binds a REMOVE clause: every item's target must already be bound, a
+// property removal applies to a node or relationship, and a label removal to a
+// node. REMOVE does not intern its names (an unknown label or key matches
+// nothing, so the removal is a no-op), so they resolve leniently.
+func (bd *binder) remove(r *ast.Remove, sc scope) error {
+	for _, it := range r.Items {
+		kind, ok := sc[it.Var]
+		if !ok {
+			return &Error{"variable " + it.Var + " is not defined", it.Line, it.Col}
+		}
+		if len(it.Labels) > 0 {
+			if kind != vkNode {
+				return &Error{"REMOVE of a label applies only to a node", it.Line, it.Col}
+			}
+			for _, l := range it.Labels {
+				if err := bd.resolveLabelName(l, it.Pos); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if kind != vkNode && kind != vkRel {
+			return &Error{"REMOVE of a property applies only to a node or relationship", it.Line, it.Col}
+		}
+		if err := bd.resolvePropKey(it.Key, it.Pos); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolveLabelName resolves a label name a SET or REMOVE clause uses outside a
+// pattern, memoizing it in the Bound's label map for the planner to read by name.
+func (bd *binder) resolveLabelName(name string, pos ast.Pos) error {
+	if _, seen := bd.out.labels[name]; seen {
+		return nil
+	}
+	ref, err := bd.resolveLabel(name, pos)
+	if err != nil {
+		return err
+	}
+	bd.out.labels[name] = ref
 	return nil
 }
 

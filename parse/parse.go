@@ -160,7 +160,11 @@ func (p *parser) singleQuery() (*ast.SingleQuery, error) {
 			c, err = p.returnClause()
 		case lex.Create:
 			c, err = p.createClause()
-		case lex.Merge, lex.Set, lex.Delete, lex.Detach, lex.Remove:
+		case lex.Set:
+			c, err = p.setClause()
+		case lex.Remove:
+			c, err = p.removeClause()
+		case lex.Merge, lex.Delete, lex.Detach:
 			return nil, p.errAt(p.cur(), "this write clause arrives in a later M3 milestone")
 		default:
 			return nil, p.errAt(p.cur(), "expected a clause (MATCH, OPTIONAL MATCH, WITH, UNWIND, RETURN), found "+p.cur().Kind.String())
@@ -261,6 +265,138 @@ func (p *parser) createClause() (*ast.Create, error) {
 		}
 	}
 	return c, nil
+}
+
+// setClause parses SET followed by one or more comma-separated update items.
+// Each item starts with a bound variable and is one of: a property assignment
+// (n.k = e), a map merge (n += e), a map replace (n = e), or a label addition
+// (n:A:B). The +=/= forms are told apart by what follows the variable.
+func (p *parser) setClause() (*ast.Set, error) {
+	start := p.cur()
+	p.advance() // SET
+	s := &ast.Set{Pos: pos(start)}
+	for {
+		it, err := p.setItem()
+		if err != nil {
+			return nil, err
+		}
+		s.Items = append(s.Items, it)
+		if !p.accept(lex.Comma) {
+			break
+		}
+	}
+	return s, nil
+}
+
+func (p *parser) setItem() (ast.SetItem, error) {
+	v, err := p.expect(lex.Ident)
+	if err != nil {
+		return ast.SetItem{}, err
+	}
+	it := ast.SetItem{Pos: pos(v), Var: v.Text}
+	switch {
+	case p.at(lex.Dot):
+		p.advance() // .
+		key, err := p.expect(lex.Ident)
+		if err != nil {
+			return ast.SetItem{}, err
+		}
+		if _, err := p.expect(lex.Eq); err != nil {
+			return ast.SetItem{}, err
+		}
+		e, err := p.expr()
+		if err != nil {
+			return ast.SetItem{}, err
+		}
+		it.Op = ast.SetProperty
+		it.Key = key.Text
+		it.Value = e
+	case p.at(lex.Colon):
+		labels, err := p.labelList()
+		if err != nil {
+			return ast.SetItem{}, err
+		}
+		it.Op = ast.SetLabels
+		it.Labels = labels
+	case p.at(lex.Plus) && p.peek(1).Kind == lex.Eq:
+		p.advance() // +
+		p.advance() // =
+		e, err := p.expr()
+		if err != nil {
+			return ast.SetItem{}, err
+		}
+		it.Op = ast.SetMerge
+		it.Value = e
+	case p.at(lex.Eq):
+		p.advance() // =
+		e, err := p.expr()
+		if err != nil {
+			return ast.SetItem{}, err
+		}
+		it.Op = ast.SetReplace
+		it.Value = e
+	default:
+		return ast.SetItem{}, p.errAt(p.cur(), "expected '.', ':', '=' or '+=' after a SET variable, found "+p.cur().Kind.String())
+	}
+	return it, nil
+}
+
+// removeClause parses REMOVE followed by one or more comma-separated targets,
+// each a property (n.k) or one or more labels (n:A:B).
+func (p *parser) removeClause() (*ast.Remove, error) {
+	start := p.cur()
+	p.advance() // REMOVE
+	r := &ast.Remove{Pos: pos(start)}
+	for {
+		it, err := p.removeItem()
+		if err != nil {
+			return nil, err
+		}
+		r.Items = append(r.Items, it)
+		if !p.accept(lex.Comma) {
+			break
+		}
+	}
+	return r, nil
+}
+
+func (p *parser) removeItem() (ast.RemoveItem, error) {
+	v, err := p.expect(lex.Ident)
+	if err != nil {
+		return ast.RemoveItem{}, err
+	}
+	it := ast.RemoveItem{Pos: pos(v), Var: v.Text}
+	switch {
+	case p.at(lex.Dot):
+		p.advance() // .
+		key, err := p.expect(lex.Ident)
+		if err != nil {
+			return ast.RemoveItem{}, err
+		}
+		it.Key = key.Text
+	case p.at(lex.Colon):
+		labels, err := p.labelList()
+		if err != nil {
+			return ast.RemoveItem{}, err
+		}
+		it.Labels = labels
+	default:
+		return ast.RemoveItem{}, p.errAt(p.cur(), "expected '.' or ':' after a REMOVE variable, found "+p.cur().Kind.String())
+	}
+	return it, nil
+}
+
+// labelList parses a colon-prefixed label chain (:A:B:C), at least one label.
+func (p *parser) labelList() ([]string, error) {
+	var labels []string
+	for p.accept(lex.Colon) {
+		l, err := p.expect(lex.Ident)
+		if err != nil {
+			return nil, err
+		}
+		labels = append(labels, l.Text)
+	}
+	return labels, nil
 }
 
 func (p *parser) returnClause() (*ast.Return, error) {

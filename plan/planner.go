@@ -254,6 +254,14 @@ func mapChildren(o Op, f func(Op) Op) Op {
 		y := *x
 		y.Input = f(x.Input)
 		return &y
+	case *Set:
+		y := *x
+		y.Input = f(x.Input)
+		return &y
+	case *Remove:
+		y := *x
+		y.Input = f(x.Input)
+		return &y
 	case *Filter:
 		return &Filter{Input: f(x.Input), Pred: x.Pred}
 	case *BindPath:

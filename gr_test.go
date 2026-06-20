@@ -397,6 +397,17 @@ func TestQueryOnClosed(t *testing.T) {
 
 // collectRows runs a read query and returns its rows as name-keyed maps, a small
 // helper for the write tests that read back what a CREATE produced.
+// openMem opens a fresh in-memory database for a test, failing the test on a
+// setup error so each test body can assume a usable handle.
+func openMem(t *testing.T, name string) *DB {
+	t.Helper()
+	db, err := Open(name, Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
 func collectRows(t *testing.T, db *DB, q string, params map[string]value.Value) []map[string]value.Value {
 	t.Helper()
 	res, err := db.Query(q, params)
@@ -526,6 +537,226 @@ func TestExecCreatePerMatchedRow(t *testing.T) {
 	rows := collectRows(t, db, "MATCH (:Person)-[:HAS]->(pet:Pet) RETURN count(*) AS n", nil)
 	if n, _ := rows[0]["n"].AsInt(); n != 2 {
 		t.Fatalf("pet edges = %d, want 2", n)
+	}
+}
+
+// TestExecSetProperty sets a new property and overwrites an existing one, then
+// reads both back. Each non-null assignment counts a property set.
+func TestExecSetProperty(t *testing.T) {
+	db := openMem(t, "setprop.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'Ada'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (a:Person) SET a.name = 'Grace', a.age = 45", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.PropertiesSet != 2 {
+		t.Fatalf("PropertiesSet = %d, want 2", sum.PropertiesSet)
+	}
+	rows := collectRows(t, db, "MATCH (a:Person) RETURN a.name AS name, a.age AS age", nil)
+	if name, _ := rows[0]["name"].AsString(); name != "Grace" {
+		t.Fatalf("name = %q, want Grace", name)
+	}
+	if age, _ := rows[0]["age"].AsInt(); age != 45 {
+		t.Fatalf("age = %d, want 45", age)
+	}
+}
+
+// TestExecSetSameValue confirms SET to the unchanged value still counts a
+// property set, the openCypher rule (doc 13 §6.22).
+func TestExecSetSameValue(t *testing.T) {
+	db := openMem(t, "setsame.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {age: 30})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (a:Person) SET a.age = 30", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.PropertiesSet != 1 {
+		t.Fatalf("PropertiesSet = %d, want 1 (same value still counts)", sum.PropertiesSet)
+	}
+}
+
+// TestExecSetNullRemoves confirms SET of a null value removes the property and
+// counts it only when the property was present (doc 13 §6.22, §7.11).
+func TestExecSetNullRemoves(t *testing.T) {
+	db := openMem(t, "setnull.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'Ada', age: 36})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// age is present, so setting it null removes and counts it.
+	sum, err := db.Exec("MATCH (a:Person) SET a.age = null", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.PropertiesSet != 1 {
+		t.Fatalf("PropertiesSet = %d, want 1", sum.PropertiesSet)
+	}
+	// age is now absent, so a second null set counts nothing.
+	sum, err = db.Exec("MATCH (a:Person) SET a.age = null", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.PropertiesSet != 0 {
+		t.Fatalf("PropertiesSet = %d, want 0 (already absent)", sum.PropertiesSet)
+	}
+	rows := collectRows(t, db, "MATCH (a:Person) RETURN a.age AS age", nil)
+	if !rows[0]["age"].IsNull() {
+		t.Fatalf("age = %v, want null after removal", rows[0]["age"])
+	}
+}
+
+// TestExecSetLabel adds a label, counting only the net addition: re-adding an
+// existing label counts nothing (doc 13 §6.7).
+func TestExecSetLabel(t *testing.T) {
+	db := openMem(t, "setlabel.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'Ada'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (a:Person) SET a:Admin", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.LabelsAdded != 1 {
+		t.Fatalf("LabelsAdded = %d, want 1", sum.LabelsAdded)
+	}
+	// Re-adding Admin and Person, both present, counts nothing.
+	sum, err = db.Exec("MATCH (a:Admin) SET a:Admin:Person", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.LabelsAdded != 0 {
+		t.Fatalf("LabelsAdded = %d, want 0 (labels already present)", sum.LabelsAdded)
+	}
+	rows := collectRows(t, db, "MATCH (a:Admin) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 1 {
+		t.Fatalf("Admin nodes = %d, want 1", n)
+	}
+}
+
+// TestExecRemoveProperty removes a present property (counted) then an absent one
+// (not counted), folding both under PropertiesSet (doc 13 §7.11).
+func TestExecRemoveProperty(t *testing.T) {
+	db := openMem(t, "rmprop.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'Ada', age: 36})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (a:Person) REMOVE a.age", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.PropertiesSet != 1 {
+		t.Fatalf("PropertiesSet = %d, want 1", sum.PropertiesSet)
+	}
+	// age is gone, so removing it again counts nothing.
+	sum, err = db.Exec("MATCH (a:Person) REMOVE a.age", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.PropertiesSet != 0 {
+		t.Fatalf("PropertiesSet = %d, want 0 (already absent)", sum.PropertiesSet)
+	}
+	rows := collectRows(t, db, "MATCH (a:Person) RETURN a.age AS age", nil)
+	if !rows[0]["age"].IsNull() {
+		t.Fatalf("age = %v, want null after removal", rows[0]["age"])
+	}
+}
+
+// TestExecRemoveUnknownProperty confirms removing a property the catalog never
+// interned is a no-op that counts nothing and does not create the key.
+func TestExecRemoveUnknownProperty(t *testing.T) {
+	db := openMem(t, "rmunknown.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'Ada'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (a:Person) REMOVE a.nope", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.PropertiesSet != 0 {
+		t.Fatalf("PropertiesSet = %d, want 0", sum.PropertiesSet)
+	}
+}
+
+// TestExecRemoveLabel removes a present label (counted) then an absent one (not
+// counted), and confirms the node no longer matches the removed label.
+func TestExecRemoveLabel(t *testing.T) {
+	db := openMem(t, "rmlabel.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person:Admin {name: 'Ada'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (a:Admin) REMOVE a:Admin", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.LabelsRemoved != 1 {
+		t.Fatalf("LabelsRemoved = %d, want 1", sum.LabelsRemoved)
+	}
+	// Admin is gone, so removing it again counts nothing.
+	sum, err = db.Exec("MATCH (a:Person) REMOVE a:Admin", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.LabelsRemoved != 0 {
+		t.Fatalf("LabelsRemoved = %d, want 0 (already absent)", sum.LabelsRemoved)
+	}
+	rows := collectRows(t, db, "MATCH (a:Admin) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 0 {
+		t.Fatalf("Admin nodes = %d, want 0 after removal", n)
+	}
+}
+
+// TestExecSetRelProperty sets a property on a relationship and reads it back.
+func TestExecSetRelProperty(t *testing.T) {
+	db := openMem(t, "setrel.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person {name: 'A'})-[:KNOWS]->(b:Person {name: 'B'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (:Person)-[r:KNOWS]->(:Person) SET r.since = 2020", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.PropertiesSet != 1 {
+		t.Fatalf("PropertiesSet = %d, want 1", sum.PropertiesSet)
+	}
+	rows := collectRows(t, db, "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN r.since AS since", nil)
+	if since, _ := rows[0]["since"].AsInt(); since != 2020 {
+		t.Fatalf("since = %d, want 2020", since)
+	}
+}
+
+// TestExecSetMapDeferred confirms the map forms of SET are rejected for now,
+// pointing at the later M3 milestone rather than silently misbehaving.
+func TestExecSetMapDeferred(t *testing.T) {
+	db := openMem(t, "setmap.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (a:Person)", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := db.Exec("MATCH (a:Person) SET a += {age: 1}", nil); err == nil {
+		t.Fatal("map-merge SET should be rejected for now")
+	}
+	if _, err := db.Exec("MATCH (a:Person) SET a = {age: 1}", nil); err == nil {
+		t.Fatal("map-replace SET should be rejected for now")
 	}
 }
 

@@ -151,6 +151,52 @@ type PropSet struct {
 	Expr ast.Expr
 }
 
+// Set is the write operator for a SET clause: it applies each update item to the
+// bound elements in the row, in order, and passes the row on unchanged (it binds
+// nothing new, doc 13 §6). It runs once per input row.
+type Set struct {
+	Input Op
+	Items []SetItem
+}
+
+// SetItem is one lowered SET assignment. Kind selects the shape: SetItemProp
+// assigns Key from Expr on the element bound to Var; SetItemLabels adds Labels to
+// the node bound to Var.
+type SetItem struct {
+	Kind   SetItemKind
+	Var    string
+	Key    bind.NameRef   // SetItemProp
+	Expr   ast.Expr       // SetItemProp
+	Labels []bind.NameRef // SetItemLabels
+}
+
+// SetItemKind classifies a lowered SET item.
+type SetItemKind uint8
+
+const (
+	// SetItemProp is a single-property assignment (n.k = e).
+	SetItemProp SetItemKind = iota
+	// SetItemLabels is a label addition (n:A:B).
+	SetItemLabels
+)
+
+// Remove is the write operator for a REMOVE clause: it removes each item's
+// property or labels from the bound element and passes the row on unchanged (doc
+// 13 §7). It runs once per input row.
+type Remove struct {
+	Input Op
+	Items []RemoveItem
+}
+
+// RemoveItem is one lowered REMOVE target. Labels non-empty marks a label
+// removal from the node bound to Var; otherwise it is a property removal of Key
+// from the element bound to Var.
+type RemoveItem struct {
+	Var    string
+	Key    bind.NameRef   // property removal
+	Labels []bind.NameRef // label removal
+}
+
 // Col is one computed output column: an expression and the variable name it
 // binds (an alias, a carried variable name, or an implicit name).
 type Col struct {
@@ -234,6 +280,8 @@ type Union struct {
 
 func (*Unit) op()         {}
 func (*Create) op()       {}
+func (*Set) op()          {}
+func (*Remove) op()       {}
 func (*Argument) op()     {}
 func (*NodeScan) op()     {}
 func (*Expand) op()       {}
@@ -267,6 +315,10 @@ func outputVars(o Op) map[string]bool {
 			s[r.Var] = true
 		}
 		return s
+	case *Set:
+		return outputVars(x.Input)
+	case *Remove:
+		return outputVars(x.Input)
 	case *Argument:
 		s := make(map[string]bool, len(x.Vars))
 		for _, v := range x.Vars {
@@ -371,6 +423,12 @@ func write(b *strings.Builder, o Op, depth int) {
 		b.WriteString("Unit\n")
 	case *Create:
 		b.WriteString("Create " + createLabel(x) + "\n")
+		write(b, x.Input, depth+1)
+	case *Set:
+		b.WriteString("Set " + setLabel(x) + "\n")
+		write(b, x.Input, depth+1)
+	case *Remove:
+		b.WriteString("Remove " + removeLabel(x) + "\n")
 		write(b, x.Input, depth+1)
 	case *Argument:
 		b.WriteString("Argument [" + strings.Join(x.Vars, ",") + "]\n")
@@ -504,6 +562,43 @@ func createLabel(x *Create) string {
 		parts = append(parts, "("+r.From+")-["+r.Var+typeSuffix([]bind.NameRef{r.Type})+propsSuffix(r.Props)+"]->("+r.To+")")
 	}
 	return strings.Join(parts, ", ")
+}
+
+// setLabel renders a Set operator's items: a property assignment as
+// "var.#key = expr" and a label addition as "var:#tok&#tok".
+func setLabel(x *Set) string {
+	parts := make([]string, len(x.Items))
+	for i, it := range x.Items {
+		switch it.Kind {
+		case SetItemProp:
+			parts[i] = it.Var + "." + tokenLabel(it.Key) + " = " + ast.Print(it.Expr)
+		case SetItemLabels:
+			parts[i] = it.Var + labelSuffix(it.Labels)
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// removeLabel renders a Remove operator's items: a property removal as "var.#key"
+// and a label removal as "var:#tok&#tok".
+func removeLabel(x *Remove) string {
+	parts := make([]string, len(x.Items))
+	for i, it := range x.Items {
+		if len(it.Labels) > 0 {
+			parts[i] = it.Var + labelSuffix(it.Labels)
+		} else {
+			parts[i] = it.Var + "." + tokenLabel(it.Key)
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// tokenLabel renders a resolved name as its #token, or #? when unresolved.
+func tokenLabel(ref bind.NameRef) string {
+	if ref.Known {
+		return "#" + itoa(int(ref.Token))
+	}
+	return "#?"
 }
 
 // propsSuffix renders a property-assignment list as {#key: expr, ...}, the key as

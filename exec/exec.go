@@ -194,6 +194,13 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 			return nil, nil, err
 		}
 		return &bindPathOp{spec: x, input: input}, inPeers, nil
+	case *plan.ShortestPath:
+		input, inPeers, err := compileRel(x.Input, peers)
+		if err != nil {
+			return nil, nil, err
+		}
+		sib := append([]string(nil), inPeers...)
+		return &shortestPathOp{spec: x, input: input, peers: sib}, append(inPeers, x.Rel), nil
 	case *plan.Project:
 		input, err := compile(x.Input)
 		if err != nil {

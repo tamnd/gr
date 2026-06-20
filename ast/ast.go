@@ -106,13 +106,29 @@ type SortItem struct {
 // --- patterns (doc 09 §3) ---
 
 // PathPattern is a node, then a chain of relationship-then-node steps, with an
-// optional bound path variable.
+// optional bound path variable. Shortest marks a pattern wrapped in
+// shortestPath(...) or allShortestPaths(...): a shortest-path search between the
+// pattern's two endpoint nodes rather than an exhaustive expansion.
 type PathPattern struct {
 	Pos
-	Var   string // bound path variable, "" if none
-	Start *NodePattern
-	Chain []PatternChain
+	Var      string // bound path variable, "" if none
+	Shortest ShortestKind
+	Start    *NodePattern
+	Chain    []PatternChain
 }
+
+// ShortestKind classifies a path pattern: an ordinary pattern, or one wrapped in
+// one of the shortest-path functions (doc 09 §3.4).
+type ShortestKind uint8
+
+const (
+	// NotShortest is an ordinary path pattern.
+	NotShortest ShortestKind = iota
+	// ShortestOne is shortestPath(...): one shortest path between the endpoints.
+	ShortestOne
+	// ShortestAll is allShortestPaths(...): every path of the minimum length.
+	ShortestAll
+)
 
 // PatternChain is one traversal step: a relationship and the node it reaches.
 type PatternChain struct {

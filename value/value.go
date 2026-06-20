@@ -38,9 +38,10 @@ const (
 
 	// TypePath is a runtime-only value: an alternating sequence of node and
 	// relationship handles, node, rel, node, ..., node, produced by a named path
-	// pattern (MATCH p = ...) and consumed by nodes(), relationships(), and
-	// length() (doc 02 §4.4, doc 09 §3.4, §7). Like the entity handles it is never
-	// stored as a property value, so it has no on-disk encoding.
+	// pattern (MATCH p = ..., including a shortestPath / allShortestPaths search)
+	// and consumed by nodes(), relationships(), and length() (doc 02 §4.4, doc 09
+	// §3.4, §7). Like the entity handles it is never stored as a property value, so
+	// it has no on-disk encoding.
 	TypePath Type = 10
 )
 

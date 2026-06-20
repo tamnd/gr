@@ -61,6 +61,14 @@ func rebuildChildren(o Op) (Op, bool) {
 		y := *x
 		y.Input = in
 		return &y, true
+	case *ShortestPath:
+		in, ch := apply(x.Input)
+		if !ch {
+			return x, false
+		}
+		y := *x
+		y.Input = in
+		return &y, true
 	case *Project:
 		in, ch := apply(x.Input)
 		if !ch {

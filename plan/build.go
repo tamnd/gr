@@ -95,21 +95,59 @@ func (bd *builder) match(m *ast.Match, cur Op, bound map[string]bool) Op {
 // (if new) joined onto the tree, or the tree's already-bound node; each chain
 // step is an expand.
 func (bd *builder) path(pp *ast.PathPattern, cur Op, bound map[string]bool) Op {
-	start := bd.nodeName(pp.Start)
-	if !bound[start] {
-		leaf := bd.scanNode(pp.Start, start)
-		bound[start] = true
-		if cur == nil {
-			cur = leaf
-		} else {
-			cur = &Join{Left: cur, Right: leaf, On: sharedVars(cur, leaf)}
-		}
+	if pp.Shortest != ast.NotShortest {
+		return bd.shortestPath(pp, cur, bound)
 	}
+	start := bd.nodeName(pp.Start)
+	cur = bd.joinNode(cur, pp.Start, start, bound)
 	cur = bd.expandChain(cur, start, pp.Chain, bound)
 	if pp.Var != "" {
 		cur = &BindPath{Input: cur, Var: pp.Var, Elems: bd.pathElems(pp)}
 	}
 	return cur
+}
+
+// joinNode ensures a node variable is bound, scanning it (with its property-map
+// constraints) and joining the scan onto the running tree when it is new. An
+// already-bound node leaves the tree unchanged.
+func (bd *builder) joinNode(cur Op, np *ast.NodePattern, name string, bound map[string]bool) Op {
+	if bound[name] {
+		return cur
+	}
+	leaf := bd.scanNode(np, name)
+	bound[name] = true
+	if cur == nil {
+		return leaf
+	}
+	return &Join{Left: cur, Right: leaf, On: sharedVars(cur, leaf)}
+}
+
+// shortestPath lowers a shortestPath / allShortestPaths pattern. Both endpoints
+// are made bound first (a scan joined in for a new one, an already-bound one left
+// in place), then a ShortestPath operator searches between them. The binder
+// guarantees the pattern carries exactly one relationship step.
+func (bd *builder) shortestPath(pp *ast.PathPattern, cur Op, bound map[string]bool) Op {
+	start := bd.nodeName(pp.Start)
+	cur = bd.joinNode(cur, pp.Start, start, bound)
+	step := pp.Chain[0]
+	end := bd.nodeName(step.Node)
+	cur = bd.joinNode(cur, step.Node, end, bound)
+	rel := bd.relName(step.Rel)
+	bound[rel] = true
+	if pp.Var != "" {
+		bound[pp.Var] = true
+	}
+	return &ShortestPath{
+		Input:   cur,
+		From:    start,
+		To:      end,
+		Rel:     rel,
+		PathVar: pp.Var,
+		Types:   bd.b.RelTypes(step.Rel),
+		Dir:     step.Rel.Dir,
+		VarLen:  step.Rel.VarLen,
+		All:     pp.Shortest == ast.ShortestAll,
+	}
 }
 
 // pathElems returns a pattern's element variable names in traversal order: the
@@ -132,6 +170,9 @@ func (bd *builder) pathCorrelated(pp *ast.PathPattern, outer map[string]bool) Op
 	for v := range outer {
 		inner[v] = true
 	}
+	if pp.Shortest != ast.NotShortest {
+		return bd.shortestPathCorrelated(pp, outer, inner)
+	}
 	start := bd.nodeName(pp.Start)
 	var cur Op
 	if outer[start] {
@@ -151,6 +192,47 @@ func (bd *builder) pathCorrelated(pp *ast.PathPattern, outer map[string]bool) Op
 		outer[v] = true
 	}
 	return cur
+}
+
+// shortestPathCorrelated lowers a shortestPath / allShortestPaths pattern on the
+// inner side of an OPTIONAL MATCH. The subtree roots on an Argument carrying the
+// outer scope (so an endpoint the outer query already bound is supplied per row),
+// joining a fresh scan for any endpoint the pattern introduces, then a
+// ShortestPath searches between the two.
+func (bd *builder) shortestPathCorrelated(pp *ast.PathPattern, outer, inner map[string]bool) Op {
+	var cur Op = &Argument{Vars: sortedKeys(outer)}
+	start := bd.nodeName(pp.Start)
+	if !outer[start] {
+		leaf := bd.scanNode(pp.Start, start)
+		inner[start] = true
+		cur = &Join{Left: cur, Right: leaf, On: sharedVars(cur, leaf)}
+	}
+	step := pp.Chain[0]
+	end := bd.nodeName(step.Node)
+	if !inner[end] {
+		leaf := bd.scanNode(step.Node, end)
+		inner[end] = true
+		cur = &Join{Left: cur, Right: leaf, On: sharedVars(cur, leaf)}
+	}
+	rel := bd.relName(step.Rel)
+	inner[rel] = true
+	if pp.Var != "" {
+		inner[pp.Var] = true
+	}
+	for v := range inner {
+		outer[v] = true
+	}
+	return &ShortestPath{
+		Input:   cur,
+		From:    start,
+		To:      end,
+		Rel:     rel,
+		PathVar: pp.Var,
+		Types:   bd.b.RelTypes(step.Rel),
+		Dir:     step.Rel.Dir,
+		VarLen:  step.Rel.VarLen,
+		All:     pp.Shortest == ast.ShortestAll,
+	}
 }
 
 // expandChain appends one Expand per relationship step, lowering label and

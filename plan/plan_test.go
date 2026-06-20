@@ -229,3 +229,15 @@ func TestBuildNamedPath(t *testing.T) {
 	eq(t, "raw", String(Build(b)), want)
 	eq(t, "normalized", String(Plan(b)), want)
 }
+
+func TestBuildShortestPath(t *testing.T) {
+	b := bound(t, "MATCH (a:Person), (b:Person) MATCH p = shortestPath((a)-[:KNOWS*]-(b)) RETURN p")
+	want := `Project p
+  ShortestPath p = shortest a -[@r0*:#1]- b
+    Join on[]
+      NodeScan a:#1
+      NodeScan b:#1
+`
+	eq(t, "raw", String(Build(b)), want)
+	eq(t, "normalized", String(Plan(b)), want)
+}

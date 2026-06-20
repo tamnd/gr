@@ -234,6 +234,28 @@ func (p *Pager) nextSalt() uint64 {
 // Header returns a copy of the current file header.
 func (p *Pager) Header() format.Header { return p.header }
 
+// CatalogRoot returns the page id the header records as the catalog root, or
+// NoPage if none has been set.
+func (p *Pager) CatalogRoot() format.PageID { return format.PageID(p.header.CatalogRoot) }
+
+// SetCatalogRoot records the catalog root in the header; it becomes durable at
+// the next Commit.
+func (p *Pager) SetCatalogRoot(id format.PageID) {
+	p.header.CatalogRoot = uint64(id)
+	p.headerDirty = true
+}
+
+// SectionDir returns the page id the header records as the section-directory
+// root (used by the storage engine to find all its store roots), or NoPage.
+func (p *Pager) SectionDir() format.PageID { return format.PageID(p.header.SectionDir) }
+
+// SetSectionDir records the section-directory root in the header; it becomes
+// durable at the next Commit.
+func (p *Pager) SetSectionDir(id format.PageID) {
+	p.header.SectionDir = uint64(id)
+	p.headerDirty = true
+}
+
 // PageSize returns the file's page size.
 func (p *Pager) PageSize() uint32 { return p.pageSize }
 

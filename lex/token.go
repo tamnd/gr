@@ -60,10 +60,9 @@ const (
 	Pipe     // |
 	Semi     // ;
 
-	// Keywords (matched case-insensitively). The first keyword Kind is recorded
-	// as keywordStart so isKeyword can range-test a Kind in O(1).
-	kwStart
-	Match = kwStart
+	// Keywords (matched case-insensitively). They occupy a contiguous range so
+	// IsKeyword can range-test a Kind in O(1); the bounds are recorded just below.
+	Match
 	Optional
 	Where
 	With
@@ -103,7 +102,12 @@ const (
 	Detach
 	Remove
 	On
-	kwEnd = On
+)
+
+// kwStart and kwEnd bound the contiguous keyword Kind range for IsKeyword.
+const (
+	kwStart = Match
+	kwEnd   = On
 )
 
 // keywords maps the case-folded keyword text to its Kind. Identifiers are looked

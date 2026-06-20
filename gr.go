@@ -336,7 +336,7 @@ func queryHasWrites(q *ast.Query) bool {
 	for _, sq := range singleQueries(q) {
 		for _, c := range sq.Clauses {
 			switch c.(type) {
-			case *ast.Create, *ast.Set, *ast.Remove:
+			case *ast.Create, *ast.Set, *ast.Remove, *ast.Delete:
 				return true
 			}
 		}

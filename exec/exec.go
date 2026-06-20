@@ -159,7 +159,13 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		op := &expandOp{spec: x, input: input, peers: append([]string(nil), inPeers...)}
+		sib := append([]string(nil), inPeers...)
+		var op operator
+		if x.VarLen != nil {
+			op = &varExpandOp{spec: x, input: input, peers: sib}
+		} else {
+			op = &expandOp{spec: x, input: input, peers: sib}
+		}
 		return op, append(inPeers, x.Rel), nil
 	case *plan.Filter:
 		input, inPeers, err := compileRel(x.Input, peers)

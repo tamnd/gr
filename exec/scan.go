@@ -1,8 +1,6 @@
 package exec
 
 import (
-	"fmt"
-
 	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/bind"
 	"github.com/tamnd/gr/engine"
@@ -137,9 +135,6 @@ type expandOp struct {
 
 func (o *expandOp) open(ctx *Ctx) error {
 	o.ctx, o.cur, o.queue, o.qpos = ctx, nil, nil, 0
-	if o.spec.VarLen != nil {
-		return fmt.Errorf("exec: variable-length expand is deliverable 8")
-	}
 	o.relTok, o.allow, o.noType = resolveTypes(o.spec.Types)
 	return o.input.open(ctx)
 }
@@ -241,9 +236,8 @@ func (o *expandOp) accept(nb engine.Neighbor) (eval.Row, bool, error) {
 // unique enforces relationship-uniqueness: the new edge must not already be bound
 // to a sibling relationship variable in the same pattern (doc 02 §4.3).
 func (o *expandOp) unique(rel engine.RelID) bool {
-	want := value.Rel(uint64(rel))
 	for _, p := range o.peers {
-		if v, ok := o.cur[p]; ok && v.Equal(want) {
+		if v, ok := o.cur[p]; ok && relValueContains(v, rel) {
 			return false
 		}
 	}

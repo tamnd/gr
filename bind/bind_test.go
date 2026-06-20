@@ -202,3 +202,29 @@ func TestBindShortestPath(t *testing.T) {
 		t.Fatal("multi-relationship shortestPath should be rejected")
 	}
 }
+
+func TestBindCreate(t *testing.T) {
+	// CREATE is a write clause: a query may end with it, with no RETURN.
+	mustBind(t, "CREATE (a:Person {name: $n})")
+	mustBind(t, "CREATE (a:Person)-[:KNOWS]->(b:Person)")
+	// CREATE after a MATCH references the matched node and creates the rest.
+	mustBind(t, "MATCH (a:Person) CREATE (a)-[:KNOWS]->(b)")
+	// A created relationship must have a direction and exactly one type.
+	if _, err := bindStr(t, "CREATE (a)-[:KNOWS]-(b)", false); err == nil {
+		t.Fatal("undirected relationship in CREATE should be rejected")
+	}
+	if _, err := bindStr(t, "CREATE (a)-[r]->(b)", false); err == nil {
+		t.Fatal("relationship without a type in CREATE should be rejected")
+	}
+	if _, err := bindStr(t, "CREATE (a)-[:KNOWS|LIKES]->(b)", false); err == nil {
+		t.Fatal("relationship with two types in CREATE should be rejected")
+	}
+	// A variable-length relationship cannot be created.
+	if _, err := bindStr(t, "CREATE (a)-[:KNOWS*]->(b)", false); err == nil {
+		t.Fatal("variable-length relationship in CREATE should be rejected")
+	}
+	// shortestPath is a read construct, not creatable.
+	if _, err := bindStr(t, "CREATE p = shortestPath((a)-[:KNOWS*]-(b))", false); err == nil {
+		t.Fatal("shortestPath in CREATE should be rejected")
+	}
+}

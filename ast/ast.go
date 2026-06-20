@@ -75,10 +75,21 @@ type Return struct {
 	Projection
 }
 
+// Create is a CREATE clause: a set of comma-separated path patterns, every
+// element of which is created. Unlike MATCH it reads nothing — it always creates
+// — except that a pattern element naming an already-bound variable references
+// that element rather than creating a new one (doc 13 §5.2). A leading CREATE
+// runs once; a CREATE after a MATCH runs once per matched row.
+type Create struct {
+	Pos
+	Patterns []*PathPattern
+}
+
 func (*Match) clauseNode()  {}
 func (*With) clauseNode()   {}
 func (*Unwind) clauseNode() {}
 func (*Return) clauseNode() {}
+func (*Create) clauseNode() {}
 
 // Projection is the shared body of WITH and RETURN: the projected items (or a
 // star), DISTINCT, and the ORDER BY / SKIP / LIMIT tail.

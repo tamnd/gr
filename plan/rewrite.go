@@ -39,6 +39,14 @@ func apply(o Op) (Op, bool) {
 // rebuildChildren applies the rewrite to each child and reconstructs the node.
 func rebuildChildren(o Op) (Op, bool) {
 	switch x := o.(type) {
+	case *Create:
+		in, ch := apply(x.Input)
+		if !ch {
+			return x, false
+		}
+		y := *x
+		y.Input = in
+		return &y, true
 	case *Expand:
 		in, ch := apply(x.Input)
 		if !ch {

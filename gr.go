@@ -12,6 +12,7 @@ package gr
 import (
 	"errors"
 
+	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/bind"
 	"github.com/tamnd/gr/catalog"
 	"github.com/tamnd/gr/engine"
@@ -27,6 +28,11 @@ import (
 
 // ErrClosed is returned by operations on a database that has been closed.
 var ErrClosed = errors.New("gr: database is closed")
+
+// ErrReadQuery is returned by Query when the statement contains a write clause,
+// and by Exec when, conversely, a read-only statement is run where a write is
+// expected (a read-only Exec is allowed, but Query rejects writes outright).
+var ErrReadQuery = errors.New("gr: Query is read-only; use Exec for a write statement")
 
 // DB is an open gr database. It owns the storage engine, which owns the pager
 // over the underlying file; queries run against snapshots the engine hands out.
@@ -108,6 +114,9 @@ func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, erro
 	if err != nil {
 		return nil, err
 	}
+	if queryHasWrites(entry.Bound.Query) {
+		return nil, ErrReadQuery
+	}
 	tx, err := db.eng.Begin(false)
 	if err != nil {
 		return nil, err
@@ -126,6 +135,211 @@ func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, erro
 		return nil, err
 	}
 	return &Result{cols: cur.Cols(), cursor: cur, tx: tx}, nil
+}
+
+// Summary reports the graph mutations a write statement performed, the normative
+// openCypher statistics (doc 13 §3.4). All counts are zero for a statement that
+// changed nothing.
+type Summary struct {
+	NodesCreated         int
+	NodesDeleted         int
+	RelationshipsCreated int
+	RelationshipsDeleted int
+	PropertiesSet        int
+	LabelsAdded          int
+	LabelsRemoved        int
+	IndexesAdded         int
+	IndexesRemoved       int
+	ConstraintsAdded     int
+	ConstraintsRemoved   int
+}
+
+// Exec runs a Cypher write statement in its own write transaction and returns a
+// summary of the mutations it performed (doc 13 §3, the write path). It threads
+// the same pipeline as Query — parse, bind, plan, execute — over a write
+// transaction, and commits once the whole statement has run; any error aborts the
+// transaction, leaving the database unchanged.
+//
+// The names a CREATE introduces (labels, relationship types, property keys) are
+// interned before the transaction begins, because interning is its own durable
+// transaction and the engine's write lock is not reentrant (doc 13 §9). A
+// statement that turns out to write nothing still runs; a read-only statement runs
+// too and reports an empty summary, so Exec is a superset of Query for callers that
+// do not need streamed rows.
+//
+// params supplies the values for the statement's $-parameters; a nil map is fine
+// for a parameterless statement.
+func (db *DB) Exec(cypher string, params map[string]value.Value) (Summary, error) {
+	if db.eng == nil {
+		return Summary{}, ErrClosed
+	}
+	q, err := parse.Parse(cypher)
+	if err != nil {
+		return Summary{}, err
+	}
+	if err := db.internWriteNames(q); err != nil {
+		return Summary{}, err
+	}
+	b, err := bind.Bind(q, bind.NewEngineCatalog(db.eng), false)
+	if err != nil {
+		return Summary{}, err
+	}
+	op := plan.Plan(b)
+	tx, err := db.eng.Begin(true)
+	if err != nil {
+		return Summary{}, err
+	}
+	eff := &exec.SideEffects{}
+	ctx := &exec.Ctx{
+		Tx:          tx,
+		Params:      params,
+		Resolve:     exec.ResolverFromBound(b),
+		LabelName:   db.tokenNamer(catalog.KindLabel),
+		RelTypeName: db.tokenNamer(catalog.KindRelType),
+		PropKeyName: db.tokenNamer(catalog.KindPropKey),
+		Effects:     eff,
+	}
+	if err := drain(op, ctx); err != nil {
+		_ = tx.Abort()
+		return Summary{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Summary{}, err
+	}
+	return summaryOf(eff), nil
+}
+
+// drain compiles and runs a plan to exhaustion, discarding the rows. A write
+// statement's effects accrue on the context as its operators run, so the caller
+// reads them from the context after draining.
+func drain(op plan.Op, ctx *exec.Ctx) error {
+	cur, err := exec.Open(op, ctx)
+	if err != nil {
+		return err
+	}
+	for {
+		_, ok, err := cur.Next()
+		if err != nil {
+			_ = cur.Close()
+			return err
+		}
+		if !ok {
+			break
+		}
+	}
+	return cur.Close()
+}
+
+// internWriteNames interns every label, relationship type, and property key a
+// statement's write clauses introduce, so the subsequent bind resolves them to
+// known tokens. It interns nothing for a name already in the catalog (interning is
+// idempotent but commits a durable transaction, so the Lookup avoids needless
+// commits) and touches only write clauses (a name read by MATCH must stay unknown
+// when absent, matching nothing rather than being created).
+func (db *DB) internWriteNames(q *ast.Query) error {
+	for _, sq := range singleQueries(q) {
+		for _, c := range sq.Clauses {
+			cl, ok := c.(*ast.Create)
+			if !ok {
+				continue
+			}
+			for _, pp := range cl.Patterns {
+				if err := db.internPatternNames(pp); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// internPatternNames interns the names of one CREATE path pattern: each node's
+// labels and property keys, and each relationship's type and property keys.
+func (db *DB) internPatternNames(pp *ast.PathPattern) error {
+	if err := db.internNode(pp.Start); err != nil {
+		return err
+	}
+	for _, step := range pp.Chain {
+		for _, ty := range step.Rel.Types {
+			if err := db.internName(catalog.KindRelType, ty); err != nil {
+				return err
+			}
+		}
+		if err := db.internProps(step.Rel.Properties); err != nil {
+			return err
+		}
+		if err := db.internNode(step.Node); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *DB) internNode(np *ast.NodePattern) error {
+	for _, l := range np.Labels {
+		if err := db.internName(catalog.KindLabel, l); err != nil {
+			return err
+		}
+	}
+	return db.internProps(np.Properties)
+}
+
+func (db *DB) internProps(props []ast.PropEntry) error {
+	for _, pe := range props {
+		if err := db.internName(catalog.KindPropKey, pe.Key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// internName ensures a name is in the catalog, interning it only when absent.
+func (db *DB) internName(kind catalog.Kind, name string) error {
+	if _, ok := db.eng.Lookup(kind, name); ok {
+		return nil
+	}
+	_, err := db.eng.Intern(kind, name)
+	return err
+}
+
+// queryHasWrites reports whether a statement contains any write clause, so Query
+// can reject one and run it where it belongs (Exec, over a write transaction).
+func queryHasWrites(q *ast.Query) bool {
+	for _, sq := range singleQueries(q) {
+		for _, c := range sq.Clauses {
+			if _, ok := c.(*ast.Create); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// singleQueries returns a statement's UNION arms in order, the leading query then
+// each tail, so a walk over every clause needs no special-casing of the head.
+func singleQueries(q *ast.Query) []*ast.SingleQuery {
+	out := []*ast.SingleQuery{q.First}
+	for _, tail := range q.Rest {
+		out = append(out, tail.Query)
+	}
+	return out
+}
+
+// summaryOf projects the executor's side-effect counters onto the public summary.
+func summaryOf(e *exec.SideEffects) Summary {
+	return Summary{
+		NodesCreated:         e.NodesCreated,
+		NodesDeleted:         e.NodesDeleted,
+		RelationshipsCreated: e.RelsCreated,
+		RelationshipsDeleted: e.RelsDeleted,
+		PropertiesSet:        e.PropertiesSet,
+		LabelsAdded:          e.LabelsAdded,
+		LabelsRemoved:        e.LabelsRemoved,
+		IndexesAdded:         e.IndexesAdded,
+		IndexesRemoved:       e.IndexesRemoved,
+		ConstraintsAdded:     e.ConstraintsAdded,
+		ConstraintsRemoved:   e.ConstraintsRemoved,
+	}
 }
 
 // compile returns the compiled query for the given text, from the plan cache on a

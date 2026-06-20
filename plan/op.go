@@ -112,6 +112,45 @@ type ShortestPath struct {
 	All     bool
 }
 
+// Create is the write operator that materializes a CREATE clause's patterns. It
+// runs once per input row (the read part feeds it; a leading CREATE runs over the
+// single Unit row), creating every new node and relationship, binding each to its
+// variable, and passing the augmented row upward (doc 13 §5). Nodes are created
+// before relationships so a relationship's endpoints — bound earlier or created
+// here — always exist when it is built.
+type Create struct {
+	Input Op
+	Nodes []NodeCreate
+	Rels  []RelCreate
+}
+
+// NodeCreate is one node to create: the variable it binds, its labels, and its
+// property assignments.
+type NodeCreate struct {
+	Var    string
+	Labels []bind.NameRef
+	Props  []PropSet
+}
+
+// RelCreate is one relationship to create: the variable it binds, its endpoint
+// variables (From toward To, already oriented by the pattern's direction), its
+// single type, and its property assignments.
+type RelCreate struct {
+	Var   string
+	From  string
+	To    string
+	Type  bind.NameRef
+	Props []PropSet
+}
+
+// PropSet is one property assignment in a write clause: the resolved key and the
+// expression computing its value. A value that evaluates to null leaves the
+// property unset (doc 13 §5.4).
+type PropSet struct {
+	Key  bind.NameRef
+	Expr ast.Expr
+}
+
 // Col is one computed output column: an expression and the variable name it
 // binds (an alias, a carried variable name, or an implicit name).
 type Col struct {
@@ -194,6 +233,7 @@ type Union struct {
 }
 
 func (*Unit) op()         {}
+func (*Create) op()       {}
 func (*Argument) op()     {}
 func (*NodeScan) op()     {}
 func (*Expand) op()       {}
@@ -218,6 +258,15 @@ func outputVars(o Op) map[string]bool {
 	switch x := o.(type) {
 	case *Unit:
 		return map[string]bool{}
+	case *Create:
+		s := outputVars(x.Input)
+		for _, n := range x.Nodes {
+			s[n.Var] = true
+		}
+		for _, r := range x.Rels {
+			s[r.Var] = true
+		}
+		return s
 	case *Argument:
 		s := make(map[string]bool, len(x.Vars))
 		for _, v := range x.Vars {
@@ -320,6 +369,9 @@ func write(b *strings.Builder, o Op, depth int) {
 	switch x := o.(type) {
 	case *Unit:
 		b.WriteString("Unit\n")
+	case *Create:
+		b.WriteString("Create " + createLabel(x) + "\n")
+		write(b, x.Input, depth+1)
 	case *Argument:
 		b.WriteString("Argument [" + strings.Join(x.Vars, ",") + "]\n")
 	case *NodeScan:
@@ -439,6 +491,36 @@ func shortestLabel(x *ShortestPath) string {
 		s = x.PathVar + " = " + s
 	}
 	return s
+}
+
+// createLabel renders a Create operator: its new nodes then its new
+// relationships, each with the labels/type and property assignments it carries.
+func createLabel(x *Create) string {
+	var parts []string
+	for _, n := range x.Nodes {
+		parts = append(parts, "("+n.Var+labelSuffix(n.Labels)+propsSuffix(n.Props)+")")
+	}
+	for _, r := range x.Rels {
+		parts = append(parts, "("+r.From+")-["+r.Var+typeSuffix([]bind.NameRef{r.Type})+propsSuffix(r.Props)+"]->("+r.To+")")
+	}
+	return strings.Join(parts, ", ")
+}
+
+// propsSuffix renders a property-assignment list as {#key: expr, ...}, the key as
+// its catalog token (matching the #token rendering of labels and types).
+func propsSuffix(props []PropSet) string {
+	if len(props) == 0 {
+		return ""
+	}
+	parts := make([]string, len(props))
+	for i, p := range props {
+		key := "#?"
+		if p.Key.Known {
+			key = "#" + itoa(int(p.Key.Token))
+		}
+		parts[i] = key + ": " + ast.Print(p.Expr)
+	}
+	return " {" + strings.Join(parts, ", ") + "}"
 }
 
 func typeSuffix(types []bind.NameRef) string {

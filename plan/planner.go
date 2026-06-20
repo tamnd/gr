@@ -250,6 +250,10 @@ func reverseDir(d ast.Direction) ast.Direction {
 // (projections, joins, optionals, unions, and the like).
 func mapChildren(o Op, f func(Op) Op) Op {
 	switch x := o.(type) {
+	case *Create:
+		y := *x
+		y.Input = f(x.Input)
+		return &y
 	case *Filter:
 		return &Filter{Input: f(x.Input), Pred: x.Pred}
 	case *BindPath:

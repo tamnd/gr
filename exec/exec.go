@@ -46,6 +46,10 @@ type Ctx struct {
 	LabelName   func(t engine.Token) (string, bool)
 	RelTypeName func(t engine.Token) (string, bool)
 	PropKeyName func(t engine.Token) (string, bool)
+	// Effects accumulates the mutation counts of a write query (doc 13 §3.4). The
+	// write operators increment it as they run; the library write path reads it
+	// after draining the cursor. It is nil for a read query, which never writes.
+	Effects *SideEffects
 }
 
 // env builds the per-row evaluation environment from the context and a row.
@@ -165,6 +169,12 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 	switch x := o.(type) {
 	case *plan.Unit:
 		return &unitOp{}, peers, nil
+	case *plan.Create:
+		input, err := compile(x.Input)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &createOp{spec: x, input: input}, nil, nil
 	case *plan.Argument:
 		return &argumentOp{vars: x.Vars}, nil, nil
 	case *plan.NodeScan:

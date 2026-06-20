@@ -27,6 +27,14 @@ const (
 	TypeBytes  Type = 5 // opaque byte string
 	TypeList   Type = 6 // ordered, heterogeneous
 	TypeMap    Type = 7 // string-keyed, heterogeneous
+
+	// Entity values are runtime-only query values: a handle to a node or
+	// relationship, carrying its element id. They are never stored as a property
+	// value, so they have no on-disk encoding (and need no reserved low tag); they
+	// exist so the expression evaluator can carry entities through expressions —
+	// n = m structural equality, id(n), RETURN n (doc 02 §4.4, doc 09 §6).
+	TypeNode Type = 8
+	TypeRel  Type = 9
 )
 
 func (t Type) String() string {
@@ -47,6 +55,10 @@ func (t Type) String() string {
 		return "LIST"
 	case TypeMap:
 		return "MAP"
+	case TypeNode:
+		return "NODE"
+	case TypeRel:
+		return "RELATIONSHIP"
 	default:
 		return "UNKNOWN(" + strconv.Itoa(int(t)) + ")"
 	}
@@ -78,7 +90,7 @@ func Bool(v bool) Value {
 	return Value{t: TypeBool, scalar: s}
 }
 
-func Int(v int64) Value    { return Value{t: TypeInt, scalar: uint64(v)} }
+func Int(v int64) Value     { return Value{t: TypeInt, scalar: uint64(v)} }
 func Float(v float64) Value { return Value{t: TypeFloat, scalar: math.Float64bits(v)} }
 func String(v string) Value { return Value{t: TypeString, b: []byte(v)} }
 
@@ -99,6 +111,12 @@ func Map(m map[string]Value) Value {
 	maps.Copy(cp, m)
 	return Value{t: TypeMap, m: cp}
 }
+
+// Node and Rel build entity handles carrying an element id. The id is the engine
+// NodeID/RelID widened to uint64; the value package stays free of an engine
+// import by holding the raw id, with the caller converting at the boundary.
+func Node(id uint64) Value { return Value{t: TypeNode, scalar: id} }
+func Rel(id uint64) Value  { return Value{t: TypeRel, scalar: id} }
 
 // Accessors.
 
@@ -158,6 +176,20 @@ func (v Value) AsMap() (map[string]Value, bool) {
 	return v.m, true
 }
 
+func (v Value) AsNode() (uint64, bool) {
+	if v.t != TypeNode {
+		return 0, false
+	}
+	return v.scalar, true
+}
+
+func (v Value) AsRel() (uint64, bool) {
+	if v.t != TypeRel {
+		return 0, false
+	}
+	return v.scalar, true
+}
+
 // Equal reports structural equality, used by tests and the storage round-trip
 // checks. Two nulls are equal here (this is value identity, not Cypher's
 // three-valued IS comparison, which lives in the expression evaluator).
@@ -168,7 +200,7 @@ func (v Value) Equal(o Value) bool {
 	switch v.t {
 	case TypeNull:
 		return true
-	case TypeBool, TypeInt:
+	case TypeBool, TypeInt, TypeNode, TypeRel:
 		return v.scalar == o.scalar
 	case TypeFloat:
 		a, b := math.Float64frombits(v.scalar), math.Float64frombits(o.scalar)
@@ -248,6 +280,10 @@ func (v Value) String() string {
 			parts[i] = strconv.Quote(k) + ": " + v.m[k].String()
 		}
 		return "{" + strings.Join(parts, ", ") + "}"
+	case TypeNode:
+		return "node(" + strconv.FormatUint(v.scalar, 10) + ")"
+	case TypeRel:
+		return "rel(" + strconv.FormatUint(v.scalar, 10) + ")"
 	default:
 		return "?"
 	}

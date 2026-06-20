@@ -184,6 +184,11 @@ func (bd *binder) single(sq *ast.SingleQuery) ([]string, error) {
 				return nil, err
 			}
 			writes = true
+		case *ast.Delete:
+			if err := bd.deleteClause(cl, sc); err != nil {
+				return nil, err
+			}
+			writes = true
 		case *ast.Unwind:
 			if err := bd.unwind(cl, sc); err != nil {
 				return nil, err
@@ -479,6 +484,25 @@ func (bd *binder) remove(r *ast.Remove, sc scope) error {
 		}
 		if err := bd.resolvePropKey(it.Key, it.Pos); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// deleteClause binds a DELETE or DETACH DELETE. Each target expression is checked
+// against the current scope. DELETE introduces no new names and interns nothing,
+// it removes already-bound elements. A target that is a bare variable must be a
+// node or relationship; a richer expression is validated at run time.
+func (bd *binder) deleteClause(d *ast.Delete, sc scope) error {
+	for _, t := range d.Targets {
+		if err := bd.checkExpr(t, sc, false); err != nil {
+			return err
+		}
+		if v, ok := t.(*ast.Variable); ok {
+			kind := sc[v.Name]
+			if kind != vkNode && kind != vkRel {
+				return &Error{"DELETE applies only to a node or relationship", v.Line, v.Col}
+			}
 		}
 	}
 	return nil

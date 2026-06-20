@@ -320,6 +320,56 @@ func TestBuildDetachDelete(t *testing.T) {
 	eq(t, "raw", String(Build(b)), want)
 }
 
+func TestBuildMergeNode(t *testing.T) {
+	// A leading MERGE runs over a Unit. The create branch is the node it ensures;
+	// the match branch is a correlated scan filtered by the pattern's properties.
+	b := bound(t, "MERGE (a:Person {name: 'x'})")
+	want := `Merge (a:#1 {#1: "x"})
+  Unit
+  Filter a.name = "x"
+    NodeScan a:#1
+`
+	eq(t, "raw", String(Build(b)), want)
+	eq(t, "normalized", String(Plan(b)), want)
+}
+
+func TestBuildMergeOnCreateOnMatch(t *testing.T) {
+	b := bound(t, "MERGE (a:Person {name: 'x'}) ON CREATE SET a.age = 1 ON MATCH SET a:Movie")
+	want := `Merge (a:#1 {#1: "x"}) on-create[a.#2 = 1] on-match[a:#2]
+  Unit
+  Filter a.name = "x"
+    NodeScan a:#1
+`
+	eq(t, "raw", String(Build(b)), want)
+}
+
+func TestBuildMergeRelAfterMatch(t *testing.T) {
+	// a is already bound, so the match branch roots on an Argument carrying it and
+	// expands to find an existing edge; the create branch makes b and the edge.
+	b := bound(t, "MATCH (a:Person) MERGE (a)-[r:KNOWS]->(b)")
+	want := `Merge (b), (a)-[r:#1]->(b)
+  NodeScan a:#1
+  Expand a -[r:#1]-> b
+    Argument [a]
+`
+	eq(t, "raw", String(Build(b)), want)
+}
+
+func TestBuildMergeCorrelatedProperty(t *testing.T) {
+	// The pattern's property references the outer variable e, so the match branch
+	// roots on an Argument carrying e, cross-joins a scan, and filters above the
+	// join where both e and the scanned node are in scope.
+	b := bound(t, "UNWIND [1, 2] AS e MERGE (a:Person {age: e})")
+	want := `Merge (a:#1 {#2: e})
+  Unwind [1, 2] AS e
+  Filter a.age = e
+    Join on[]
+      Argument [e]
+      NodeScan a:#1
+`
+	eq(t, "raw", String(Build(b)), want)
+}
+
 func TestBuildShortestPath(t *testing.T) {
 	b := bound(t, "MATCH (a:Person), (b:Person) MATCH p = shortestPath((a)-[:KNOWS*]-(b)) RETURN p")
 	want := `Project p

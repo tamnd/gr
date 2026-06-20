@@ -145,11 +145,26 @@ type Delete struct {
 	Targets []Expr
 }
 
+// Merge is a MERGE clause: a single path pattern that is matched if it already
+// exists and created in full if it does not (doc 13 §11). The pattern uses the
+// same grammar as CREATE (directed, single-type relationships, no variable
+// length), and the whole pattern is the match key. The optional ON CREATE and
+// ON MATCH sub-clauses carry SET items that run only on the branch they name:
+// OnCreate when the merge created the pattern, OnMatch when it matched. Either
+// list is empty when its sub-clause is absent.
+type Merge struct {
+	Pos
+	Pattern  *PathPattern
+	OnCreate []SetItem
+	OnMatch  []SetItem
+}
+
 func (*Match) clauseNode()  {}
 func (*With) clauseNode()   {}
 func (*Unwind) clauseNode() {}
 func (*Return) clauseNode() {}
 func (*Create) clauseNode() {}
+func (*Merge) clauseNode()  {}
 func (*Set) clauseNode()    {}
 func (*Remove) clauseNode() {}
 func (*Delete) clauseNode() {}

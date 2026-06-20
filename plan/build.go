@@ -54,6 +54,8 @@ func (bd *builder) single(sq *ast.SingleQuery) Op {
 			cur = bd.match(cl, cur, bound)
 		case *ast.Create:
 			cur = bd.create(cl, cur, bound)
+		case *ast.Merge:
+			cur = bd.merge(cl, cur, bound)
 		case *ast.Set:
 			cur = bd.set(cl, cur)
 		case *ast.Remove:
@@ -165,43 +167,155 @@ func (bd *builder) lowerCreatePattern(pp *ast.PathPattern, cr *Create, bound map
 	}
 }
 
+// merge lowers a MERGE clause (doc 13 §11) into a Merge operator over the running
+// tree (a leading MERGE runs over a Unit row). It builds two views of the one
+// pattern: a correlated read sub-plan (the match probe, reusing the OPTIONAL MATCH
+// lowering so the pattern is found under the writer's snapshot) and a create spec
+// (the same fold CREATE uses, the create branch). The variables the pattern
+// introduces beyond the entry scope become bound after the clause, exactly as a
+// matched-or-created element should. A named path is bound above the operator from
+// its element variables, the same as CREATE and MATCH.
+func (bd *builder) merge(m *ast.Merge, cur Op, bound map[string]bool) Op {
+	if cur == nil {
+		cur = &Unit{}
+	}
+	entry := copyBound(bound)
+	var newVars []string
+	for _, e := range bd.pathElems(m.Pattern) {
+		if !entry[e] {
+			newVars = append(newVars, e)
+		}
+	}
+	match := bd.mergeMatch(m.Pattern, copyBound(entry))
+	cr := &Create{}
+	bd.lowerCreatePattern(m.Pattern, cr, copyBound(entry))
+	mg := &Merge{
+		Input:    cur,
+		Match:    match,
+		Nodes:    cr.Nodes,
+		Rels:     cr.Rels,
+		NewVars:  newVars,
+		OnCreate: bd.lowerSetItems(m.OnCreate),
+		OnMatch:  bd.lowerSetItems(m.OnMatch),
+	}
+	for _, v := range newVars {
+		bound[v] = true
+	}
+	var out Op = mg
+	if m.Pattern.Var != "" {
+		out = &BindPath{Input: out, Var: m.Pattern.Var, Elems: bd.pathElems(m.Pattern)}
+		bound[m.Pattern.Var] = true
+	}
+	return out
+}
+
+// mergeMatch builds the correlated read sub-plan a MERGE uses to probe for an
+// existing match. Unlike the OPTIONAL MATCH lowering, a MERGE pattern's property
+// filters routinely reference variables from the entry scope: MERGE (u:User
+// {email: e}) after UNWIND ... AS e reads e on every probe. So the subtree always
+// roots on an Argument carrying the entry scope, cross-joins a scan for any new
+// start node, and applies every property filter above the scan and expand, where
+// both the outer variable and the matched element are in scope. The single-row
+// Argument is fed the current outer row each time mergeOp reopens this subtree.
+func (bd *builder) mergeMatch(pp *ast.PathPattern, outer map[string]bool) Op {
+	inner := copyBound(outer)
+	start := bd.nodeName(pp.Start)
+	var cur Op
+	if len(outer) > 0 {
+		cur = &Argument{Vars: sortedKeys(outer)}
+	}
+	if !outer[start] {
+		leaf := &NodeScan{Var: start, Labels: bd.b.NodeLabels(pp.Start)}
+		if cur == nil {
+			cur = leaf
+		} else {
+			cur = &Join{Left: cur, Right: leaf, On: sharedVars(cur, leaf)}
+		}
+		inner[start] = true
+	}
+	cur = withPropFilters(cur, start, pp.Start.Properties)
+	prev := start
+	for _, step := range pp.Chain {
+		rel := bd.relName(step.Rel)
+		to := bd.nodeName(step.Node)
+		ex := &Expand{
+			Input:    cur,
+			From:     prev,
+			Rel:      rel,
+			To:       to,
+			Types:    bd.b.RelTypes(step.Rel),
+			ToLabels: bd.b.NodeLabels(step.Node),
+			Dir:      step.Rel.Dir,
+			VarLen:   step.Rel.VarLen,
+			ToBound:  inner[to],
+		}
+		cur = withPropFilters(ex, rel, step.Rel.Properties)
+		cur = withPropFilters(cur, to, step.Node.Properties)
+		inner[rel] = true
+		inner[to] = true
+		prev = to
+	}
+	if pp.Var != "" {
+		cur = &BindPath{Input: cur, Var: pp.Var, Elems: bd.pathElems(pp)}
+	}
+	return cur
+}
+
+// copyBound returns a shallow copy of a bound-variable set, so a sub-plan builder
+// (a MERGE match probe, an OPTIONAL inner) can extend its own scope without
+// disturbing the caller's.
+func copyBound(b map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(b))
+	for k, v := range b {
+		out[k] = v
+	}
+	return out
+}
+
 // set lowers a SET clause into a Set operator over the running tree, resolving
 // each item's property key or labels through the bound query.
 func (bd *builder) set(s *ast.Set, cur Op) Op {
 	if cur == nil {
 		cur = &Unit{}
 	}
-	op := &Set{Input: cur}
-	for _, it := range s.Items {
+	return &Set{Input: cur, Items: bd.lowerSetItems(s.Items)}
+}
+
+// lowerSetItems lowers a list of AST SET items to plan items, resolving each
+// item's property key or labels through the bound query. It backs the SET clause
+// and MERGE's ON CREATE / ON MATCH sub-clauses (doc 13 §11.5).
+func (bd *builder) lowerSetItems(items []ast.SetItem) []SetItem {
+	out := make([]SetItem, 0, len(items))
+	for _, it := range items {
 		switch it.Op {
 		case ast.SetProperty:
-			op.Items = append(op.Items, SetItem{
+			out = append(out, SetItem{
 				Kind: SetItemProp,
 				Var:  it.Var,
 				Key:  bd.b.PropKey(it.Key),
 				Expr: it.Value,
 			})
 		case ast.SetLabels:
-			op.Items = append(op.Items, SetItem{
+			out = append(out, SetItem{
 				Kind:   SetItemLabels,
 				Var:    it.Var,
 				Labels: bd.labelRefs(it.Labels),
 			})
 		case ast.SetMerge:
-			op.Items = append(op.Items, SetItem{
+			out = append(out, SetItem{
 				Kind: SetItemMerge,
 				Var:  it.Var,
 				Expr: it.Value,
 			})
 		case ast.SetReplace:
-			op.Items = append(op.Items, SetItem{
+			out = append(out, SetItem{
 				Kind: SetItemReplace,
 				Var:  it.Var,
 				Expr: it.Value,
 			})
 		}
 	}
-	return op
+	return out
 }
 
 // remove lowers a REMOVE clause into a Remove operator over the running tree.

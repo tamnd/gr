@@ -212,6 +212,24 @@ type Delete struct {
 	Targets []ast.Expr
 }
 
+// Merge is the write operator for a MERGE clause (doc 13 §11). For each input row
+// it runs Match, a correlated read sub-plan that looks for the whole pattern under
+// the transaction's snapshot (read-your-writes, so it sees the query's earlier
+// writes). When Match yields rows the merge matched: each matched row passes
+// upward with the OnMatch items applied. When Match yields nothing the merge
+// creates the whole pattern (Nodes then Rels, like Create), binds the new
+// variables, applies the OnCreate items, and passes the created row upward. NewVars
+// are the variables the pattern introduces beyond the input scope.
+type Merge struct {
+	Input    Op
+	Match    Op
+	Nodes    []NodeCreate
+	Rels     []RelCreate
+	NewVars  []string
+	OnCreate []SetItem
+	OnMatch  []SetItem
+}
+
 // Col is one computed output column: an expression and the variable name it
 // binds (an alias, a carried variable name, or an implicit name).
 type Col struct {
@@ -295,6 +313,7 @@ type Union struct {
 
 func (*Unit) op()         {}
 func (*Create) op()       {}
+func (*Merge) op()        {}
 func (*Set) op()          {}
 func (*Remove) op()       {}
 func (*Delete) op()       {}
@@ -329,6 +348,12 @@ func outputVars(o Op) map[string]bool {
 		}
 		for _, r := range x.Rels {
 			s[r.Var] = true
+		}
+		return s
+	case *Merge:
+		s := outputVars(x.Input)
+		for _, v := range x.NewVars {
+			s[v] = true
 		}
 		return s
 	case *Set:
@@ -442,6 +467,10 @@ func write(b *strings.Builder, o Op, depth int) {
 	case *Create:
 		b.WriteString("Create " + createLabel(x) + "\n")
 		write(b, x.Input, depth+1)
+	case *Merge:
+		b.WriteString("Merge " + mergeLabel(x) + "\n")
+		write(b, x.Input, depth+1)
+		write(b, x.Match, depth+1)
 	case *Set:
 		b.WriteString("Set " + setLabel(x) + "\n")
 		write(b, x.Input, depth+1)
@@ -588,8 +617,14 @@ func createLabel(x *Create) string {
 // setLabel renders a Set operator's items: a property assignment as
 // "var.#key = expr" and a label addition as "var:#tok&#tok".
 func setLabel(x *Set) string {
-	parts := make([]string, len(x.Items))
-	for i, it := range x.Items {
+	return setItemsLabel(x.Items)
+}
+
+// setItemsLabel renders a list of SET items, shared by the Set operator and by
+// the ON CREATE / ON MATCH parts of a Merge operator.
+func setItemsLabel(items []SetItem) string {
+	parts := make([]string, len(items))
+	for i, it := range items {
 		switch it.Kind {
 		case SetItemProp:
 			parts[i] = it.Var + "." + tokenLabel(it.Key) + " = " + ast.Print(it.Expr)
@@ -602,6 +637,26 @@ func setLabel(x *Set) string {
 		}
 	}
 	return strings.Join(parts, ", ")
+}
+
+// mergeLabel renders a Merge operator: the pattern it ensures (its create-branch
+// nodes and relationships), then any ON CREATE / ON MATCH items.
+func mergeLabel(x *Merge) string {
+	var parts []string
+	for _, n := range x.Nodes {
+		parts = append(parts, "("+n.Var+labelSuffix(n.Labels)+propsSuffix(n.Props)+")")
+	}
+	for _, r := range x.Rels {
+		parts = append(parts, "("+r.From+")-["+r.Var+typeSuffix([]bind.NameRef{r.Type})+propsSuffix(r.Props)+"]->("+r.To+")")
+	}
+	s := strings.Join(parts, ", ")
+	if len(x.OnCreate) > 0 {
+		s += " on-create[" + setItemsLabel(x.OnCreate) + "]"
+	}
+	if len(x.OnMatch) > 0 {
+		s += " on-match[" + setItemsLabel(x.OnMatch) + "]"
+	}
+	return s
 }
 
 // removeLabel renders a Remove operator's items: a property removal as "var.#key"

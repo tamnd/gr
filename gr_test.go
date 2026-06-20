@@ -1048,6 +1048,224 @@ func TestExecDeleteNullNoop(t *testing.T) {
 	}
 }
 
+// TestExecMergeCreatesWhenAbsent confirms a MERGE on a pattern that does not
+// exist takes the create branch, binding and persisting the new node.
+func TestExecMergeCreatesWhenAbsent(t *testing.T) {
+	db := openMem(t, "mergecreate.gr")
+	defer func() { _ = db.Close() }()
+
+	sum, err := db.Exec("MERGE (a:Person {name: 'Ada'})", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesCreated != 1 || sum.LabelsAdded != 1 || sum.PropertiesSet != 1 {
+		t.Fatalf("summary = %+v, want 1 node, 1 label, 1 prop", sum)
+	}
+	rows := collectRows(t, db, "MATCH (p:Person) RETURN p.name AS name", nil)
+	if len(rows) != 1 {
+		t.Fatalf("read back %d rows, want 1", len(rows))
+	}
+	if name, _ := rows[0]["name"].AsString(); name != "Ada" {
+		t.Fatalf("name = %q, want Ada", name)
+	}
+}
+
+// TestExecMergeMatchesWhenPresent confirms a second MERGE on the same pattern
+// matches the existing node and creates nothing: MERGE is idempotent.
+func TestExecMergeMatchesWhenPresent(t *testing.T) {
+	db := openMem(t, "mergematch.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("MERGE (a:Person {name: 'Ada'})", nil); err != nil {
+		t.Fatalf("first merge: %v", err)
+	}
+	sum, err := db.Exec("MERGE (a:Person {name: 'Ada'})", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesCreated != 0 || sum.PropertiesSet != 0 {
+		t.Fatalf("summary = %+v, want nothing created on a match", sum)
+	}
+	rows := collectRows(t, db, "MATCH (p:Person) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 1 {
+		t.Fatalf("Person nodes = %d, want 1 (no duplicate)", n)
+	}
+}
+
+// TestExecMergeOnCreate confirms ON CREATE SET runs only on the create branch.
+func TestExecMergeOnCreate(t *testing.T) {
+	db := openMem(t, "mergeoncreate.gr")
+	defer func() { _ = db.Close() }()
+
+	sum, err := db.Exec("MERGE (a:Person {name: 'Ada'}) ON CREATE SET a.created = true", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	// one property for the merge key, one for ON CREATE.
+	if sum.NodesCreated != 1 || sum.PropertiesSet != 2 {
+		t.Fatalf("summary = %+v, want 1 node and 2 props", sum)
+	}
+	rows := collectRows(t, db, "MATCH (p:Person) RETURN p.created AS c", nil)
+	if c, _ := rows[0]["c"].AsBool(); !c {
+		t.Fatalf("created = %v, want true (ON CREATE ran)", rows[0]["c"])
+	}
+	// a second merge matches, so ON CREATE must not run again.
+	sum2, err := db.Exec("MERGE (a:Person {name: 'Ada'}) ON CREATE SET a.created = false", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum2.PropertiesSet != 0 {
+		t.Fatalf("summary = %+v, want no property set on a match", sum2)
+	}
+	rows = collectRows(t, db, "MATCH (p:Person) RETURN p.created AS c", nil)
+	if c, _ := rows[0]["c"].AsBool(); !c {
+		t.Fatalf("created = %v, want still true (ON CREATE skipped on match)", rows[0]["c"])
+	}
+}
+
+// TestExecMergeOnMatch confirms ON MATCH SET runs only on the match branch.
+func TestExecMergeOnMatch(t *testing.T) {
+	db := openMem(t, "mergeonmatch.gr")
+	defer func() { _ = db.Close() }()
+
+	// first merge creates, so ON MATCH does not run.
+	sum, err := db.Exec("MERGE (a:Person {name: 'Ada'}) ON MATCH SET a.seen = 1", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesCreated != 1 || sum.PropertiesSet != 1 {
+		t.Fatalf("summary = %+v, want 1 node and only the merge-key prop", sum)
+	}
+	rows := collectRows(t, db, "MATCH (p:Person) RETURN p.seen AS s", nil)
+	if rows[0]["s"].Type() != value.TypeNull {
+		t.Fatalf("seen = %v, want null (ON MATCH skipped on create)", rows[0]["s"])
+	}
+	// second merge matches, so ON MATCH runs.
+	sum2, err := db.Exec("MERGE (a:Person {name: 'Ada'}) ON MATCH SET a.seen = 1", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum2.NodesCreated != 0 || sum2.PropertiesSet != 1 {
+		t.Fatalf("summary = %+v, want no node and one prop set by ON MATCH", sum2)
+	}
+	rows = collectRows(t, db, "MATCH (p:Person) RETURN p.seen AS s", nil)
+	if s, _ := rows[0]["s"].AsInt(); s != 1 {
+		t.Fatalf("seen = %v, want 1 (ON MATCH ran on the match)", rows[0]["s"])
+	}
+}
+
+// TestExecMergeRelationship confirms MERGE of a relationship pattern creates the
+// whole pattern when absent, then matches it when present.
+func TestExecMergeRelationship(t *testing.T) {
+	db := openMem(t, "mergerel.gr")
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (:Person {name: 'A'}), (:Person {name: 'B'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	q := "MATCH (a:Person {name: 'A'}), (b:Person {name: 'B'}) MERGE (a)-[:KNOWS]->(b)"
+	sum, err := db.Exec(q, nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.RelationshipsCreated != 1 {
+		t.Fatalf("summary = %+v, want 1 rel created", sum)
+	}
+	// a second merge over the same endpoints finds the edge and creates nothing.
+	sum2, err := db.Exec(q, nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum2.RelationshipsCreated != 0 {
+		t.Fatalf("summary = %+v, want 0 rels created on the match", sum2)
+	}
+	rows := collectRows(t, db, "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 1 {
+		t.Fatalf("KNOWS edges = %d, want 1 (no duplicate)", n)
+	}
+}
+
+// TestExecMergeBindsVariable confirms the MERGE pattern binds its variable for a
+// following clause, on both the create and the match branch. A SET after the
+// MERGE references the bound node, so the property landing proves the binding.
+func TestExecMergeBindsVariable(t *testing.T) {
+	db := openMem(t, "mergebind.gr")
+	defer func() { _ = db.Close() }()
+
+	// create branch: a is bound, the following SET writes through it.
+	if _, err := db.Exec("MERGE (a:Person {name: 'Ada'}) SET a.touched = 1", nil); err != nil {
+		t.Fatalf("create branch: %v", err)
+	}
+	rows := collectRows(t, db, "MATCH (p:Person) RETURN p.touched AS t", nil)
+	if tch, _ := rows[0]["t"].AsInt(); tch != 1 {
+		t.Fatalf("touched = %v, want 1 (SET saw the created binding)", rows[0]["t"])
+	}
+	// match branch: a is bound to the existing node, the SET writes through it.
+	if _, err := db.Exec("MERGE (a:Person {name: 'Ada'}) SET a.touched = 2", nil); err != nil {
+		t.Fatalf("match branch: %v", err)
+	}
+	rows = collectRows(t, db, "MATCH (p:Person) RETURN p.touched AS t, count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 1 {
+		t.Fatalf("Person nodes = %d, want 1 (matched, not recreated)", n)
+	}
+	if tch, _ := rows[0]["t"].AsInt(); tch != 2 {
+		t.Fatalf("touched = %v, want 2 (SET saw the matched binding)", rows[0]["t"])
+	}
+}
+
+// TestExecMergeInBatchDedup confirms that within one statement, a MERGE sees the
+// rows its own earlier iterations created (read-your-writes): two duplicate keys
+// collapse to one node, even though they merge in the same transaction.
+func TestExecMergeInBatchDedup(t *testing.T) {
+	db := openMem(t, "mergededup.gr")
+	defer func() { _ = db.Close() }()
+
+	sum, err := db.Exec("UNWIND ['x@y', 'x@y', 'z@z'] AS e MERGE (u:User {email: e})", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesCreated != 2 {
+		t.Fatalf("summary = %+v, want 2 nodes (the duplicate key collapses)", sum)
+	}
+	rows := collectRows(t, db, "MATCH (u:User) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 2 {
+		t.Fatalf("User nodes = %d, want 2", n)
+	}
+}
+
+// TestExecMergePersistsAcrossReopen confirms a merged node survives a close and
+// reopen, and that a later MERGE matches the persisted node.
+func TestExecMergePersistsAcrossReopen(t *testing.T) {
+	fsys := vfs.NewMem()
+	db, err := Open("mergepersist.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("MERGE (a:Person {name: 'Grace'})", nil); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	db2, err := Open("mergepersist.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db2.Close() }()
+	sum, err := db2.Exec("MERGE (a:Person {name: 'Grace'})", nil)
+	if err != nil {
+		t.Fatalf("merge after reopen: %v", err)
+	}
+	if sum.NodesCreated != 0 {
+		t.Fatalf("summary = %+v, want a match against the persisted node", sum)
+	}
+	rows := collectRows(t, db2, "MATCH (p:Person) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 1 {
+		t.Fatalf("Person nodes = %d, want 1 (no duplicate after reopen)", n)
+	}
+}
+
 // TestQueryRejectsWrites confirms Query refuses a write statement, directing the
 // caller to Exec, and that nothing is mutated.
 func TestQueryRejectsWrites(t *testing.T) {

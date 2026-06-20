@@ -60,34 +60,47 @@ func (o *createOp) next() (eval.Row, bool, error) {
 		return nil, false, err
 	}
 	row := cloneRow(in)
-	for _, nc := range o.spec.Nodes {
-		if err := o.createNode(nc, row); err != nil {
-			return nil, false, err
-		}
-	}
-	for _, rc := range o.spec.Rels {
-		if err := o.createRel(rc, row); err != nil {
-			return nil, false, err
-		}
+	if err := createPattern(o.ctx, o.spec.Nodes, o.spec.Rels, row); err != nil {
+		return nil, false, err
 	}
 	return row, true, nil
 }
 
-func (o *createOp) createNode(nc plan.NodeCreate, row eval.Row) error {
+func (o *createOp) close() error { return o.input.close() }
+
+// createPattern creates a clause's new nodes then its new relationships into the
+// row, binding each new element to its variable. Nodes come before relationships
+// so every endpoint exists when its relationship is built. It backs both the
+// CREATE operator and MERGE's create branch (doc 13 §5, §11.2).
+func createPattern(ctx *Ctx, nodes []plan.NodeCreate, rels []plan.RelCreate, row eval.Row) error {
+	for _, nc := range nodes {
+		if err := createNode(ctx, nc, row); err != nil {
+			return err
+		}
+	}
+	for _, rc := range rels {
+		if err := createRel(ctx, rc, row); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func createNode(ctx *Ctx, nc plan.NodeCreate, row eval.Row) error {
 	labels := knownTokens(nc.Labels)
-	id, err := o.ctx.Tx.CreateNode(labels)
+	id, err := ctx.Tx.CreateNode(labels)
 	if err != nil {
 		return err
 	}
 	row[nc.Var] = value.Node(uint64(id))
-	o.ctx.Effects.NodesCreated++
-	o.ctx.Effects.LabelsAdded += len(labels)
-	return o.setProps(nc.Props, row, func(key engine.Token, v value.Value) error {
-		return o.ctx.Tx.SetNodeProperty(id, key, v)
+	ctx.Effects.NodesCreated++
+	ctx.Effects.LabelsAdded += len(labels)
+	return createProps(ctx, nc.Props, row, func(key engine.Token, v value.Value) error {
+		return ctx.Tx.SetNodeProperty(id, key, v)
 	})
 }
 
-func (o *createOp) createRel(rc plan.RelCreate, row eval.Row) error {
+func createRel(ctx *Ctx, rc plan.RelCreate, row eval.Row) error {
 	src, ok := row[rc.From].AsNode()
 	if !ok {
 		return fmt.Errorf("exec: CREATE relationship source %q is not a node", rc.From)
@@ -99,23 +112,23 @@ func (o *createOp) createRel(rc plan.RelCreate, row eval.Row) error {
 	if !rc.Type.Known {
 		return fmt.Errorf("exec: CREATE relationship type is unresolved")
 	}
-	id, err := o.ctx.Tx.CreateRel(engine.NodeID(src), engine.NodeID(dst), rc.Type.Token)
+	id, err := ctx.Tx.CreateRel(engine.NodeID(src), engine.NodeID(dst), rc.Type.Token)
 	if err != nil {
 		return err
 	}
 	row[rc.Var] = value.Rel(uint64(id))
-	o.ctx.Effects.RelsCreated++
-	return o.setProps(rc.Props, row, func(key engine.Token, v value.Value) error {
-		return o.ctx.Tx.SetRelProperty(id, key, v)
+	ctx.Effects.RelsCreated++
+	return createProps(ctx, rc.Props, row, func(key engine.Token, v value.Value) error {
+		return ctx.Tx.SetRelProperty(id, key, v)
 	})
 }
 
-// setProps evaluates each property expression against the current row and applies
-// it through set. A value that evaluates to null leaves the property unset and is
-// not counted (doc 13 §5.4).
-func (o *createOp) setProps(props []plan.PropSet, row eval.Row, set func(engine.Token, value.Value) error) error {
+// createProps evaluates each property expression against the current row and
+// applies it through set. A value that evaluates to null leaves the property
+// unset and is not counted (doc 13 §5.4).
+func createProps(ctx *Ctx, props []plan.PropSet, row eval.Row, set func(engine.Token, value.Value) error) error {
 	for _, p := range props {
-		v, err := eval.Eval(p.Expr, o.ctx.env(row))
+		v, err := eval.Eval(p.Expr, ctx.env(row))
 		if err != nil {
 			return err
 		}
@@ -128,12 +141,127 @@ func (o *createOp) setProps(props []plan.PropSet, row eval.Row, set func(engine.
 		if err := set(p.Key.Token, v); err != nil {
 			return err
 		}
-		o.ctx.Effects.PropertiesSet++
+		ctx.Effects.PropertiesSet++
 	}
 	return nil
 }
 
-func (o *createOp) close() error { return o.input.close() }
+// mergeOp executes a MERGE clause (doc 13 §11). For each input row it runs the
+// correlated match sub-plan against the writer's snapshot; when the match yields
+// rows the merge matched (each matched row passes upward with the ON MATCH items
+// applied), and when it yields nothing the merge creates the whole pattern, binds
+// the new variables, applies the ON CREATE items, and passes the created row up.
+//
+// Like deleteOp the operator buffers its whole input before doing any write. This
+// is the Eager barrier MERGE needs (doc 13 §11.13): a lazy input scan over the
+// same label the merge creates could otherwise advance onto the merge's own new
+// nodes (the Halloween problem). Within the batch the per-row match runs live, so
+// a row sees nodes that an earlier row of the same batch created (read-your-writes,
+// doc 13 §11.22), which collapses an in-batch duplicate to a single create. The
+// planner will grow a general write-path Eager pass later (doc 11 §10); until then
+// the barrier lives here.
+type mergeOp struct {
+	spec  *plan.Merge
+	input operator
+	match operator
+	args  []*argumentOp
+	ctx   *Ctx
+
+	out   []eval.Row
+	pos   int
+	built bool
+}
+
+func (o *mergeOp) open(ctx *Ctx) error {
+	o.ctx = ctx
+	o.out = nil
+	o.pos = 0
+	o.built = false
+	return o.input.open(ctx)
+}
+
+func (o *mergeOp) next() (eval.Row, bool, error) {
+	if !o.built {
+		if err := o.build(); err != nil {
+			return nil, false, err
+		}
+		o.built = true
+	}
+	if o.pos >= len(o.out) {
+		return nil, false, nil
+	}
+	row := o.out[o.pos]
+	o.pos++
+	return row, true, nil
+}
+
+// build reads the whole input (the Eager barrier, see the type comment), then
+// merges each row, accumulating the output rows.
+func (o *mergeOp) build() error {
+	var rows []eval.Row
+	for {
+		in, ok, err := o.input.next()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+		rows = append(rows, in)
+	}
+	for _, outer := range rows {
+		if err := o.mergeRow(outer); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mergeRow probes the pattern for one outer row: it feeds the outer bindings to
+// the match sub-plan and runs it. Every matched row is emitted with ON MATCH
+// applied; if none matched, the whole pattern is created and emitted with ON
+// CREATE applied (doc 13 §11.2).
+func (o *mergeOp) mergeRow(outer eval.Row) error {
+	for _, a := range o.args {
+		a.bound = restrict(outer, a.vars)
+	}
+	if err := o.match.open(o.ctx); err != nil {
+		return err
+	}
+	matched := false
+	for {
+		row, ok, err := o.match.next()
+		if err != nil {
+			o.match.close()
+			return err
+		}
+		if !ok {
+			break
+		}
+		matched = true
+		merged := mergeRows(outer, row)
+		if err := applySetItems(o.ctx, o.spec.OnMatch, merged); err != nil {
+			o.match.close()
+			return err
+		}
+		o.out = append(o.out, merged)
+	}
+	o.match.close()
+	if matched {
+		return nil
+	}
+	created := cloneRow(outer)
+	if err := createPattern(o.ctx, o.spec.Nodes, o.spec.Rels, created); err != nil {
+		return err
+	}
+	if err := applySetItems(o.ctx, o.spec.OnCreate, created); err != nil {
+		return err
+	}
+	o.out = append(o.out, created)
+	return nil
+}
+
+func (o *mergeOp) close() error { return o.input.close() }
 
 // setOp executes a SET clause (doc 13 §6). For each input row it applies every
 // update item to the bound element in order and passes the row on unchanged (SET
@@ -158,44 +286,54 @@ func (o *setOp) next() (eval.Row, bool, error) {
 	if err != nil || !ok {
 		return nil, false, err
 	}
-	for _, it := range o.spec.Items {
-		switch it.Kind {
-		case plan.SetItemProp:
-			if err := o.setProp(it, in); err != nil {
-				return nil, false, err
-			}
-		case plan.SetItemLabels:
-			if err := o.setLabels(it, in); err != nil {
-				return nil, false, err
-			}
-		case plan.SetItemMerge:
-			if err := o.setMap(it, in, false); err != nil {
-				return nil, false, err
-			}
-		case plan.SetItemReplace:
-			if err := o.setMap(it, in, true); err != nil {
-				return nil, false, err
-			}
-		}
+	if err := applySetItems(o.ctx, o.spec.Items, in); err != nil {
+		return nil, false, err
 	}
 	return in, true, nil
 }
 
-func (o *setOp) setProp(it plan.SetItem, row eval.Row) error {
-	v, err := eval.Eval(it.Expr, o.ctx.env(row))
+// applySetItems applies a list of lowered SET items to a row in order, the body
+// of the SET clause and of MERGE's ON CREATE / ON MATCH sub-clauses (doc 13 §6,
+// §11.5). It binds nothing new; it mutates the elements the row already carries.
+func applySetItems(ctx *Ctx, items []plan.SetItem, row eval.Row) error {
+	for _, it := range items {
+		switch it.Kind {
+		case plan.SetItemProp:
+			if err := setProp(ctx, it, row); err != nil {
+				return err
+			}
+		case plan.SetItemLabels:
+			if err := setLabels(ctx, it, row); err != nil {
+				return err
+			}
+		case plan.SetItemMerge:
+			if err := setMap(ctx, it, row, false); err != nil {
+				return err
+			}
+		case plan.SetItemReplace:
+			if err := setMap(ctx, it, row, true); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func setProp(ctx *Ctx, it plan.SetItem, row eval.Row) error {
+	v, err := eval.Eval(it.Expr, ctx.env(row))
 	if err != nil {
 		return err
 	}
 	if v.IsNull() {
-		return removeElementProp(o.ctx, row[it.Var], it.Key)
+		return removeElementProp(ctx, row[it.Var], it.Key)
 	}
 	if !it.Key.Known {
 		return fmt.Errorf("exec: SET property key is unresolved")
 	}
-	return setElementProp(o.ctx, row[it.Var], it.Key.Token, v)
+	return setElementProp(ctx, row[it.Var], it.Key.Token, v)
 }
 
-func (o *setOp) setLabels(it plan.SetItem, row eval.Row) error {
+func setLabels(ctx *Ctx, it plan.SetItem, row eval.Row) error {
 	id, ok := row[it.Var].AsNode()
 	if !ok {
 		return fmt.Errorf("exec: SET label target %q is not a node", it.Var)
@@ -204,17 +342,17 @@ func (o *setOp) setLabels(it plan.SetItem, row eval.Row) error {
 		if !l.Known {
 			return fmt.Errorf("exec: SET label is unresolved")
 		}
-		has, err := o.ctx.Tx.HasLabel(engine.NodeID(id), l.Token)
+		has, err := ctx.Tx.HasLabel(engine.NodeID(id), l.Token)
 		if err != nil {
 			return err
 		}
 		if has {
 			continue
 		}
-		if err := o.ctx.Tx.AddLabel(engine.NodeID(id), l.Token); err != nil {
+		if err := ctx.Tx.AddLabel(engine.NodeID(id), l.Token); err != nil {
 			return err
 		}
-		o.ctx.Effects.LabelsAdded++
+		ctx.Effects.LabelsAdded++
 	}
 	return nil
 }
@@ -227,8 +365,8 @@ func (o *setOp) setLabels(it plan.SetItem, row eval.Row) error {
 // right-hand side may be a literal or parameter map, or another bound element
 // whose properties are read and copied (doc 13 §6.15). A null right-hand side
 // clears the target on replace and is a no-op on merge.
-func (o *setOp) setMap(it plan.SetItem, row eval.Row, replace bool) error {
-	v, err := eval.Eval(it.Expr, o.ctx.env(row))
+func setMap(ctx *Ctx, it plan.SetItem, row eval.Row, replace bool) error {
+	v, err := eval.Eval(it.Expr, ctx.env(row))
 	if err != nil {
 		return err
 	}
@@ -238,27 +376,27 @@ func (o *setOp) setMap(it plan.SetItem, row eval.Row, replace bool) error {
 	}
 	if v.IsNull() {
 		if replace {
-			return o.clearProps(target)
+			return clearProps(ctx, target)
 		}
 		return nil
 	}
-	pairs, err := o.mapPairs(v)
+	pairs, err := mapPairs(ctx, v)
 	if err != nil {
 		return err
 	}
 	if replace {
-		if err := o.removeAbsent(target, pairs); err != nil {
+		if err := removeAbsent(ctx, target, pairs); err != nil {
 			return err
 		}
 	}
 	for _, p := range pairs {
 		if p.val.IsNull() {
-			if err := removeElementProp(o.ctx, target, bind.NameRef{Known: true, Token: p.key}); err != nil {
+			if err := removeElementProp(ctx, target, bind.NameRef{Known: true, Token: p.key}); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := setElementProp(o.ctx, target, p.key, p.val); err != nil {
+		if err := setElementProp(ctx, target, p.key, p.val); err != nil {
 			return err
 		}
 	}
@@ -276,11 +414,11 @@ type propPair struct {
 // apply. A map value interns each of its keys in this transaction (the keys are
 // only known now, doc 13 §6.4); an element value reads the source element's
 // current properties under the writer's snapshot (read-your-writes, doc 13 §6.15).
-func (o *setOp) mapPairs(v value.Value) ([]propPair, error) {
+func mapPairs(ctx *Ctx, v value.Value) ([]propPair, error) {
 	if m, ok := v.AsMap(); ok {
 		pairs := make([]propPair, 0, len(m))
 		for name, val := range m {
-			tok, err := o.ctx.Tx.InternPropKey(name)
+			tok, err := ctx.Tx.InternPropKey(name)
 			if err != nil {
 				return nil, err
 			}
@@ -289,7 +427,7 @@ func (o *setOp) mapPairs(v value.Value) ([]propPair, error) {
 		return pairs, nil
 	}
 	if isNode(v) || isRel(v) {
-		return o.elementProps(v)
+		return elementProps(ctx, v)
 	}
 	return nil, fmt.Errorf("exec: SET of properties requires a map or a node or relationship")
 }
@@ -297,14 +435,14 @@ func (o *setOp) mapPairs(v value.Value) ([]propPair, error) {
 // elementProps reads every property a source element carries, as the entries to
 // copy onto the target (doc 13 §6.15). The source keys already exist as tokens,
 // so no interning is needed.
-func (o *setOp) elementProps(v value.Value) ([]propPair, error) {
-	keys, err := o.currentKeys(v)
+func elementProps(ctx *Ctx, v value.Value) ([]propPair, error) {
+	keys, err := currentKeys(ctx, v)
 	if err != nil {
 		return nil, err
 	}
 	pairs := make([]propPair, 0, len(keys))
 	for _, k := range keys {
-		val, err := o.readProp(v, k)
+		val, err := readProp(ctx, v, k)
 		if err != nil {
 			return nil, err
 		}
@@ -318,12 +456,12 @@ func (o *setOp) elementProps(v value.Value) ([]propPair, error) {
 
 // removeAbsent removes every property the target currently carries whose key is
 // not among the replacement entries, the first half of map-replace (doc 13 §6.5).
-func (o *setOp) removeAbsent(target value.Value, pairs []propPair) error {
+func removeAbsent(ctx *Ctx, target value.Value, pairs []propPair) error {
 	keep := make(map[engine.Token]struct{}, len(pairs))
 	for _, p := range pairs {
 		keep[p.key] = struct{}{}
 	}
-	cur, err := o.currentKeys(target)
+	cur, err := currentKeys(ctx, target)
 	if err != nil {
 		return err
 	}
@@ -331,7 +469,7 @@ func (o *setOp) removeAbsent(target value.Value, pairs []propPair) error {
 		if _, ok := keep[k]; ok {
 			continue
 		}
-		if err := removeElementProp(o.ctx, target, bind.NameRef{Known: true, Token: k}); err != nil {
+		if err := removeElementProp(ctx, target, bind.NameRef{Known: true, Token: k}); err != nil {
 			return err
 		}
 	}
@@ -339,13 +477,13 @@ func (o *setOp) removeAbsent(target value.Value, pairs []propPair) error {
 }
 
 // clearProps removes every property the target carries, the effect of SET n = null.
-func (o *setOp) clearProps(target value.Value) error {
-	cur, err := o.currentKeys(target)
+func clearProps(ctx *Ctx, target value.Value) error {
+	cur, err := currentKeys(ctx, target)
 	if err != nil {
 		return err
 	}
 	for _, k := range cur {
-		if err := removeElementProp(o.ctx, target, bind.NameRef{Known: true, Token: k}); err != nil {
+		if err := removeElementProp(ctx, target, bind.NameRef{Known: true, Token: k}); err != nil {
 			return err
 		}
 	}
@@ -353,21 +491,21 @@ func (o *setOp) clearProps(target value.Value) error {
 }
 
 // currentKeys returns the property keys the node or relationship currently carries.
-func (o *setOp) currentKeys(elem value.Value) ([]engine.Token, error) {
+func currentKeys(ctx *Ctx, elem value.Value) ([]engine.Token, error) {
 	if id, ok := elem.AsNode(); ok {
-		return o.ctx.Tx.NodePropertyKeys(engine.NodeID(id))
+		return ctx.Tx.NodePropertyKeys(engine.NodeID(id))
 	}
 	id, _ := elem.AsRel()
-	return o.ctx.Tx.RelPropertyKeys(engine.RelID(id))
+	return ctx.Tx.RelPropertyKeys(engine.RelID(id))
 }
 
 // readProp reads one property of the node or relationship bound to an element value.
-func (o *setOp) readProp(elem value.Value, key engine.Token) (value.Value, error) {
+func readProp(ctx *Ctx, elem value.Value, key engine.Token) (value.Value, error) {
 	if id, ok := elem.AsNode(); ok {
-		return o.ctx.Tx.NodeProperty(engine.NodeID(id), key)
+		return ctx.Tx.NodeProperty(engine.NodeID(id), key)
 	}
 	id, _ := elem.AsRel()
-	return o.ctx.Tx.RelProperty(engine.RelID(id), key)
+	return ctx.Tx.RelProperty(engine.RelID(id), key)
 }
 
 func (o *setOp) close() error { return o.input.close() }

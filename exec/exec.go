@@ -175,6 +175,16 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 			return nil, nil, err
 		}
 		return &createOp{spec: x, input: input}, nil, nil
+	case *plan.Merge:
+		input, err := compile(x.Input)
+		if err != nil {
+			return nil, nil, err
+		}
+		match, args, err := compileInner(x.Match)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &mergeOp{spec: x, input: input, match: match, args: args}, nil, nil
 	case *plan.Set:
 		input, err := compile(x.Input)
 		if err != nil {

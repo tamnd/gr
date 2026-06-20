@@ -263,6 +263,34 @@ func TestBindSetRemove(t *testing.T) {
 	}
 }
 
+func TestBindMerge(t *testing.T) {
+	// MERGE is a write clause: a query may end with it, with no RETURN.
+	mustBind(t, "MERGE (a:Person {name: $n})")
+	mustBind(t, "MERGE (a:Person)-[:KNOWS]->(b:Person)")
+	// MERGE after a MATCH references the matched node and merges the rest.
+	mustBind(t, "MATCH (a:Person) MERGE (a)-[:KNOWS]->(b)")
+	// The MERGE pattern binds its variables for a following clause.
+	mustBind(t, "MERGE (a:Person {name: 'x'}) RETURN a.name AS name")
+	// ON CREATE and ON MATCH bind their set items against the MERGE pattern.
+	mustBind(t, "MERGE (a:Person {name: 'x'}) ON CREATE SET a.age = 1")
+	mustBind(t, "MERGE (a:Person {name: 'x'}) ON MATCH SET a.age = 1")
+	mustBind(t, "MERGE (a:Person {name: 'x'}) ON CREATE SET a.age = 1 ON MATCH SET a:Admin")
+	// A merged relationship obeys the CREATE rules: one type, a direction, fixed length.
+	if _, err := bindStr(t, "MERGE (a)-[:KNOWS]-(b)", false); err == nil {
+		t.Fatal("undirected relationship in MERGE should be rejected")
+	}
+	if _, err := bindStr(t, "MERGE (a)-[r]->(b)", false); err == nil {
+		t.Fatal("relationship without a type in MERGE should be rejected")
+	}
+	if _, err := bindStr(t, "MERGE (a)-[:KNOWS*]->(b)", false); err == nil {
+		t.Fatal("variable-length relationship in MERGE should be rejected")
+	}
+	// An ON SET item must target a variable the pattern binds.
+	if _, err := bindStr(t, "MERGE (a:Person) ON CREATE SET b.age = 1", false); err == nil {
+		t.Fatal("ON CREATE SET of an unbound variable should be rejected")
+	}
+}
+
 func TestBindDelete(t *testing.T) {
 	// DELETE and DETACH DELETE bind their targets against bound variables.
 	mustBind(t, "MATCH (a) DELETE a")

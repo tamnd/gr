@@ -72,6 +72,23 @@ func sexpr(n any) string {
 			}
 		}
 		return "(remove " + strings.Join(parts, " ") + ")"
+	case *ast.Merge:
+		s := "(merge " + sexpr(x.Pattern)
+		if len(x.OnCreate) > 0 {
+			items := make([]string, len(x.OnCreate))
+			for i, it := range x.OnCreate {
+				items[i] = setItem(it)
+			}
+			s += " (on-create " + strings.Join(items, " ") + ")"
+		}
+		if len(x.OnMatch) > 0 {
+			items := make([]string, len(x.OnMatch))
+			for i, it := range x.OnMatch {
+				items[i] = setItem(it)
+			}
+			s += " (on-match " + strings.Join(items, " ") + ")"
+		}
+		return s + ")"
 	case *ast.Delete:
 		parts := make([]string, len(x.Targets))
 		for i, t := range x.Targets {
@@ -445,6 +462,41 @@ func TestParseDelete(t *testing.T) {
 		`(query (match (path (node a))) (detach-delete a))`)
 	check(t, "MATCH (a)-[r]->(b) DELETE r, a, b",
 		`(query (match (path (node a) (rel -> r) (node b))) (delete r a b))`)
+}
+
+// TestParseMerge covers MERGE with a bare pattern, a relationship pattern, and
+// the ON CREATE / ON MATCH sub-clauses in either order.
+func TestParseMerge(t *testing.T) {
+	check(t, "MERGE (a:Person {name: 'x'})",
+		`(query (merge (path (node a :Person {name:'x'}))))`)
+	check(t, "MERGE (a)-[r:KNOWS]->(b)",
+		`(query (merge (path (node a) (rel -> r :KNOWS) (node b))))`)
+	check(t, "MERGE (a:Person {id: 1}) ON CREATE SET a.created = true",
+		`(query (merge (path (node a :Person {id:1})) (on-create (prop a.created true))))`)
+	check(t, "MERGE (a:Person {id: 1}) ON MATCH SET a.seen = 1",
+		`(query (merge (path (node a :Person {id:1})) (on-match (prop a.seen 1))))`)
+	check(t, "MERGE (a:Person {id: 1}) ON CREATE SET a.c = 1 ON MATCH SET a.m = 2",
+		`(query (merge (path (node a :Person {id:1})) (on-create (prop a.c 1)) (on-match (prop a.m 2))))`)
+	check(t, "MERGE (a:Person {id: 1}) ON MATCH SET a.m = 2 ON CREATE SET a.c = 1",
+		`(query (merge (path (node a :Person {id:1})) (on-create (prop a.c 1)) (on-match (prop a.m 2))))`)
+	check(t, "MATCH (a) MERGE (a)-[r:KNOWS]->(b:Person)",
+		`(query (match (path (node a))) (merge (path (node a) (rel -> r :KNOWS) (node b :Person))))`)
+}
+
+// TestParseMergeErrors confirms malformed MERGE clauses are rejected.
+func TestParseMergeErrors(t *testing.T) {
+	bad := []string{
+		"MERGE (a), (b)",                    // MERGE takes a single pattern
+		"MERGE (a) ON SET a.x = 1",          // ON without CREATE/MATCH
+		"MERGE (a) ON CREATE a.x = 1",       // ON CREATE without SET
+		"MERGE (a) ON CREATE SET",           // SET with no item
+		"MERGE",                             // no pattern
+	}
+	for _, src := range bad {
+		if _, err := parse.Parse(src); err == nil {
+			t.Fatalf("Parse(%q): expected an error, got none", src)
+		}
+	}
 }
 
 // TestParseErrors confirms malformed queries are rejected with a parse.Error.

@@ -92,6 +92,26 @@ type BindPath struct {
 	Elems []string
 }
 
+// ShortestPath finds the shortest path(s) between two already-bound endpoint
+// nodes (shortestPath / allShortestPaths, doc 09 §3.4, doc 12 §4.4). From and To
+// are the endpoint variables, bound below by scans or earlier clauses; Rel binds
+// the path's relationship list (like a variable-length expand); PathVar binds the
+// materialized path value when the pattern names one ("" otherwise). Types is the
+// resolved type set, Dir the direction, and VarLen the hop range (nil for a fixed
+// single hop). All selects allShortestPaths: every path of the minimum length,
+// rather than one.
+type ShortestPath struct {
+	Input   Op
+	From    string
+	To      string
+	Rel     string
+	PathVar string
+	Types   []bind.NameRef
+	Dir     ast.Direction
+	VarLen  *ast.VarLength
+	All     bool
+}
+
 // Col is one computed output column: an expression and the variable name it
 // binds (an alias, a carried variable name, or an implicit name).
 type Col struct {
@@ -173,21 +193,22 @@ type Union struct {
 	All         bool
 }
 
-func (*Unit) op()      {}
-func (*Argument) op()  {}
-func (*NodeScan) op()  {}
-func (*Expand) op()    {}
-func (*Filter) op()    {}
-func (*BindPath) op()  {}
-func (*Project) op()   {}
-func (*Aggregate) op() {}
-func (*Join) op()      {}
-func (*Optional) op()  {}
-func (*Unwind) op()    {}
-func (*Sort) op()      {}
-func (*Skip) op()      {}
-func (*Limit) op()     {}
-func (*Union) op()     {}
+func (*Unit) op()         {}
+func (*Argument) op()     {}
+func (*NodeScan) op()     {}
+func (*Expand) op()       {}
+func (*Filter) op()       {}
+func (*BindPath) op()     {}
+func (*ShortestPath) op() {}
+func (*Project) op()      {}
+func (*Aggregate) op()    {}
+func (*Join) op()         {}
+func (*Optional) op()     {}
+func (*Unwind) op()       {}
+func (*Sort) op()         {}
+func (*Skip) op()         {}
+func (*Limit) op()        {}
+func (*Union) op()        {}
 
 // outputVars returns the set of variable names an operator's rows carry. It is
 // the basis for predicate pushdown (a filter can move below an operator only if
@@ -215,6 +236,13 @@ func outputVars(o Op) map[string]bool {
 	case *BindPath:
 		s := outputVars(x.Input)
 		s[x.Var] = true
+		return s
+	case *ShortestPath:
+		s := outputVars(x.Input)
+		s[x.Rel] = true
+		if x.PathVar != "" {
+			s[x.PathVar] = true
+		}
 		return s
 	case *Project:
 		return colNames(x.Cols)
@@ -305,6 +333,9 @@ func write(b *strings.Builder, o Op, depth int) {
 	case *BindPath:
 		b.WriteString("BindPath " + x.Var + " = [" + strings.Join(x.Elems, ",") + "]\n")
 		write(b, x.Input, depth+1)
+	case *ShortestPath:
+		b.WriteString("ShortestPath " + shortestLabel(x) + "\n")
+		write(b, x.Input, depth+1)
 	case *Project:
 		b.WriteString("Project" + distinct(x.Distinct) + " " + colList(x.Cols) + "\n")
 		write(b, x.Input, depth+1)
@@ -383,6 +414,31 @@ func expandLabel(x *Expand) string {
 		tail += " (into)"
 	}
 	return x.From + " " + left + "[" + rel + typeSuffix(x.Types) + "]" + right + " " + x.To + tail
+}
+
+// shortestLabel renders a ShortestPath operator's pattern: the search kind, the
+// (optional) path variable, and the relationship between the two endpoints.
+func shortestLabel(x *ShortestPath) string {
+	kind := "shortest"
+	if x.All {
+		kind = "allShortest"
+	}
+	left, right := "-", "-"
+	switch x.Dir {
+	case ast.DirOut:
+		right = "->"
+	case ast.DirIn:
+		left = "<-"
+	}
+	rel := x.Rel
+	if x.VarLen != nil {
+		rel += "*"
+	}
+	s := kind + " " + x.From + " " + left + "[" + rel + typeSuffix(x.Types) + "]" + right + " " + x.To
+	if x.PathVar != "" {
+		s = x.PathVar + " = " + s
+	}
+	return s
 }
 
 func typeSuffix(types []bind.NameRef) string {

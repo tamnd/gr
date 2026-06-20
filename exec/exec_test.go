@@ -520,3 +520,73 @@ func TestNamedPath(t *testing.T) {
 		}
 	}
 }
+
+func TestShortestPath(t *testing.T) {
+	e, ids := graph(t)
+	// Alice reaches Carol directly (length 1) and via Bob (length 2); the shortest
+	// is the direct edge, so one path of length 1 is returned.
+	rows, _ := run(t, e, "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Carol'}) "+
+		"MATCH p = shortestPath((a)-[:KNOWS*]->(b)) RETURN length(p) AS len", nil)
+	if len(rows) != 1 {
+		t.Fatalf("want 1 shortest path Alice->Carol, got %d", len(rows))
+	}
+	if l, _ := rows[0]["len"].AsInt(); l != 1 {
+		t.Fatalf("length(p) = %s, want 1", rows[0]["len"])
+	}
+
+	// The path's endpoints are Alice and Carol.
+	rows, _ = run(t, e, "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Carol'}) "+
+		"MATCH p = shortestPath((a)-[:KNOWS*]->(b)) RETURN nodes(p) AS ns", nil)
+	ns, _ := rows[0]["ns"].AsList()
+	if len(ns) != 2 {
+		t.Fatalf("nodes(p) has %d nodes, want 2", len(ns))
+	}
+	first, _ := ns[0].AsNode()
+	last, _ := ns[len(ns)-1].AsNode()
+	if engine.NodeID(first) != ids["Alice"] || engine.NodeID(last) != ids["Carol"] {
+		t.Fatalf("path endpoints = %d..%d, want %d..%d", first, last, ids["Alice"], ids["Carol"])
+	}
+}
+
+func TestAllShortestPaths(t *testing.T) {
+	// A diamond: A -> B -> D and A -> C -> D. Two distinct shortest paths of
+	// length 2 from A to D.
+	e := engine.NewMemEngine()
+	tx, err := e.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk := func(name string) engine.NodeID {
+		id, _ := tx.CreateNode([]engine.Token{lblPerson})
+		tx.SetNodeProperty(id, keyName, value.String(name))
+		return id
+	}
+	a, b, c, d := mk("A"), mk("B"), mk("C"), mk("D")
+	for _, e := range [][2]engine.NodeID{{a, b}, {a, c}, {b, d}, {c, d}} {
+		if _, err := tx.CreateRel(e[0], e[1], typKnows); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// allShortestPaths returns both length-2 paths.
+	rows, _ := run(t, e, "MATCH (a:Person {name: 'A'}), (d:Person {name: 'D'}) "+
+		"MATCH p = allShortestPaths((a)-[:KNOWS*]->(d)) RETURN length(p) AS len", nil)
+	if len(rows) != 2 {
+		t.Fatalf("want 2 shortest paths A->D, got %d", len(rows))
+	}
+	for _, row := range rows {
+		if l, _ := row["len"].AsInt(); l != 2 {
+			t.Fatalf("length(p) = %s, want 2", row["len"])
+		}
+	}
+
+	// shortestPath returns just one of them.
+	rows, _ = run(t, e, "MATCH (a:Person {name: 'A'}), (d:Person {name: 'D'}) "+
+		"MATCH p = shortestPath((a)-[:KNOWS*]->(d)) RETURN length(p) AS len", nil)
+	if len(rows) != 1 {
+		t.Fatalf("want 1 shortest path A->D, got %d", len(rows))
+	}
+}

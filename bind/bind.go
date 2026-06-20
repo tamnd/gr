@@ -223,17 +223,28 @@ func (bd *binder) match(m *ast.Match, sc scope) error {
 // variable and every node and relationship variable, and resolves the label,
 // type, and property-key names.
 func (bd *binder) bindPath(pp *ast.PathPattern, sc scope) error {
-	if pp.Var != "" {
-		// A named path materializes from its bound element variables in order
-		// (plan.BindPath). A variable-length step binds a relationship list, not a
-		// single relationship, and does not bind its intermediate nodes, so the
-		// element sequence is incomplete; reject it until the variable-length
-		// expand records the full walk (deliverable 8b follow-on).
+	if pp.Shortest != ast.NotShortest {
+		// A shortest-path pattern searches between two endpoints, so it carries
+		// exactly one relationship (doc 09 §3.4). The relationship may be variable-
+		// length; the shortest-path operator records the full walk including the
+		// intermediate nodes, so a named shortest path materializes even over a
+		// variable-length step.
+		if len(pp.Chain) != 1 {
+			return &Error{"shortestPath requires exactly one relationship", pp.Line, pp.Col}
+		}
+	} else if pp.Var != "" {
+		// A named ordinary path materializes from its bound element variables in
+		// order (plan.BindPath). A variable-length step binds a relationship list,
+		// not a single relationship, and does not bind its intermediate nodes, so
+		// the element sequence is incomplete; reject it (a shortestPath over the same
+		// step is fine, handled above, because that operator records the full walk).
 		for _, step := range pp.Chain {
 			if step.Rel.VarLen != nil {
 				return &Error{"named path over a variable-length relationship is not yet supported", pp.Line, pp.Col}
 			}
 		}
+	}
+	if pp.Var != "" {
 		if err := bindVar(sc, pp.Var, vkPath, pp.Pos); err != nil {
 			return err
 		}

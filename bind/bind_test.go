@@ -191,3 +191,14 @@ func TestBindNamedPath(t *testing.T) {
 		t.Fatal("named var-length path should be rejected")
 	}
 }
+
+func TestBindShortestPath(t *testing.T) {
+	// A named shortest path over a variable-length step binds, unlike an ordinary
+	// named variable-length path: the shortest-path operator records the full walk.
+	mustBind(t, "MATCH (a:Person), (b:Person) MATCH p = shortestPath((a)-[:KNOWS*]-(b)) RETURN p")
+	mustBind(t, "MATCH (a:Person), (b:Person) MATCH allShortestPaths((a)-[:KNOWS*]-(b)) RETURN a")
+	// A shortest-path pattern must carry exactly one relationship.
+	if _, err := bindStr(t, "MATCH (a), (b), (c) MATCH p = shortestPath((a)-[:KNOWS*]-(b)-[:KNOWS*]-(c)) RETURN p", false); err == nil {
+		t.Fatal("multi-relationship shortestPath should be rejected")
+	}
+}

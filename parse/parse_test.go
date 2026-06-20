@@ -55,6 +55,12 @@ func sexpr(n any) string {
 		if x.Var != "" {
 			s += " " + x.Var + "="
 		}
+		switch x.Shortest {
+		case ast.ShortestOne:
+			s += " shortest"
+		case ast.ShortestAll:
+			s += " all-shortest"
+		}
 		s += " " + sexpr(x.Start)
 		for _, ch := range x.Chain {
 			s += " " + sexpr(ch.Rel) + " " + sexpr(ch.Node)
@@ -296,6 +302,15 @@ func TestDirections(t *testing.T) {
 		"(query (match (path (node a) (rel -- :KNOWS) (node b))) (return b))")
 	check(t, "MATCH (a)-->(b) RETURN b",
 		"(query (match (path (node a) (rel ->) (node b))) (return b))")
+}
+
+// TestShortestPath covers the shortestPath and allShortestPaths wrappers, with
+// and without a bound path variable.
+func TestShortestPath(t *testing.T) {
+	check(t, "MATCH p = shortestPath((a)-[:KNOWS*]-(b)) RETURN p",
+		"(query (match (path p= shortest (node a) (rel -- :KNOWS *-1..-1) (node b))) (return p))")
+	check(t, "MATCH allShortestPaths((a)-[*]->(b)) RETURN a",
+		"(query (match (path all-shortest (node a) (rel -> *-1..-1) (node b))) (return a))")
 }
 
 // TestProjectionTail covers DISTINCT, *, ORDER BY, SKIP, LIMIT, and aliases.

@@ -346,23 +346,65 @@ func (p *parser) pathPattern() (*ast.PathPattern, error) {
 		pp.Var = p.advance().Text
 		p.advance() // =
 	}
+	// shortestPath(...) / allShortestPaths(...) wrap a pattern in parentheses.
+	if k := p.shortestKind(); k != ast.NotShortest {
+		pp.Shortest = k
+		p.advance() // the function name
+		if _, err := p.expect(lex.Lparen); err != nil {
+			return nil, err
+		}
+		if err := p.pathBody(pp); err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(lex.Rparen); err != nil {
+			return nil, err
+		}
+		return pp, nil
+	}
+	if err := p.pathBody(pp); err != nil {
+		return nil, err
+	}
+	return pp, nil
+}
+
+// shortestKind recognizes a shortest-path wrapper: an identifier naming one of
+// the shortest-path functions immediately followed by an opening parenthesis.
+// These are ordinary identifiers to the lexer; only this position gives them
+// meaning, so a node or relationship variable named "shortestpath" elsewhere is
+// unaffected.
+func (p *parser) shortestKind() ast.ShortestKind {
+	if !p.at(lex.Ident) || p.peek(1).Kind != lex.Lparen {
+		return ast.NotShortest
+	}
+	switch strings.ToLower(p.cur().Text) {
+	case "shortestpath":
+		return ast.ShortestOne
+	case "allshortestpaths":
+		return ast.ShortestAll
+	}
+	return ast.NotShortest
+}
+
+// pathBody parses a pattern's node and its chain of relationship-then-node steps,
+// the shape shared by a bare pattern and one wrapped in a shortest-path function.
+func (p *parser) pathBody(pp *ast.PathPattern) error {
 	n, err := p.nodePattern()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	pp.Start = n
 	for p.at(lex.Minus) || p.at(lex.Lt) {
 		rel, err := p.relPattern()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		node, err := p.nodePattern()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		pp.Chain = append(pp.Chain, ast.PatternChain{Rel: rel, Node: node})
 	}
-	return pp, nil
+	return nil
 }
 
 func (p *parser) nodePattern() (*ast.NodePattern, error) {

@@ -153,6 +153,7 @@ func Bind(q *ast.Query, cat Catalog, strict bool) (*Bound, error) {
 func (bd *binder) single(sq *ast.SingleQuery) ([]string, error) {
 	sc := scope{}
 	var cols []string
+	writes := false
 	for i, c := range sq.Clauses {
 		last := i == len(sq.Clauses)-1
 		switch cl := c.(type) {
@@ -160,6 +161,11 @@ func (bd *binder) single(sq *ast.SingleQuery) ([]string, error) {
 			if err := bd.match(cl, sc); err != nil {
 				return nil, err
 			}
+		case *ast.Create:
+			if err := bd.create(cl, sc); err != nil {
+				return nil, err
+			}
+			writes = true
 		case *ast.Unwind:
 			if err := bd.unwind(cl, sc); err != nil {
 				return nil, err
@@ -190,6 +196,11 @@ func (bd *binder) single(sq *ast.SingleQuery) ([]string, error) {
 		}
 	}
 	if cols == nil {
+		// A write query may omit RETURN (CREATE (n) is a complete statement); a
+		// read-only query without a final RETURN produces nothing and is rejected.
+		if writes {
+			return []string{}, nil
+		}
 		return nil, &Error{"a query must end with RETURN", sq.Line, sq.Col}
 	}
 	return cols, nil
@@ -328,6 +339,60 @@ func (bd *binder) checkProps(props []ast.PropEntry, sc scope) error {
 		if err := bd.checkExpr(pe.Value, sc, false); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// create binds a CREATE clause. Like match it runs in two passes (bind every new
+// variable and resolve every name, then check the property-map expressions
+// against the complete post-clause scope), so a property value may reference any
+// variable the clause binds. The names it resolves are interned before binding
+// (the executor's write-setup, doc 13 §9), so every label, type, and key resolves
+// to a known token rather than the read path's null sentinel.
+func (bd *binder) create(c *ast.Create, sc scope) error {
+	for _, pp := range c.Patterns {
+		if err := bd.bindCreatePath(pp, sc); err != nil {
+			return err
+		}
+	}
+	for _, pp := range c.Patterns {
+		if err := bd.checkPathExprs(pp, sc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// bindCreatePath binds one CREATE path pattern, rejecting the forms CREATE cannot
+// express: a shortestPath wrapper, an undirected or variable-length relationship,
+// and a relationship without exactly one type (a created relationship has a single
+// concrete type, doc 13 §5.3).
+func (bd *binder) bindCreatePath(pp *ast.PathPattern, sc scope) error {
+	if pp.Shortest != ast.NotShortest {
+		return &Error{"shortestPath cannot appear in CREATE", pp.Line, pp.Col}
+	}
+	if err := bd.bindNode(pp.Start, sc); err != nil {
+		return err
+	}
+	for _, step := range pp.Chain {
+		if step.Rel.VarLen != nil {
+			return &Error{"a variable-length relationship cannot be created", step.Rel.Line, step.Rel.Col}
+		}
+		if step.Rel.Dir == ast.DirBoth {
+			return &Error{"CREATE requires a directed relationship", step.Rel.Line, step.Rel.Col}
+		}
+		if len(step.Rel.Types) != 1 {
+			return &Error{"CREATE requires exactly one relationship type", step.Rel.Line, step.Rel.Col}
+		}
+		if err := bd.bindRel(step.Rel, sc); err != nil {
+			return err
+		}
+		if err := bd.bindNode(step.Node, sc); err != nil {
+			return err
+		}
+	}
+	if pp.Var != "" {
+		return bindVar(sc, pp.Var, vkPath, pp.Pos)
 	}
 	return nil
 }

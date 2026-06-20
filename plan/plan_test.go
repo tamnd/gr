@@ -230,6 +230,45 @@ func TestBuildNamedPath(t *testing.T) {
 	eq(t, "normalized", String(Plan(b)), want)
 }
 
+func TestBuildCreateNode(t *testing.T) {
+	b := bound(t, "CREATE (a:Person {name: $n})")
+	want := `Create (a:#1 {#1: $n})
+  Unit
+`
+	eq(t, "raw", String(Build(b)), want)
+	eq(t, "normalized", String(Plan(b)), want)
+}
+
+func TestBuildCreateRel(t *testing.T) {
+	// Both endpoints and the relationship are new; the relationship is oriented
+	// From a To b regardless of how it was written.
+	b := bound(t, "CREATE (a:Person)-[:KNOWS {age: 1}]->(b:Person)")
+	want := `Create (a:#1), (b:#1), (a)-[@r0:#1 {#2: 1}]->(b)
+  Unit
+`
+	eq(t, "raw", String(Build(b)), want)
+}
+
+func TestBuildCreateAfterMatch(t *testing.T) {
+	// a is already bound by the MATCH, so it is referenced, not created; only b and
+	// the relationship are new. The Create sits above the read plan.
+	b := bound(t, "MATCH (a:Person) CREATE (a)-[:KNOWS]->(b)")
+	want := `Create (b), (a)-[@r0:#1]->(b)
+  NodeScan a:#1
+`
+	eq(t, "raw", String(Build(b)), want)
+}
+
+func TestBuildCreateIncoming(t *testing.T) {
+	// An incoming relationship is stored oriented from its real source: (a)<-[r]-(b)
+	// creates the edge b -> a.
+	b := bound(t, "CREATE (a)<-[:KNOWS]-(b)")
+	want := `Create (a), (b), (b)-[@r0:#1]->(a)
+  Unit
+`
+	eq(t, "raw", String(Build(b)), want)
+}
+
 func TestBuildShortestPath(t *testing.T) {
 	b := bound(t, "MATCH (a:Person), (b:Person) MATCH p = shortestPath((a)-[:KNOWS*]-(b)) RETURN p")
 	want := `Project p

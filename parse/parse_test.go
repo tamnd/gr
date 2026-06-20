@@ -50,6 +50,12 @@ func sexpr(n any) string {
 		return "(return " + projection(x.Projection) + ")"
 	case *ast.Unwind:
 		return "(unwind " + sexpr(x.Expr) + " as " + x.Var + ")"
+	case *ast.Create:
+		parts := make([]string, len(x.Patterns))
+		for i, pp := range x.Patterns {
+			parts[i] = sexpr(pp)
+		}
+		return "(create " + strings.Join(parts, " ") + ")"
 	case *ast.PathPattern:
 		s := "(path"
 		if x.Var != "" {
@@ -348,6 +354,21 @@ func TestUnwindAndUnion(t *testing.T) {
 		"(query (match (path (node a))) (return a)) union-all (query (match (path (node b))) (return b))")
 }
 
+// TestParseCreate confirms CREATE parses into path patterns, standalone and after
+// a MATCH, including multiple comma-separated patterns and a named path.
+func TestParseCreate(t *testing.T) {
+	check(t, "CREATE (a:Person {name: $n})",
+		`(query (create (path (node a :Person {name:$n}))))`)
+	check(t, "CREATE (a)-[:KNOWS]->(b)",
+		`(query (create (path (node a) (rel -> :KNOWS) (node b))))`)
+	check(t, "MATCH (a:Person) CREATE (a)-[:KNOWS]->(b:Person)",
+		`(query (match (path (node a :Person))) (create (path (node a) (rel -> :KNOWS) (node b :Person))))`)
+	check(t, "CREATE (a), (b)",
+		`(query (create (path (node a)) (path (node b))))`)
+	check(t, "CREATE p = (a)-[:KNOWS]->(b) RETURN p",
+		`(query (create (path p= (node a) (rel -> :KNOWS) (node b))) (return p))`)
+}
+
 // TestParseErrors confirms malformed queries are rejected with a parse.Error.
 func TestParseErrors(t *testing.T) {
 	bad := []string{
@@ -355,8 +376,7 @@ func TestParseErrors(t *testing.T) {
 		"MATCH (a)-[:KNOWS]->",           // missing target node
 		"RETURN",                         // empty projection
 		"MATCH (a) WHERE RETURN a",       // missing predicate
-		"CREATE (a)",                     // write clause (M2)
-		"MATCH (a) SET a.x = 1 RETURN a", // write clause (M2)
+		"MATCH (a) SET a.x = 1 RETURN a", // a later M3 write clause
 		"MATCH (a)<-[:T]->(b) RETURN b",  // both directions
 		"RETURN 1 +",                     // dangling operator
 		"FOO bar",                        // not a clause

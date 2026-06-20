@@ -394,3 +394,200 @@ func TestQueryOnClosed(t *testing.T) {
 		t.Fatalf("query on closed db = %v, want ErrClosed", err)
 	}
 }
+
+// collectRows runs a read query and returns its rows as name-keyed maps, a small
+// helper for the write tests that read back what a CREATE produced.
+func collectRows(t *testing.T, db *DB, q string, params map[string]value.Value) []map[string]value.Value {
+	t.Helper()
+	res, err := db.Query(q, params)
+	if err != nil {
+		t.Fatalf("query %q: %v", q, err)
+	}
+	defer func() { _ = res.Close() }()
+	cols := res.Columns()
+	var out []map[string]value.Value
+	for {
+		row, ok, err := res.Next()
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if !ok {
+			break
+		}
+		m := map[string]value.Value{}
+		for i, c := range cols {
+			m[c] = row[i]
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// TestExecCreateNode creates a labeled node with a property and reads it back,
+// checking both the side-effect summary and the persisted value.
+func TestExecCreateNode(t *testing.T) {
+	fsys := vfs.NewMem()
+	db, err := Open("create.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	sum, err := db.Exec("CREATE (a:Person {name: 'Ada', age: 36})", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesCreated != 1 || sum.LabelsAdded != 1 || sum.PropertiesSet != 2 {
+		t.Fatalf("summary = %+v, want 1 node, 1 label, 2 props", sum)
+	}
+
+	rows := collectRows(t, db, "MATCH (p:Person) RETURN p.name AS name, p.age AS age", nil)
+	if len(rows) != 1 {
+		t.Fatalf("read back %d rows, want 1", len(rows))
+	}
+	if name, _ := rows[0]["name"].AsString(); name != "Ada" {
+		t.Fatalf("name = %q, want Ada", name)
+	}
+	if age, _ := rows[0]["age"].AsInt(); age != 36 {
+		t.Fatalf("age = %d, want 36", age)
+	}
+}
+
+// TestExecCreateNullProperty confirms a property whose value is null is left
+// unset and not counted in the summary.
+func TestExecCreateNullProperty(t *testing.T) {
+	fsys := vfs.NewMem()
+	db, err := Open("nullprop.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	sum, err := db.Exec("CREATE (a:Person {name: 'x', nick: null})", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.PropertiesSet != 1 {
+		t.Fatalf("PropertiesSet = %d, want 1 (null is not set)", sum.PropertiesSet)
+	}
+}
+
+// TestExecCreateRelationship creates two nodes and a typed relationship with a
+// property, then reads the pattern back to confirm the edge and its direction.
+func TestExecCreateRelationship(t *testing.T) {
+	fsys := vfs.NewMem()
+	db, err := Open("rel.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	sum, err := db.Exec("CREATE (a:Person {name: 'A'})-[:KNOWS {since: 2020}]->(b:Person {name: 'B'})", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesCreated != 2 || sum.RelationshipsCreated != 1 || sum.PropertiesSet != 3 {
+		t.Fatalf("summary = %+v, want 2 nodes, 1 rel, 3 props", sum)
+	}
+
+	rows := collectRows(t, db,
+		"MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name AS a, b.name AS b, r.since AS since", nil)
+	if len(rows) != 1 {
+		t.Fatalf("read back %d rows, want 1", len(rows))
+	}
+	a, _ := rows[0]["a"].AsString()
+	b, _ := rows[0]["b"].AsString()
+	since, _ := rows[0]["since"].AsInt()
+	if a != "A" || b != "B" || since != 2020 {
+		t.Fatalf("row = a:%q b:%q since:%d, want A B 2020", a, b, since)
+	}
+}
+
+// TestExecCreatePerMatchedRow confirms a CREATE after a MATCH runs once per
+// matched row, giving each matched node a new neighbor.
+func TestExecCreatePerMatchedRow(t *testing.T) {
+	fsys := vfs.NewMem()
+	db, err := Open("permatch.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (:Person {name: 'A'}), (:Person {name: 'B'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sum, err := db.Exec("MATCH (p:Person) CREATE (p)-[:HAS]->(:Pet)", nil)
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if sum.NodesCreated != 2 || sum.RelationshipsCreated != 2 {
+		t.Fatalf("summary = %+v, want 2 nodes and 2 rels (one per matched person)", sum)
+	}
+	rows := collectRows(t, db, "MATCH (:Person)-[:HAS]->(pet:Pet) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 2 {
+		t.Fatalf("pet edges = %d, want 2", n)
+	}
+}
+
+// TestQueryRejectsWrites confirms Query refuses a write statement, directing the
+// caller to Exec, and that nothing is mutated.
+func TestQueryRejectsWrites(t *testing.T) {
+	fsys := vfs.NewMem()
+	db, err := Open("reject.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Query("CREATE (a:Person)", nil); err != ErrReadQuery {
+		t.Fatalf("Query on a write = %v, want ErrReadQuery", err)
+	}
+	rows := collectRows(t, db, "MATCH (p:Person) RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 0 {
+		t.Fatalf("a rejected write must not mutate, found %d nodes", n)
+	}
+}
+
+// TestExecCreatePersistsAcrossReopen confirms a committed CREATE survives closing
+// and reopening the database.
+func TestExecCreatePersistsAcrossReopen(t *testing.T) {
+	fsys := vfs.NewMem()
+	db, err := Open("persist.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE (a:Person {name: 'Grace'})", nil); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	db2, err := Open("persist.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db2.Close() }()
+	rows := collectRows(t, db2, "MATCH (p:Person) RETURN p.name AS name", nil)
+	if len(rows) != 1 {
+		t.Fatalf("after reopen, %d nodes, want 1", len(rows))
+	}
+	if name, _ := rows[0]["name"].AsString(); name != "Grace" {
+		t.Fatalf("name = %q, want Grace", name)
+	}
+}
+
+// TestExecOnClosed reports the closed-database error rather than panicking.
+func TestExecOnClosed(t *testing.T) {
+	fsys := vfs.NewMem()
+	db, err := Open("ec.gr", Options{VFS: fsys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE (a)", nil); err != ErrClosed {
+		t.Fatalf("exec on closed db = %v, want ErrClosed", err)
+	}
+}

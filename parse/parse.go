@@ -158,8 +158,10 @@ func (p *parser) singleQuery() (*ast.SingleQuery, error) {
 			c, err = p.unwindClause()
 		case lex.Return:
 			c, err = p.returnClause()
-		case lex.Create, lex.Merge, lex.Set, lex.Delete, lex.Detach, lex.Remove:
-			return nil, p.errAt(p.cur(), "write clauses are not supported in the M2 read path; they arrive in M3")
+		case lex.Create:
+			c, err = p.createClause()
+		case lex.Merge, lex.Set, lex.Delete, lex.Detach, lex.Remove:
+			return nil, p.errAt(p.cur(), "this write clause arrives in a later M3 milestone")
 		default:
 			return nil, p.errAt(p.cur(), "expected a clause (MATCH, OPTIONAL MATCH, WITH, UNWIND, RETURN), found "+p.cur().Kind.String())
 		}
@@ -238,6 +240,27 @@ func (p *parser) unwindClause() (*ast.Unwind, error) {
 		return nil, err
 	}
 	return &ast.Unwind{Pos: pos(start), Expr: e, Var: v.Text}, nil
+}
+
+// createClause parses CREATE followed by one or more comma-separated path
+// patterns. The patterns reuse the same grammar as MATCH; the binder rejects the
+// forms CREATE cannot express (a variable-length step, an undirected
+// relationship, a shortestPath wrapper).
+func (p *parser) createClause() (*ast.Create, error) {
+	start := p.cur()
+	p.advance() // CREATE
+	c := &ast.Create{Pos: pos(start)}
+	for {
+		pp, err := p.pathPattern()
+		if err != nil {
+			return nil, err
+		}
+		c.Patterns = append(c.Patterns, pp)
+		if !p.accept(lex.Comma) {
+			break
+		}
+	}
+	return c, nil
 }
 
 func (p *parser) returnClause() (*ast.Return, error) {

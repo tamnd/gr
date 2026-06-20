@@ -52,6 +52,8 @@ func (bd *builder) single(sq *ast.SingleQuery) Op {
 		switch cl := c.(type) {
 		case *ast.Match:
 			cur = bd.match(cl, cur, bound)
+		case *ast.Create:
+			cur = bd.create(cl, cur, bound)
 		case *ast.Unwind:
 			cur = &Unwind{Input: cur, Expr: cl.Expr, Var: cl.Var}
 			bound[cl.Var] = true
@@ -105,6 +107,91 @@ func (bd *builder) path(pp *ast.PathPattern, cur Op, bound map[string]bool) Op {
 		cur = &BindPath{Input: cur, Var: pp.Var, Elems: bd.pathElems(pp)}
 	}
 	return cur
+}
+
+// create lowers a CREATE clause into a single Create operator over the running
+// tree (a leading CREATE runs over a Unit row). Every pattern's new nodes and
+// relationships are folded into the one operator; a pattern element naming an
+// already-bound variable is a reference, not a creation. A named path is bound
+// above the operator from its element variables, exactly as in MATCH.
+func (bd *builder) create(c *ast.Create, cur Op, bound map[string]bool) Op {
+	if cur == nil {
+		cur = &Unit{}
+	}
+	cr := &Create{Input: cur}
+	for _, pp := range c.Patterns {
+		bd.lowerCreatePattern(pp, cr, bound)
+	}
+	var out Op = cr
+	for _, pp := range c.Patterns {
+		if pp.Var != "" {
+			out = &BindPath{Input: out, Var: pp.Var, Elems: bd.pathElems(pp)}
+			bound[pp.Var] = true
+		}
+	}
+	return out
+}
+
+// lowerCreatePattern folds one CREATE path pattern into the operator: each node is
+// created (unless already bound), then each step's relationship, oriented so From
+// points at To regardless of how the pattern was written.
+func (bd *builder) lowerCreatePattern(pp *ast.PathPattern, cr *Create, bound map[string]bool) {
+	start := bd.nodeName(pp.Start)
+	bd.addCreateNode(cr, pp.Start, start, bound)
+	prev := start
+	for _, step := range pp.Chain {
+		to := bd.nodeName(step.Node)
+		bd.addCreateNode(cr, step.Node, to, bound)
+		rel := bd.relName(step.Rel)
+		from, dst := prev, to
+		if step.Rel.Dir == ast.DirIn {
+			from, dst = to, prev
+		}
+		cr.Rels = append(cr.Rels, RelCreate{
+			Var:   rel,
+			From:  from,
+			To:    dst,
+			Type:  firstRef(bd.b.RelTypes(step.Rel)),
+			Props: bd.propSets(step.Rel.Properties),
+		})
+		bound[rel] = true
+		prev = to
+	}
+}
+
+// addCreateNode appends a node creation unless the variable is already bound, in
+// which case the pattern references an existing node and creates nothing.
+func (bd *builder) addCreateNode(cr *Create, np *ast.NodePattern, name string, bound map[string]bool) {
+	if bound[name] {
+		return
+	}
+	cr.Nodes = append(cr.Nodes, NodeCreate{
+		Var:    name,
+		Labels: bd.b.NodeLabels(np),
+		Props:  bd.propSets(np.Properties),
+	})
+	bound[name] = true
+}
+
+// propSets lowers a pattern's property map into resolved key/expression pairs.
+func (bd *builder) propSets(props []ast.PropEntry) []PropSet {
+	if len(props) == 0 {
+		return nil
+	}
+	out := make([]PropSet, len(props))
+	for i, pe := range props {
+		out[i] = PropSet{Key: bd.b.PropKey(pe.Key), Expr: pe.Value}
+	}
+	return out
+}
+
+// firstRef returns the first resolved name of a set, the single type a created
+// relationship carries (the binder guarantees CREATE names exactly one).
+func firstRef(refs []bind.NameRef) bind.NameRef {
+	if len(refs) == 0 {
+		return bind.NameRef{}
+	}
+	return refs[0]
 }
 
 // joinNode ensures a node variable is bound, scanning it (with its property-map

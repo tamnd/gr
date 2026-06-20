@@ -131,6 +131,48 @@ func TestPropertiesOfMap(t *testing.T) {
 	}
 }
 
+func TestPathFunctions(t *testing.T) {
+	// A path a-[r]->b-[s]->c, held as its alternating element sequence.
+	p := value.Path(value.Node(1), value.Rel(10), value.Node(2), value.Rel(11), value.Node(3))
+	e := &Env{Row: Row{"p": p}, Params: map[string]value.Value{}}
+
+	ns := evalExpr(t, "nodes(p)", e)
+	nl, ok := ns.AsList()
+	if !ok || len(nl) != 3 {
+		t.Fatalf("nodes(p): got %s, want 3 nodes", ns)
+	}
+	if id, _ := nl[0].AsNode(); id != 1 {
+		t.Fatalf("nodes(p)[0]: got %s, want node(1)", nl[0])
+	}
+	if id, _ := nl[2].AsNode(); id != 3 {
+		t.Fatalf("nodes(p)[2]: got %s, want node(3)", nl[2])
+	}
+
+	rs := evalExpr(t, "relationships(p)", e)
+	rl, ok := rs.AsList()
+	if !ok || len(rl) != 2 {
+		t.Fatalf("relationships(p): got %s, want 2 rels", rs)
+	}
+	if id, _ := rl[0].AsRel(); id != 10 {
+		t.Fatalf("relationships(p)[0]: got %s, want rel(10)", rl[0])
+	}
+
+	wantInt(t, "length(p)", e, 2)
+	wantNull(t, "nodes(null)", e)
+	wantNull(t, "relationships(null)", e)
+	wantNull(t, "length(null)", e)
+}
+
+func TestPathFunctionMisuse(t *testing.T) {
+	e := &Env{Row: Row{"n": value.Node(1)}, Params: map[string]value.Value{}}
+	for _, src := range []string{"nodes(n)", "relationships(1)"} {
+		q := mustExpr(t, src)
+		if _, err := Eval(q, e); err == nil {
+			t.Fatalf("%s: want type-misuse error, got none", src)
+		}
+	}
+}
+
 func TestEntityTypeMisuse(t *testing.T) {
 	e := entityEnv()
 	for _, src := range []string{"labels(r)", "type(n)", "keys(1)", "properties(1)"} {

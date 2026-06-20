@@ -224,6 +224,16 @@ func (bd *binder) match(m *ast.Match, sc scope) error {
 // type, and property-key names.
 func (bd *binder) bindPath(pp *ast.PathPattern, sc scope) error {
 	if pp.Var != "" {
+		// A named path materializes from its bound element variables in order
+		// (plan.BindPath). A variable-length step binds a relationship list, not a
+		// single relationship, and does not bind its intermediate nodes, so the
+		// element sequence is incomplete; reject it until the variable-length
+		// expand records the full walk (deliverable 8b follow-on).
+		for _, step := range pp.Chain {
+			if step.Rel.VarLen != nil {
+				return &Error{"named path over a variable-length relationship is not yet supported", pp.Line, pp.Col}
+			}
+		}
 		if err := bindVar(sc, pp.Var, vkPath, pp.Pos); err != nil {
 			return err
 		}

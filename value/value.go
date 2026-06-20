@@ -35,6 +35,13 @@ const (
 	// n = m structural equality, id(n), RETURN n (doc 02 §4.4, doc 09 §6).
 	TypeNode Type = 8
 	TypeRel  Type = 9
+
+	// TypePath is a runtime-only value: an alternating sequence of node and
+	// relationship handles, node, rel, node, ..., node, produced by a named path
+	// pattern (MATCH p = ...) and consumed by nodes(), relationships(), and
+	// length() (doc 02 §4.4, doc 09 §3.4, §7). Like the entity handles it is never
+	// stored as a property value, so it has no on-disk encoding.
+	TypePath Type = 10
 )
 
 func (t Type) String() string {
@@ -59,6 +66,8 @@ func (t Type) String() string {
 		return "NODE"
 	case TypeRel:
 		return "RELATIONSHIP"
+	case TypePath:
+		return "PATH"
 	default:
 		return "UNKNOWN(" + strconv.Itoa(int(t)) + ")"
 	}
@@ -117,6 +126,18 @@ func Map(m map[string]Value) Value {
 // import by holding the raw id, with the caller converting at the boundary.
 func Node(id uint64) Value { return Value{t: TypeNode, scalar: id} }
 func Rel(id uint64) Value  { return Value{t: TypeRel, scalar: id} }
+
+// Path builds a path value from its alternating elements: a node, then a
+// relationship and a node per traversal step. The caller guarantees the
+// alternation and that the sequence begins and ends with a node (a path has one
+// more node than relationship). The elements are held as one ordered sequence;
+// PathNodes and PathRels are the two projections that back nodes() and
+// relationships().
+func Path(elems ...Value) Value {
+	cp := make([]Value, len(elems))
+	copy(cp, elems)
+	return Value{t: TypePath, list: cp}
+}
 
 // Accessors.
 
@@ -190,6 +211,46 @@ func (v Value) AsRel() (uint64, bool) {
 	return v.scalar, true
 }
 
+// AsPath returns the path's alternating element sequence (node, rel, ..., node).
+func (v Value) AsPath() ([]Value, bool) {
+	if v.t != TypePath {
+		return nil, false
+	}
+	return v.list, true
+}
+
+// PathNodes returns the path's nodes, the even positions in the element sequence.
+func (v Value) PathNodes() []Value {
+	if v.t != TypePath {
+		return nil
+	}
+	out := make([]Value, 0, (len(v.list)+1)/2)
+	for i := 0; i < len(v.list); i += 2 {
+		out = append(out, v.list[i])
+	}
+	return out
+}
+
+// PathRels returns the path's relationships, the odd positions in the sequence.
+func (v Value) PathRels() []Value {
+	if v.t != TypePath {
+		return nil
+	}
+	out := make([]Value, 0, len(v.list)/2)
+	for i := 1; i < len(v.list); i += 2 {
+		out = append(out, v.list[i])
+	}
+	return out
+}
+
+// PathLen returns the path's length: its number of relationships.
+func (v Value) PathLen() int {
+	if v.t != TypePath {
+		return 0
+	}
+	return len(v.list) / 2
+}
+
 // Equal reports structural equality, used by tests and the storage round-trip
 // checks. Two nulls are equal here (this is value identity, not Cypher's
 // three-valued IS comparison, which lives in the expression evaluator).
@@ -218,7 +279,7 @@ func (v Value) Equal(o Value) bool {
 			}
 		}
 		return true
-	case TypeList:
+	case TypeList, TypePath:
 		if len(v.list) != len(o.list) {
 			return false
 		}
@@ -284,6 +345,12 @@ func (v Value) String() string {
 		return "node(" + strconv.FormatUint(v.scalar, 10) + ")"
 	case TypeRel:
 		return "rel(" + strconv.FormatUint(v.scalar, 10) + ")"
+	case TypePath:
+		parts := make([]string, len(v.list))
+		for i, e := range v.list {
+			parts[i] = e.String()
+		}
+		return "path[" + strings.Join(parts, ", ") + "]"
 	default:
 		return "?"
 	}

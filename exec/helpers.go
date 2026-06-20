@@ -182,6 +182,14 @@ func encodeValue(b *strings.Builder, v value.Value) {
 		id, _ := v.AsRel()
 		b.WriteByte('R')
 		b.WriteString(strconv.FormatUint(id, 10))
+	case value.TypePath:
+		elems, _ := v.AsPath()
+		b.WriteByte('P')
+		for _, e := range elems {
+			encodeValue(b, e)
+			b.WriteByte(',')
+		}
+		b.WriteByte('P')
 	}
 }
 

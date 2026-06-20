@@ -497,3 +497,26 @@ func TestEntityFunctions(t *testing.T) {
 	rows, _ = run(t, e, "MATCH (n:Person {name: 'Carol'}) RETURN properties(n).name AS name", nil)
 	eqStrings(t, strCol(rows, "name"), []string{"Carol"})
 }
+
+func TestNamedPath(t *testing.T) {
+	e, _ := graph(t)
+	// A two-hop named path Alice-KNOWS->?-KNOWS->? exists (Alice->Bob->Carol).
+	rows, _ := run(t, e, "MATCH p = (:Person {name: 'Alice'})-[:KNOWS]->()-[:KNOWS]->() RETURN length(p) AS len", nil)
+	if len(rows) != 1 {
+		t.Fatalf("want 1 two-hop path from Alice, got %d", len(rows))
+	}
+	if l, _ := rows[0]["len"].AsInt(); l != 2 {
+		t.Fatalf("length(p) = %s, want 2", rows[0]["len"])
+	}
+
+	// nodes(p) and relationships(p) of the one-hop paths from Alice.
+	rows, _ = run(t, e, "MATCH p = (:Person {name: 'Alice'})-[:KNOWS]->(b) RETURN size(nodes(p)) AS n, size(relationships(p)) AS r", nil)
+	for _, row := range rows {
+		if n, _ := row["n"].AsInt(); n != 2 {
+			t.Fatalf("size(nodes(p)) = %s, want 2", row["n"])
+		}
+		if r, _ := row["r"].AsInt(); r != 1 {
+			t.Fatalf("size(relationships(p)) = %s, want 1", row["r"])
+		}
+	}
+}

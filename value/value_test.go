@@ -55,3 +55,39 @@ func TestStringDeterministic(t *testing.T) {
 		t.Fatalf("map string = %q", got)
 	}
 }
+
+func TestPath(t *testing.T) {
+	p := Path(Node(1), Rel(10), Node(2), Rel(11), Node(3))
+	if p.Type() != TypePath {
+		t.Fatalf("type = %s, want PATH", p.Type())
+	}
+	nodes := p.PathNodes()
+	if len(nodes) != 3 {
+		t.Fatalf("PathNodes len = %d, want 3", len(nodes))
+	}
+	if id, _ := nodes[2].AsNode(); id != 3 {
+		t.Fatalf("PathNodes[2] = %s, want node(3)", nodes[2])
+	}
+	rels := p.PathRels()
+	if len(rels) != 2 {
+		t.Fatalf("PathRels len = %d, want 2", len(rels))
+	}
+	if id, _ := rels[0].AsRel(); id != 10 {
+		t.Fatalf("PathRels[0] = %s, want rel(10)", rels[0])
+	}
+	if p.PathLen() != 2 {
+		t.Fatalf("PathLen = %d, want 2", p.PathLen())
+	}
+	// A single-node path (zero length) has one node and no relationships.
+	z := Path(Node(7))
+	if z.PathLen() != 0 || len(z.PathNodes()) != 1 || len(z.PathRels()) != 0 {
+		t.Fatalf("single-node path shape wrong: len=%d nodes=%d rels=%d", z.PathLen(), len(z.PathNodes()), len(z.PathRels()))
+	}
+	// Equality is structural over the element sequence.
+	if !p.Equal(Path(Node(1), Rel(10), Node(2), Rel(11), Node(3))) {
+		t.Fatal("equal paths should compare equal")
+	}
+	if p.Equal(z) {
+		t.Fatal("different paths should not compare equal")
+	}
+}

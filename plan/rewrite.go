@@ -53,6 +53,14 @@ func rebuildChildren(o Op) (Op, bool) {
 			return x, false
 		}
 		return &Filter{Input: in, Pred: x.Pred}, true
+	case *BindPath:
+		in, ch := apply(x.Input)
+		if !ch {
+			return x, false
+		}
+		y := *x
+		y.Input = in
+		return &y, true
 	case *Project:
 		in, ch := apply(x.Input)
 		if !ch {

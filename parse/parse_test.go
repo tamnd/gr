@@ -99,6 +99,12 @@ func sexpr(n any) string {
 			kw = "detach-delete"
 		}
 		return "(" + kw + " " + strings.Join(parts, " ") + ")"
+	case *ast.Foreach:
+		parts := make([]string, len(x.Body))
+		for i, c := range x.Body {
+			parts[i] = sexpr(c)
+		}
+		return "(foreach " + x.Var + " in " + sexpr(x.List) + " " + strings.Join(parts, " ") + ")"
 	case *ast.PathPattern:
 		s := "(path"
 		if x.Var != "" {
@@ -486,11 +492,48 @@ func TestParseMerge(t *testing.T) {
 // TestParseMergeErrors confirms malformed MERGE clauses are rejected.
 func TestParseMergeErrors(t *testing.T) {
 	bad := []string{
-		"MERGE (a), (b)",                    // MERGE takes a single pattern
-		"MERGE (a) ON SET a.x = 1",          // ON without CREATE/MATCH
-		"MERGE (a) ON CREATE a.x = 1",       // ON CREATE without SET
-		"MERGE (a) ON CREATE SET",           // SET with no item
-		"MERGE",                             // no pattern
+		"MERGE (a), (b)",              // MERGE takes a single pattern
+		"MERGE (a) ON SET a.x = 1",    // ON without CREATE/MATCH
+		"MERGE (a) ON CREATE a.x = 1", // ON CREATE without SET
+		"MERGE (a) ON CREATE SET",     // SET with no item
+		"MERGE",                       // no pattern
+	}
+	for _, src := range bad {
+		if _, err := parse.Parse(src); err == nil {
+			t.Fatalf("Parse(%q): expected an error, got none", src)
+		}
+	}
+}
+
+// TestParseForeach confirms the FOREACH loop parses, with its loop variable, list
+// expression, and write-only body, including nesting and a leading list literal.
+func TestParseForeach(t *testing.T) {
+	check(t, "FOREACH (x IN [1, 2, 3] | CREATE (:N {v: x}))",
+		`(query (foreach x in (list 1 2 3) (create (path (node :N {v:x})))))`)
+	check(t, "MATCH (a) FOREACH (n IN nodes | SET n.seen = true)",
+		`(query (match (path (node a))) (foreach n in nodes (set (prop n.seen true))))`)
+	check(t, "FOREACH (x IN [1, 2] | CREATE (a:N) SET a.v = x)",
+		`(query (foreach x in (list 1 2) (create (path (node a :N))) (set (prop a.v x))))`)
+	check(t, "FOREACH (x IN list | MERGE (:N {v: x}))",
+		`(query (foreach x in list (merge (path (node :N {v:x})))))`)
+	check(t, "FOREACH (row IN rows | FOREACH (c IN row | CREATE (:N {v: c})))",
+		`(query (foreach row in rows (foreach c in row (create (path (node :N {v:c}))))))`)
+	check(t, "MATCH (a) FOREACH (x IN [1] | DELETE a)",
+		`(query (match (path (node a))) (foreach x in (list 1) (delete a)))`)
+}
+
+// TestParseForeachErrors confirms malformed FOREACH clauses are rejected, above
+// all a body holding a read clause (the body is write-only, doc 13 §10.2).
+func TestParseForeachErrors(t *testing.T) {
+	bad := []string{
+		"FOREACH (x IN [1, 2] | RETURN x)",  // body must be write-only
+		"FOREACH (x IN [1, 2] | MATCH (a))", // body must be write-only
+		"FOREACH (x IN [1, 2] | WITH x)",    // body must be write-only
+		"FOREACH (x IN [1, 2])",             // missing | and body
+		"FOREACH (x IN [1, 2] | )",          // empty body
+		"FOREACH (x [1, 2] | CREATE (a))",   // missing IN
+		"FOREACH ([1, 2] | CREATE (a))",     // missing loop variable
+		"FOREACH x IN [1, 2] | CREATE (a)",  // missing parentheses
 	}
 	for _, src := range bad {
 		if _, err := parse.Parse(src); err == nil {

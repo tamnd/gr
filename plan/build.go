@@ -62,6 +62,8 @@ func (bd *builder) single(sq *ast.SingleQuery) Op {
 			cur = bd.remove(cl, cur)
 		case *ast.Delete:
 			cur = bd.deleteClause(cl, cur)
+		case *ast.Foreach:
+			cur = bd.foreach(cl, cur, bound)
 		case *ast.Unwind:
 			cur = &Unwind{Input: cur, Expr: cl.Expr, Var: cl.Var}
 			bound[cl.Var] = true
@@ -257,6 +259,55 @@ func (bd *builder) mergeMatch(pp *ast.PathPattern, outer map[string]bool) Op {
 	}
 	if pp.Var != "" {
 		cur = &BindPath{Input: cur, Var: pp.Var, Elems: bd.pathElems(pp)}
+	}
+	return cur
+}
+
+// foreach lowers a FOREACH clause (doc 13 §10) into a Foreach operator over the
+// running tree (a leading FOREACH runs over a Unit row). The clause is a
+// write-only loop: FOREACH (x IN list | writes) runs the writes once per list
+// element. It lowers to a correlated write sub-plan rooted on an Argument carrying
+// the outer scope and an Unwind of the list that binds the loop variable, with the
+// body's write operators stacked on top. The Argument is fed the current outer row
+// each time foreachOp reopens the sub-plan. The body's bindings stay inside that
+// sub-plan and never reach the surrounding query (§10.3), so nothing is added to
+// the outer scope.
+func (bd *builder) foreach(f *ast.Foreach, cur Op, bound map[string]bool) Op {
+	if cur == nil {
+		cur = &Unit{}
+	}
+	outer := copyBound(bound)
+	var body Op
+	if len(outer) > 0 {
+		body = &Argument{Vars: sortedKeys(outer)}
+	}
+	body = &Unwind{Input: body, Expr: f.List, Var: f.Var}
+	inner := copyBound(outer)
+	inner[f.Var] = true
+	for _, c := range f.Body {
+		body = bd.foreachBody(c, body, inner)
+	}
+	return &Foreach{Input: cur, Body: body}
+}
+
+// foreachBody lowers one clause inside a FOREACH body, threading the running
+// sub-plan and the loop's inner scope. The body allows only write clauses (the
+// binder rejects the rest, doc 13 §10.2), each lowered with the same builder the
+// top level uses; a nested FOREACH recurses.
+func (bd *builder) foreachBody(c ast.Clause, cur Op, bound map[string]bool) Op {
+	switch cl := c.(type) {
+	case *ast.Create:
+		return bd.create(cl, cur, bound)
+	case *ast.Merge:
+		return bd.merge(cl, cur, bound)
+	case *ast.Set:
+		return bd.set(cl, cur)
+	case *ast.Remove:
+		return bd.remove(cl, cur)
+	case *ast.Delete:
+		return bd.deleteClause(cl, cur)
+	case *ast.Foreach:
+		return bd.foreach(cl, cur, bound)
 	}
 	return cur
 }

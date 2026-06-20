@@ -185,6 +185,16 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 			return nil, nil, err
 		}
 		return &mergeOp{spec: x, input: input, match: match, args: args}, nil, nil
+	case *plan.Foreach:
+		input, err := compile(x.Input)
+		if err != nil {
+			return nil, nil, err
+		}
+		body, args, err := compileInner(x.Body)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &foreachOp{input: input, body: body, args: args}, nil, nil
 	case *plan.Set:
 		input, err := compile(x.Input)
 		if err != nil {

@@ -254,6 +254,10 @@ func (db *DB) internWriteNames(q *ast.Query) error {
 				if err := db.internSetNames(cl); err != nil {
 					return err
 				}
+			case *ast.Foreach:
+				if err := db.internForeachNames(cl); err != nil {
+					return err
+				}
 			}
 			// REMOVE interns nothing: an unknown label or key names no stored
 			// element, so it stays unresolved and removes nothing rather than
@@ -305,6 +309,35 @@ func (db *DB) internMergeNames(m *ast.Merge) error {
 		return err
 	}
 	return db.internSetItemNames(m.OnMatch)
+}
+
+// internForeachNames interns the static names a FOREACH body introduces. The body
+// holds only write clauses (doc 13 §10.2); each is interned like its top-level
+// form, and a nested FOREACH recurses. REMOVE and DELETE introduce no names.
+func (db *DB) internForeachNames(f *ast.Foreach) error {
+	for _, c := range f.Body {
+		switch cl := c.(type) {
+		case *ast.Create:
+			for _, pp := range cl.Patterns {
+				if err := db.internPatternNames(pp); err != nil {
+					return err
+				}
+			}
+		case *ast.Merge:
+			if err := db.internMergeNames(cl); err != nil {
+				return err
+			}
+		case *ast.Set:
+			if err := db.internSetNames(cl); err != nil {
+				return err
+			}
+		case *ast.Foreach:
+			if err := db.internForeachNames(cl); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // internPatternNames interns the names of one CREATE path pattern: each node's
@@ -362,7 +395,7 @@ func queryHasWrites(q *ast.Query) bool {
 	for _, sq := range singleQueries(q) {
 		for _, c := range sq.Clauses {
 			switch c.(type) {
-			case *ast.Create, *ast.Merge, *ast.Set, *ast.Remove, *ast.Delete:
+			case *ast.Create, *ast.Merge, *ast.Set, *ast.Remove, *ast.Delete, *ast.Foreach:
 				return true
 			}
 		}

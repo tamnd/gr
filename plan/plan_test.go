@@ -370,6 +370,48 @@ func TestBuildMergeCorrelatedProperty(t *testing.T) {
 	eq(t, "raw", String(Build(b)), want)
 }
 
+func TestBuildForeach(t *testing.T) {
+	// A leading FOREACH runs over a Unit. The body is a correlated write sub-plan:
+	// an Unwind of the list binds the loop variable, with the create stacked on top.
+	// With no outer scope the Unwind needs no Argument leaf.
+	b := bound(t, "FOREACH (x IN [1, 2, 3] | CREATE (n:Person {age: x}))")
+	want := `Foreach
+  Unit
+  Create (n:#1 {#2: x})
+    Unwind [1, 2, 3] AS x
+`
+	eq(t, "raw", String(Build(b)), want)
+	eq(t, "normalized", String(Plan(b)), want)
+}
+
+func TestBuildForeachAfterMatch(t *testing.T) {
+	// a is already bound, so the body sub-plan roots on an Argument carrying it; the
+	// Unwind binds the loop variable and the SET updates the outer node per element.
+	b := bound(t, "MATCH (a:Person) FOREACH (x IN [1, 2] | SET a.age = x)")
+	want := `Foreach
+  NodeScan a:#1
+  Set a.#2 = x
+    Unwind [1, 2] AS x
+      Argument [a]
+`
+	eq(t, "raw", String(Build(b)), want)
+}
+
+func TestBuildForeachNested(t *testing.T) {
+	// A nested FOREACH is the body of the outer one, a Cartesian product of the two
+	// loops; the inner body sees the outer loop variable through its Argument.
+	b := bound(t, "FOREACH (r IN [1] | FOREACH (c IN [2] | CREATE (n:Person {age: r})))")
+	want := `Foreach
+  Unit
+  Foreach
+    Unwind [1] AS r
+    Create (n:#1 {#2: r})
+      Unwind [2] AS c
+        Argument [r]
+`
+	eq(t, "raw", String(Build(b)), want)
+}
+
 func TestBuildShortestPath(t *testing.T) {
 	b := bound(t, "MATCH (a:Person), (b:Person) MATCH p = shortestPath((a)-[:KNOWS*]-(b)) RETURN p")
 	want := `Project p

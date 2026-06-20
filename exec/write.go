@@ -263,6 +263,103 @@ func (o *mergeOp) mergeRow(outer eval.Row) error {
 
 func (o *mergeOp) close() error { return o.input.close() }
 
+// foreachOp executes a FOREACH clause (doc 13 §10). FOREACH is a write-only loop:
+// FOREACH (x IN list | writes) runs the body's writes once per list element. For
+// each input row it feeds the outer bindings to the body sub-plan (an Argument
+// carrying the outer scope, an Unwind that binds the loop variable per element,
+// then the body's write operators), drains and discards the body's rows for their
+// side effects, and passes the input row on unchanged. The body's bindings stay
+// inside the sub-plan and never reach the surrounding query (doc 13 §10.3), so the
+// output row is exactly the input row.
+//
+// Like mergeOp and deleteOp the operator buffers its whole input before any write,
+// the Eager barrier a write loop needs so the body cannot feed its own later
+// iterations through a lazy input scan (doc 13 §10, the Halloween problem). Within
+// the batch the body runs live, so a later row sees what an earlier row wrote
+// (read-your-writes). The planner will grow a general write-path Eager pass later
+// (doc 11 §10); until then the barrier lives here.
+type foreachOp struct {
+	input operator
+	body  operator
+	args  []*argumentOp
+	ctx   *Ctx
+
+	out   []eval.Row
+	pos   int
+	built bool
+}
+
+func (o *foreachOp) open(ctx *Ctx) error {
+	o.ctx = ctx
+	o.out = nil
+	o.pos = 0
+	o.built = false
+	return o.input.open(ctx)
+}
+
+func (o *foreachOp) next() (eval.Row, bool, error) {
+	if !o.built {
+		if err := o.build(); err != nil {
+			return nil, false, err
+		}
+		o.built = true
+	}
+	if o.pos >= len(o.out) {
+		return nil, false, nil
+	}
+	row := o.out[o.pos]
+	o.pos++
+	return row, true, nil
+}
+
+// build reads the whole input (the Eager barrier, see the type comment), then runs
+// the body once per row and passes each input row through unchanged.
+func (o *foreachOp) build() error {
+	var rows []eval.Row
+	for {
+		in, ok, err := o.input.next()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+		rows = append(rows, in)
+	}
+	for _, outer := range rows {
+		if err := o.runRow(outer); err != nil {
+			return err
+		}
+		o.out = append(o.out, outer)
+	}
+	return nil
+}
+
+// runRow runs the body sub-plan for one outer row: it feeds the outer bindings to
+// the body's Argument leaves, opens the body, drains every row for its write side
+// effects, and discards them (FOREACH returns nothing, doc 13 §10.1).
+func (o *foreachOp) runRow(outer eval.Row) error {
+	for _, a := range o.args {
+		a.bound = restrict(outer, a.vars)
+	}
+	if err := o.body.open(o.ctx); err != nil {
+		return err
+	}
+	for {
+		_, ok, err := o.body.next()
+		if err != nil {
+			o.body.close()
+			return err
+		}
+		if !ok {
+			break
+		}
+	}
+	return o.body.close()
+}
+
+func (o *foreachOp) close() error { return o.input.close() }
+
 // setOp executes a SET clause (doc 13 §6). For each input row it applies every
 // update item to the bound element in order and passes the row on unchanged (SET
 // binds nothing new). A property assignment to a non-null value always counts a

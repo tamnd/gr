@@ -291,6 +291,36 @@ func TestBindMerge(t *testing.T) {
 	}
 }
 
+func TestBindForeach(t *testing.T) {
+	// FOREACH is a write clause: a query may end with it, with no RETURN.
+	mustBind(t, "FOREACH (x IN [1, 2, 3] | CREATE (:Person {name: 'a'}))")
+	// The loop variable is in scope for the body.
+	mustBind(t, "FOREACH (x IN [1, 2] | CREATE (n:Person {age: x}))")
+	// The body may reference outer variables.
+	mustBind(t, "MATCH (a:Person) FOREACH (x IN [1] | SET a.age = x)")
+	// The list expression is bound against the outer scope.
+	mustBind(t, "MATCH (a:Person) FOREACH (x IN a.name | SET a.age = x)")
+	// A body may hold several write clauses, including MERGE and a nested FOREACH.
+	mustBind(t, "FOREACH (x IN [1, 2] | CREATE (n:Person) SET n.age = x)")
+	mustBind(t, "FOREACH (r IN [1] | FOREACH (c IN [2] | CREATE (:Person {age: r})))")
+	// The loop variable does not leak past the clause (doc 13 §10.3).
+	if _, err := bindStr(t, "FOREACH (x IN [1, 2] | CREATE (:Person)) RETURN x", false); err == nil {
+		t.Fatal("FOREACH loop variable should not leak to a following clause")
+	}
+	// A body binding does not leak either.
+	if _, err := bindStr(t, "FOREACH (x IN [1] | CREATE (n:Person)) RETURN n", false); err == nil {
+		t.Fatal("a FOREACH body binding should not leak to a following clause")
+	}
+	// The body references only variables in scope.
+	if _, err := bindStr(t, "FOREACH (x IN [1] | SET a.age = x)", false); err == nil {
+		t.Fatal("SET of an unbound variable in a FOREACH body should be rejected")
+	}
+	// The list expression references only variables in scope.
+	if _, err := bindStr(t, "FOREACH (x IN ys | CREATE (:Person))", false); err == nil {
+		t.Fatal("an unbound list expression should be rejected")
+	}
+}
+
 func TestBindDelete(t *testing.T) {
 	// DELETE and DETACH DELETE bind their targets against bound variables.
 	mustBind(t, "MATCH (a) DELETE a")

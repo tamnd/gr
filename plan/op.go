@@ -230,6 +230,19 @@ type Merge struct {
 	OnMatch  []SetItem
 }
 
+// Foreach is the write operator for a FOREACH clause (doc 13 §10). FOREACH is a
+// write-only loop: FOREACH (x IN list | writes) runs the writes once per list
+// element. For each input row it runs Body, a correlated write sub-plan rooted on
+// an Argument carrying the outer scope and an Unwind of the list that binds the
+// loop variable per element, with the body's write operators stacked on top. It
+// then discards Body's rows and passes the input row on unchanged. FOREACH leaks
+// no bindings to the surrounding query (§10.3), so it adds nothing to the output
+// scope. Body may itself contain only write operators.
+type Foreach struct {
+	Input Op
+	Body  Op
+}
+
 // Col is one computed output column: an expression and the variable name it
 // binds (an alias, a carried variable name, or an implicit name).
 type Col struct {
@@ -314,6 +327,7 @@ type Union struct {
 func (*Unit) op()         {}
 func (*Create) op()       {}
 func (*Merge) op()        {}
+func (*Foreach) op()      {}
 func (*Set) op()          {}
 func (*Remove) op()       {}
 func (*Delete) op()       {}
@@ -356,6 +370,8 @@ func outputVars(o Op) map[string]bool {
 			s[v] = true
 		}
 		return s
+	case *Foreach:
+		return outputVars(x.Input)
 	case *Set:
 		return outputVars(x.Input)
 	case *Remove:
@@ -471,6 +487,10 @@ func write(b *strings.Builder, o Op, depth int) {
 		b.WriteString("Merge " + mergeLabel(x) + "\n")
 		write(b, x.Input, depth+1)
 		write(b, x.Match, depth+1)
+	case *Foreach:
+		b.WriteString("Foreach\n")
+		write(b, x.Input, depth+1)
+		write(b, x.Body, depth+1)
 	case *Set:
 		b.WriteString("Set " + setLabel(x) + "\n")
 		write(b, x.Input, depth+1)

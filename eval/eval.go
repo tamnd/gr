@@ -6,10 +6,11 @@
 // It is the read path's arithmetic core, consumed by the executor's Filter,
 // Project, and Sort operators (deliverable 6). It is strictly per-row and does
 // not aggregate: an aggregate (count, sum, collect …) is computed by the
-// Aggregate operator over a stream of rows, not here. Entity-shaped functions
-// that need reverse name resolution or path support (labels, type, properties,
-// keys, nodes, relationships) are deferred to the executor, which carries that
-// context; this package owns the value-level core.
+// Aggregate operator over a stream of rows, not here. The entity functions that
+// name a node's or relationship's catalog facts (labels, type, keys, properties)
+// live in entity.go and read through the Tx plus the reverse name resolvers on
+// the Env; the path functions (nodes, relationships) are deferred until the Path
+// value type lands with shortestPath (deliverable 8b).
 //
 // Evaluation distinguishes null from error. A comparison or arithmetic step over
 // a null operand yields null (three-valued logic); a genuine type misuse (adding
@@ -44,6 +45,13 @@ type Env struct {
 	Params  map[string]value.Value
 	Tx      engine.Tx
 	Resolve func(name string) (engine.Token, bool)
+	// LabelName, RelTypeName, and PropKeyName are the reverse resolvers: a catalog
+	// token to the name it interns. They back the entity functions labels(), type(),
+	// and keys()/properties() (doc 09 §7), which return names rather than tokens.
+	// They may be nil when no expression names an entity's labels, type, or keys.
+	LabelName   func(t engine.Token) (string, bool)
+	RelTypeName func(t engine.Token) (string, bool)
+	PropKeyName func(t engine.Token) (string, bool)
 }
 
 // Eval computes an expression against the environment. It returns a value (which

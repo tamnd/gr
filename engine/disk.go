@@ -453,6 +453,62 @@ func (t *diskTx) RelProperty(id RelID, key Token) (value.Value, error) {
 	return v, nil
 }
 
+func (t *diskTx) RelType(id RelID) (Token, error) {
+	defer t.rguard()()
+	pos, err := t.relPos(id)
+	if err != nil {
+		return 0, err
+	}
+	r, err := t.e.rels.Get(pos)
+	if err != nil {
+		return 0, err
+	}
+	return toTok(r.Type), nil
+}
+
+// NodePropertyKeys probes every property column for a snapshot-visible value at
+// the node's position; a key with a present value is one the node carries. The
+// candidate set is the columns that exist (a key never written has no column and
+// so can be on no node), which keeps this proportional to the schema, not the
+// catalog.
+func (t *diskTx) NodePropertyKeys(id NodeID) ([]Token, error) {
+	defer t.rguard()()
+	pos, err := t.nodePos(id)
+	if err != nil {
+		return nil, err
+	}
+	var out []Token
+	for _, k := range t.e.ncols.Keys() {
+		_, ok, err := t.snapNodeProp(pos, k)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, toTok(k))
+		}
+	}
+	return out, nil
+}
+
+func (t *diskTx) RelPropertyKeys(id RelID) ([]Token, error) {
+	defer t.rguard()()
+	pos, err := t.relPos(id)
+	if err != nil {
+		return nil, err
+	}
+	var out []Token
+	for _, k := range t.e.rcols.Keys() {
+		_, ok, err := t.snapRelProp(pos, k)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, toTok(k))
+		}
+	}
+	return out, nil
+}
+
 func (t *diskTx) ScanLabel(label Token, fn func(NodeID) error) error {
 	defer t.rguard()()
 	for pos := range uint64(t.e.nodes.Count()) {

@@ -24,6 +24,40 @@ const (
 	keySince  engine.Token = 3
 )
 
+// labelName, relTypeName, and propKeyName are the reverse resolvers (token to
+// name) the entity functions read; they invert the testCatalog tokens.
+func labelName(t engine.Token) (string, bool) {
+	switch t {
+	case lblPerson:
+		return "Person", true
+	case lblCity:
+		return "City", true
+	}
+	return "", false
+}
+
+func relTypeName(t engine.Token) (string, bool) {
+	switch t {
+	case typKnows:
+		return "KNOWS", true
+	case typLikes:
+		return "LIKES", true
+	}
+	return "", false
+}
+
+func propKeyName(t engine.Token) (string, bool) {
+	switch t {
+	case keyName:
+		return "name", true
+	case keyAge:
+		return "age", true
+	case keySince:
+		return "since", true
+	}
+	return "", false
+}
+
 // testCatalog resolves the names the test queries use to the tokens the test graph
 // is built with.
 type testCatalog struct{}
@@ -115,7 +149,14 @@ func run(t *testing.T, e *engine.MemEngine, cypher string, params map[string]val
 	if params == nil {
 		params = map[string]value.Value{}
 	}
-	cur, err := Open(root, &Ctx{Tx: tx, Params: params, Resolve: ResolverFromBound(b)})
+	cur, err := Open(root, &Ctx{
+		Tx:          tx,
+		Params:      params,
+		Resolve:     ResolverFromBound(b),
+		LabelName:   labelName,
+		RelTypeName: relTypeName,
+		PropKeyName: propKeyName,
+	})
 	if err != nil {
 		t.Fatalf("open %q: %v", cypher, err)
 	}
@@ -436,4 +477,23 @@ func TestVarLengthCycleTerminates(t *testing.T) {
 	// cannot be reused, so the walk stops. Two trails: to Ben, back to Ann.
 	rows, _ := run(t, e, "MATCH (a:Person {name: 'Ann'})-[:KNOWS*]->(b) RETURN b.name AS name", nil)
 	eqStrings(t, strCol(rows, "name"), []string{"Ann", "Ben"})
+}
+
+func TestEntityFunctions(t *testing.T) {
+	e, _ := graph(t)
+	// labels() names a node's labels through the reverse resolver.
+	rows, _ := run(t, e, "MATCH (n:Person {name: 'Alice'}) RETURN labels(n)[0] AS l", nil)
+	eqStrings(t, strCol(rows, "l"), []string{"Person"})
+
+	// type() names a relationship's type.
+	rows, _ = run(t, e, "MATCH (:Person {name: 'Alice'})-[r:KNOWS]->() RETURN type(r) AS t", nil)
+	eqStrings(t, strCol(rows, "t"), []string{"KNOWS", "KNOWS"})
+
+	// keys() returns a node's property keys, sorted.
+	rows, _ = run(t, e, "MATCH (n:Person {name: 'Bob'}) RETURN keys(n)[0] AS k", nil)
+	eqStrings(t, strCol(rows, "k"), []string{"age"})
+
+	// properties() returns a node's property map, read back through indexing.
+	rows, _ = run(t, e, "MATCH (n:Person {name: 'Carol'}) RETURN properties(n).name AS name", nil)
+	eqStrings(t, strCol(rows, "name"), []string{"Carol"})
 }

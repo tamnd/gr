@@ -39,11 +39,26 @@ type Ctx struct {
 	Tx      engine.Tx
 	Params  map[string]value.Value
 	Resolve func(name string) (engine.Token, bool)
+	// LabelName, RelTypeName, and PropKeyName are the reverse resolvers eval's
+	// entity functions need to name a token (doc 09 §7). They may be nil when the
+	// query names no entity labels, type, or keys; db.Query wires them from the
+	// engine's catalog (deliverable 9).
+	LabelName   func(t engine.Token) (string, bool)
+	RelTypeName func(t engine.Token) (string, bool)
+	PropKeyName func(t engine.Token) (string, bool)
 }
 
 // env builds the per-row evaluation environment from the context and a row.
 func (c *Ctx) env(row eval.Row) *eval.Env {
-	return &eval.Env{Row: row, Params: c.Params, Tx: c.Tx, Resolve: c.Resolve}
+	return &eval.Env{
+		Row:         row,
+		Params:      c.Params,
+		Tx:          c.Tx,
+		Resolve:     c.Resolve,
+		LabelName:   c.LabelName,
+		RelTypeName: c.RelTypeName,
+		PropKeyName: c.PropKeyName,
+	}
 }
 
 // ResolverFromBound builds a property-key resolver from a bound query: a name the

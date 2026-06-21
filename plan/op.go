@@ -54,6 +54,28 @@ type NodeScan struct {
 	Labels []bind.NameRef
 }
 
+// NodeIndexSeek produces nodes the way NodeScan does, but reaches them through a
+// declared property index instead of a label scan (doc 11 §6). Label is the
+// indexed label it seeks on, Rest the other labels the produced node must also
+// carry (residual-checked, like NodeScan's tail labels), Prop the indexed
+// property key, and Value the expression giving the sought value. Var names the
+// produced node binding.
+//
+// The seek is meaning-preserving only in concert with the equality Filter the
+// rewrite leaves above it: the index keys values by exact type (the integer 1 and
+// the float 1.0 are distinct keys) while Cypher equality is value equality across
+// numeric types, so the executor probes the index for a superset of the matches
+// (it double-probes the integral siblings of a numeric value and falls back to a
+// full label scan for a value it cannot key) and the retained Filter trims that
+// superset to exactly the rows the original NodeScan-plus-Filter produced.
+type NodeIndexSeek struct {
+	Var   string
+	Label bind.NameRef
+	Rest  []bind.NameRef
+	Prop  bind.NameRef
+	Value ast.Expr
+}
+
 // Expand traverses a relationship from already-bound source nodes to their
 // neighbors. From is the bound source variable, To the produced (or, when
 // ToBound, the already-bound) neighbor, Rel the produced relationship variable.
@@ -324,28 +346,29 @@ type Union struct {
 	All         bool
 }
 
-func (*Unit) op()         {}
-func (*Create) op()       {}
-func (*Merge) op()        {}
-func (*Foreach) op()      {}
-func (*Set) op()          {}
-func (*Remove) op()       {}
-func (*Delete) op()       {}
-func (*Argument) op()     {}
-func (*NodeScan) op()     {}
-func (*Expand) op()       {}
-func (*Filter) op()       {}
-func (*BindPath) op()     {}
-func (*ShortestPath) op() {}
-func (*Project) op()      {}
-func (*Aggregate) op()    {}
-func (*Join) op()         {}
-func (*Optional) op()     {}
-func (*Unwind) op()       {}
-func (*Sort) op()         {}
-func (*Skip) op()         {}
-func (*Limit) op()        {}
-func (*Union) op()        {}
+func (*Unit) op()          {}
+func (*Create) op()        {}
+func (*Merge) op()         {}
+func (*Foreach) op()       {}
+func (*Set) op()           {}
+func (*Remove) op()        {}
+func (*Delete) op()        {}
+func (*Argument) op()      {}
+func (*NodeScan) op()      {}
+func (*NodeIndexSeek) op() {}
+func (*Expand) op()        {}
+func (*Filter) op()        {}
+func (*BindPath) op()      {}
+func (*ShortestPath) op()  {}
+func (*Project) op()       {}
+func (*Aggregate) op()     {}
+func (*Join) op()          {}
+func (*Optional) op()      {}
+func (*Unwind) op()        {}
+func (*Sort) op()          {}
+func (*Skip) op()          {}
+func (*Limit) op()         {}
+func (*Union) op()         {}
 
 // outputVars returns the set of variable names an operator's rows carry. It is
 // the basis for predicate pushdown (a filter can move below an operator only if
@@ -385,6 +408,8 @@ func outputVars(o Op) map[string]bool {
 		}
 		return s
 	case *NodeScan:
+		return map[string]bool{x.Var: true}
+	case *NodeIndexSeek:
 		return map[string]bool{x.Var: true}
 	case *Expand:
 		s := outputVars(x.Input)
@@ -504,6 +529,8 @@ func write(b *strings.Builder, o Op, depth int) {
 		b.WriteString("Argument [" + strings.Join(x.Vars, ",") + "]\n")
 	case *NodeScan:
 		b.WriteString("NodeScan " + x.Var + labelSuffix(x.Labels) + "\n")
+	case *NodeIndexSeek:
+		b.WriteString("NodeIndexSeek " + seekLabel(x) + "\n")
 	case *Expand:
 		b.WriteString("Expand " + expandLabel(x) + "\n")
 		write(b, x.Input, depth+1)
@@ -575,6 +602,14 @@ func labelSuffix(labels []bind.NameRef) string {
 		}
 	}
 	return ":" + strings.Join(parts, "&")
+}
+
+// seekLabel renders a NodeIndexSeek: the bound variable with its indexed label
+// and any residual labels, then the indexed property and the sought value, as
+// "v:#label&#rest(#prop = expr)".
+func seekLabel(x *NodeIndexSeek) string {
+	labels := append([]bind.NameRef{x.Label}, x.Rest...)
+	return x.Var + labelSuffix(labels) + "(" + tokenLabel(x.Prop) + " = " + ast.Print(x.Value) + ")"
 }
 
 func expandLabel(x *Expand) string {

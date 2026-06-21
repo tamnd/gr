@@ -129,6 +129,50 @@ func TestQueryRejectsCreateIndex(t *testing.T) {
 	}
 }
 
+// TestExecIndexCrossTypeNumeric confirms the index access path honors Cypher's
+// cross-type numeric equality: a seek for the integer 1 still finds a node whose
+// indexed property was stored as the float 1.0, and the other way round.
+func TestExecIndexCrossTypeNumeric(t *testing.T) {
+	db := openMem(t, "ixnumeric.gr")
+	defer func() { _ = db.Close() }()
+
+	mustExec(t, db, "CREATE INDEX FOR (p:Person) ON (p.score)", nil)
+	mustExec(t, db, "CREATE (:Person {score: 1})", nil)
+	mustExec(t, db, "CREATE (:Person {score: 1.0})", nil)
+
+	// An integer probe matches both the integer and the float node.
+	rows := collectRows(t, db, "MATCH (p:Person) WHERE p.score = 1 RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 2 {
+		t.Fatalf("count for score = 1 is %d, want 2", n)
+	}
+	// A float probe matches both as well.
+	rows = collectRows(t, db, "MATCH (p:Person) WHERE p.score = 1.0 RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 2 {
+		t.Fatalf("count for score = 1.0 is %d, want 2", n)
+	}
+	// A different value matches neither.
+	rows = collectRows(t, db, "MATCH (p:Person) WHERE p.score = 2 RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 0 {
+		t.Fatalf("count for score = 2 is %d, want 0", n)
+	}
+}
+
+// TestExecIndexResidualLabel confirms a seek on one indexed label still residual-
+// checks the node's other required labels.
+func TestExecIndexResidualLabel(t *testing.T) {
+	db := openMem(t, "ixresidual.gr")
+	defer func() { _ = db.Close() }()
+
+	mustExec(t, db, "CREATE INDEX FOR (p:Person) ON (p.email)", nil)
+	mustExec(t, db, "CREATE (:Person:Admin {email: 'a@x'})", nil)
+	mustExec(t, db, "CREATE (:Person {email: 'a@x'})", nil)
+
+	rows := collectRows(t, db, "MATCH (p:Person:Admin) WHERE p.email = 'a@x' RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 1 {
+		t.Fatalf("count for Person:Admin with email a@x is %d, want 1", n)
+	}
+}
+
 // TestExecIndexParamValue confirms an index-eligible query still works when the
 // sought value comes from a parameter.
 func TestExecIndexParamValue(t *testing.T) {

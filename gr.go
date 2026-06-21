@@ -621,9 +621,20 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	entry := &plan.Entry{Bound: b, Op: plan.Plan(b)}
+	op := plan.SeekRewrite(plan.Plan(b), b, indexLookup{db.eng})
+	entry := &plan.Entry{Bound: b, Op: op}
 	db.cache.Put(key, entry)
 	return entry, nil
+}
+
+// indexLookup adapts the engine to the planner's IndexLookup seam, mapping the
+// planner's raw token integers to the engine's Token type. The plan cache keys on
+// the catalog version, which bumps on an index add or drop, so a plan built from
+// these answers is invalidated when an index appears or disappears.
+type indexLookup struct{ eng *engine.DiskEngine }
+
+func (ix indexLookup) HasNodeIndex(label, prop uint32) bool {
+	return ix.eng.HasNodeIndex(engine.Token(label), engine.Token(prop))
 }
 
 // tokenNamer returns a reverse resolver for one catalog kind: a token to the name

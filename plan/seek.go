@@ -31,13 +31,23 @@ type IndexLookup interface {
 // for a value it cannot key), and the retained filter chain trims that superset
 // to exactly the original result. A tree with no index available, or no eligible
 // equality, is returned unchanged.
-func SeekRewrite(o Op, b *bind.Bound, ix IndexLookup) Op {
+//
+// st is the cost model's statistics, and it drives the access-path choice when a
+// scan has more than one usable index (doc 11 §3): among the eligible seeks, the
+// rewrite picks the one the cost model estimates produces the fewest rows, so it
+// seeks on the most selective index rather than the first one it happens to find.
+// With nil statistics it falls back to the first eligible index, the structural
+// choice it made before the cost model existed. The choice is performance only,
+// never correctness: every eligible seek is meaning-preserving with its retained
+// filter chain, so a different pick changes how fast the plan runs, not what it
+// returns.
+func SeekRewrite(o Op, b *bind.Bound, ix IndexLookup, st Statistics) Op {
 	if ix == nil || b == nil {
 		return o
 	}
 	var rewrite func(Op) Op
 	rewrite = func(n Op) Op {
-		if seek, ok := trySeek(n, b, ix); ok {
+		if seek, ok := trySeek(n, b, ix, st); ok {
 			return seek
 		}
 		return mapChildren(n, rewrite)
@@ -50,7 +60,11 @@ func SeekRewrite(o Op, b *bind.Bound, ix IndexLookup) Op {
 // when an eligible equality and a matching index are found, and false otherwise
 // (leaving the caller to recurse structurally). The whole chain is returned, so
 // the caller does not recurse into it again.
-func trySeek(o Op, b *bind.Bound, ix IndexLookup) (Op, bool) {
+//
+// When several equalities and labels yield eligible seeks, it keeps the cheapest:
+// with statistics, the seek the cost model estimates produces the fewest rows;
+// without them, the first one found, the original structural order.
+func trySeek(o Op, b *bind.Bound, ix IndexLookup, st Statistics) (Op, bool) {
 	var preds []ast.Expr
 	cur := o
 	for {
@@ -65,6 +79,8 @@ func trySeek(o Op, b *bind.Bound, ix IndexLookup) (Op, bool) {
 	if !ok || len(scan.Labels) == 0 {
 		return nil, false
 	}
+	var best *NodeIndexSeek
+	var bestRows float64
 	for _, p := range preds {
 		key, val, ok := eqOnVar(p, scan.Var)
 		if !ok {
@@ -84,14 +100,37 @@ func trySeek(o Op, b *bind.Bound, ix IndexLookup) (Op, bool) {
 					rest = append(rest, other)
 				}
 			}
-			var res Op = &NodeIndexSeek{Var: scan.Var, Label: lab, Rest: rest, Prop: pref, Value: val}
-			for i := len(preds) - 1; i >= 0; i-- {
-				res = &Filter{Input: res, Pred: preds[i]}
+			seek := &NodeIndexSeek{Var: scan.Var, Label: lab, Rest: rest, Prop: pref, Value: val}
+			if best == nil {
+				best, bestRows = seek, estimateSeek(seek, st)
+				continue
 			}
-			return res, true
+			if st == nil {
+				continue // keep the first eligible seek, the structural choice
+			}
+			if rows := estimateSeek(seek, st); rows < bestRows {
+				best, bestRows = seek, rows
+			}
 		}
 	}
-	return nil, false
+	if best == nil {
+		return nil, false
+	}
+	var res Op = best
+	for i := len(preds) - 1; i >= 0; i-- {
+		res = &Filter{Input: res, Pred: preds[i]}
+	}
+	return res, true
+}
+
+// estimateSeek is the cost model's row estimate for a candidate seek, or zero when
+// no statistics are available (the no-stats path never compares estimates, so the
+// value is unused there).
+func estimateSeek(seek *NodeIndexSeek, st Statistics) float64 {
+	if st == nil {
+		return 0
+	}
+	return EstimateRows(seek, st)
 }
 
 // eqOnVar reports whether e is an equality between varName's property and a

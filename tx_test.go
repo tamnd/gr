@@ -145,17 +145,50 @@ func TestViewRejectsWrite(t *testing.T) {
 	}
 }
 
-// TestTxRunRejectsWrite confirms Run is the read entry point: a write statement
-// run through it returns ErrReadQuery, pointing the caller at Exec.
-func TestTxRunRejectsWrite(t *testing.T) {
+// TestRunWriteOnReadTxRejected confirms a write run through Run inside a read
+// transaction is rejected with ErrReadOnly.
+func TestRunWriteOnReadTxRejected(t *testing.T) {
 	db := openMem(t, "v3.gr")
 
-	err := db.Update(func(tx *Tx) error {
+	err := db.View(func(tx *Tx) error {
 		_, err := tx.Run("CREATE (:Person {name:'Ada'})", nil)
 		return err
 	})
-	if !errors.Is(err, ErrReadQuery) {
-		t.Fatalf("Run write error = %v, want ErrReadQuery", err)
+	if !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("Run write on read tx = %v, want ErrReadOnly", err)
+	}
+}
+
+// TestRunWriteReturnsRows confirms Run is the single read/write entry point: a
+// write with a RETURN streams its rows and reports its mutations through the
+// result's Summary, and the writes commit with the transaction.
+func TestRunWriteReturnsRows(t *testing.T) {
+	db := openMem(t, "v4.gr")
+
+	err := db.Update(func(tx *Tx) error {
+		res, err := tx.Run("CREATE (p:Person {name:$n}) RETURN p.name AS name",
+			map[string]value.Value{"n": value.String("Ada")})
+		if err != nil {
+			return err
+		}
+		defer func() { _ = res.Close() }()
+		row, ok, err := res.NextRow()
+		if err != nil || !ok {
+			t.Fatalf("write Run next: ok=%v err=%v", ok, err)
+		}
+		if name, _ := row["name"].AsString(); name != "Ada" {
+			t.Fatalf("returned name = %q, want Ada", name)
+		}
+		if s := res.Summary(); s.NodesCreated != 1 || s.PropertiesSet != 1 {
+			t.Fatalf("summary = %+v, want 1 node / 1 prop", s)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got := personCount(t, db); got != 1 {
+		t.Fatalf("after write Run, Person count = %d, want 1", got)
 	}
 }
 

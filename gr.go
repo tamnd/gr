@@ -11,6 +11,7 @@ package gr
 
 import (
 	"errors"
+	"strings"
 
 	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/bind"
@@ -38,6 +39,17 @@ var ErrReadQuery = errors.New("gr: Query is read-only; use Exec for a write stat
 // (CREATE CONSTRAINT, DROP CONSTRAINT); those run through Exec, which carries the
 // write transaction and reports the schema mutation in its summary.
 var ErrSchemaCommand = errors.New("gr: schema commands run through Exec, not Query")
+
+// ErrExplain is returned when an EXPLAIN statement reaches an entry point that
+// cannot carry a plan listing. EXPLAIN yields rows (the operator tree), so it runs
+// through Run or a transaction's Run, not through the row-less Exec or the
+// write-rejecting, cache-backed Query.
+var ErrExplain = errors.New("gr: EXPLAIN runs through Run, not Query or Exec")
+
+// ErrExplainSchema is returned by EXPLAIN of a schema command. A schema command
+// changes the catalog outside the operator pipeline (execSchema), so it has no plan
+// to render.
+var ErrExplainSchema = errors.New("gr: cannot EXPLAIN a schema command")
 
 // DB is an open gr database. It owns the storage engine, which owns the pager
 // over the underlying file; queries run against snapshots the engine hands out.
@@ -231,6 +243,9 @@ func (db *DB) Run(cypher string, params map[string]value.Value) (*Result, error)
 	if err != nil {
 		return nil, err
 	}
+	if q.Explain {
+		return db.explain(q, db.eng, indexLookup{db.eng})
+	}
 	if q.Schema != nil {
 		s, err := db.execSchema(q.Schema)
 		if err != nil {
@@ -307,6 +322,9 @@ func (db *DB) Exec(cypher string, params map[string]value.Value) (Summary, error
 	q, err := parse.Parse(cypher)
 	if err != nil {
 		return Summary{}, err
+	}
+	if q.Explain {
+		return Summary{}, ErrExplain
 	}
 	if q.Schema != nil {
 		return db.execSchema(q.Schema)
@@ -625,6 +643,11 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 	if err != nil {
 		return nil, err
 	}
+	if q.Explain {
+		// EXPLAIN returns a plan listing, which the cache-backed read path is not
+		// shaped to carry; it runs through Run (doc 25 §7.2).
+		return nil, ErrExplain
+	}
 	if q.Schema != nil {
 		return nil, ErrSchemaCommand
 	}
@@ -636,6 +659,48 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 	entry := &plan.Entry{Bound: b, Op: op}
 	db.cache.Put(key, entry)
 	return entry, nil
+}
+
+// explain binds and plans a statement without interning, executing, or otherwise
+// touching the database, then returns the operator tree as a result whose single
+// "plan" column lists one operator per row (doc 25 §7.2). It is side-effect free
+// for a write statement as much as a read: the write's plan is rendered, never run,
+// so EXPLAIN CREATE shows the plan and creates nothing. A schema command has no
+// operator plan, so EXPLAIN of one is rejected.
+//
+// cat is the catalog the bind resolves names against and ix the index oracle the
+// seek rewrite consults. The auto-commit path passes the engine and its index
+// lookup; a write transaction, which already holds the engine lock, passes its own
+// catalog view and a nil ix to skip the seek rewrite, exactly as its execution path
+// does, so EXPLAIN inside a write transaction cannot deadlock against the lock the
+// transaction holds.
+func (db *DB) explain(q *ast.Query, cat bind.TokenResolver, ix plan.IndexLookup) (*Result, error) {
+	if q.Schema != nil {
+		return nil, ErrExplainSchema
+	}
+	b, err := bind.Bind(q, bind.NewEngineCatalog(cat), false)
+	if err != nil {
+		return nil, err
+	}
+	op := plan.Plan(b)
+	if ix != nil {
+		op = plan.SeekRewrite(op, b, ix)
+	}
+	return explainResult(op), nil
+}
+
+// explainResult renders an operator tree into a streaming result: one column named
+// "plan" and one row per line of the tree, so a caller iterates the listing the way
+// it iterates any other result. The trailing newline is trimmed so the listing has
+// no blank final row.
+func explainResult(op plan.Op) *Result {
+	text := strings.TrimRight(plan.String(op), "\n")
+	lines := strings.Split(text, "\n")
+	buf := make([]eval.Row, len(lines))
+	for i, ln := range lines {
+		buf[i] = eval.Row{"plan": value.String(ln)}
+	}
+	return &Result{cols: []string{"plan"}, buf: buf}
 }
 
 // indexLookup adapts the engine to the planner's IndexLookup seam, mapping the

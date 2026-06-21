@@ -23,12 +23,22 @@ func Build(b *bind.Bound) Op {
 	return left
 }
 
-// Plan is the read path's full planning output: build the raw logical tree,
-// apply the rule-based planner subset (anchor and direction choice, doc 11 §3,
-// §6 simple form), then normalize to canonical form. In M2 this is the whole
-// planner; the cost-based planner that would replace Optimize is M4 (doc 10
-// §8.1).
-func Plan(b *bind.Bound) Op { return Normalize(Optimize(Build(b))) }
+// Plan is the structural planning output: build the raw logical tree, apply the
+// rule-based planner subset (anchor and direction choice on the structural proxy,
+// doc 11 §3, §6 simple form), then normalize to canonical form. It is a pure
+// function of the bound query, with no statistics, so it is the stable shape the
+// planner golden tests assert against. The read path calls [PlanWithStats] to
+// drive the same choices on cost instead (doc 10 §8.1).
+func Plan(b *bind.Bound) Op { return PlanWithStats(b, nil) }
+
+// PlanWithStats is Plan with a cost model: Optimize orders each linear chain's
+// anchor and expand direction by estimated cardinality rather than the structural
+// proxy (doc 11 §3, §4). With nil statistics it is exactly Plan, so the two share
+// one path and the structural choice is the cost path's fallback, not a separate
+// planner.
+func PlanWithStats(b *bind.Bound, st Statistics) Op {
+	return Normalize(Optimize(Build(b), st))
+}
 
 // builder carries the per-build state: the bound query (for resolved tokens) and
 // the counter that names anonymous pattern elements.

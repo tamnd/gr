@@ -196,6 +196,42 @@ func TestExplainCostPicksRarerIndex(t *testing.T) {
 	}
 }
 
+// TestExplainCostAnchorsRarerEnd is the end-to-end discriminator for cost-based join
+// ordering: a linear pattern with two labeled ends anchors its scan on the rarer end,
+// not the leftmost one. The pattern lists Common before Rare, so the structural rule
+// ties on label and keeps the leftmost anchor; with Common abundant and Rare scarce,
+// the cost model anchors on Rare and reverses the expand, and EXPLAIN shows the scan
+// landed on the rare end.
+func TestExplainCostAnchorsRarerEnd(t *testing.T) {
+	db := openMem(t, "explaincostanchor.gr")
+	defer func() { _ = db.Close() }()
+
+	// One Rare node and five Common nodes, with one link between them, so Rare is the
+	// far smaller scan.
+	mustExec(t, db, "CREATE (c:Common)-[:LINK]->(r:Rare)", nil)
+	for range 4 {
+		mustExec(t, db, "CREATE (:Common)", nil)
+	}
+
+	rare, ok := db.eng.Lookup(catalog.KindLabel, "Rare")
+	if !ok {
+		t.Fatal("Rare label was not interned")
+	}
+	common, ok := db.eng.Lookup(catalog.KindLabel, "Common")
+	if !ok {
+		t.Fatal("Common label was not interned")
+	}
+
+	plan := planText(t, db, "EXPLAIN MATCH (a:Common)-[:LINK]->(b:Rare) RETURN a")
+	wantScan := fmt.Sprintf("NodeScan b:#%d", rare)
+	if !strings.Contains(plan, wantScan) {
+		t.Fatalf("cost model did not anchor on the rarer end:\n%s\nwant %q", plan, wantScan)
+	}
+	if strings.Contains(plan, fmt.Sprintf("NodeScan a:#%d", common)) {
+		t.Fatalf("cost model anchored on the abundant Common end:\n%s", plan)
+	}
+}
+
 // TestExplainRejectsSchemaCommand confirms EXPLAIN of a schema command is an error:
 // a schema command changes the catalog outside the operator pipeline, so it has no
 // plan to render.

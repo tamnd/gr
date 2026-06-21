@@ -147,6 +147,29 @@ func EstimateRows(o Op, st Statistics) float64 {
 	}
 }
 
+// planCost is the metric the planner orders whole plans by: the sum of the row
+// estimates of every operator in the tree, the total number of rows that flow
+// through the plan (doc 11 §3, §4). It is the right metric for join and expand
+// ordering, where the final cardinality alone is blind to the choice. A linear
+// scan/expand chain produces the same final row count whichever node it anchors
+// at, since reversing an expand keeps the same types and end labels, so two
+// orderings of one chain tie on EstimateRows of the root. They differ in the
+// intermediate sizes: anchoring at the rarest node keeps every partial result
+// small, and that difference is exactly the sum of the per-operator estimates.
+//
+// It is a pure function of the tree and the statistics, computed by adding each
+// operator's own estimate to the cost of its children, so a deeper or wider tree
+// costs more, as it should. With nil statistics every estimate collapses to the
+// same constant, so the metric stops discriminating and the caller falls back to
+// its structural choice.
+func planCost(o Op, st Statistics) float64 {
+	cost := EstimateRows(o, st)
+	for _, c := range nodeChildren(o) {
+		cost += planCost(c, st)
+	}
+	return cost
+}
+
 // scanRows estimates a node scan's output. An all-nodes scan (no labels) is the
 // whole node count; a labeled scan is the smallest of its labels' counts, since a
 // node carrying every label is at most as common as its rarest one. An unknown

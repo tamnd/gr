@@ -655,7 +655,8 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	op := plan.SeekRewrite(plan.Plan(b), b, indexLookup{db.eng}, engineStats{db.eng})
+	st := engineStats{db.eng}
+	op := plan.SeekRewrite(plan.PlanWithStats(b, st), b, indexLookup{db.eng}, st)
 	entry := &plan.Entry{Bound: b, Op: op}
 	db.cache.Put(key, entry)
 	return entry, nil
@@ -684,7 +685,7 @@ func (db *DB) explain(q *ast.Query, cat bind.TokenResolver, ix plan.IndexLookup,
 	if err != nil {
 		return nil, err
 	}
-	op := plan.Plan(b)
+	op := plan.PlanWithStats(b, st)
 	if ix != nil {
 		op = plan.SeekRewrite(op, b, ix, st)
 	}

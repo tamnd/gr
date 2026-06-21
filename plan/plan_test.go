@@ -188,6 +188,31 @@ func TestNoReanchorWhenLeftmostBest(t *testing.T) {
 `)
 }
 
+func TestCostAnchorsRarerLabel(t *testing.T) {
+	// Both ends are labeled, so the structural proxy ties and Plan keeps the leftmost
+	// anchor. With statistics where Movie is far rarer than Person the cost model
+	// re-anchors at the Movie end, the scan that reads the fewest nodes, and reverses
+	// the expand to radiate from it.
+	b := bound(t, "MATCH (a:Person)-[:KNOWS]->(b:Movie) RETURN a")
+	st := fakeStats{nodes: 1010, rels: 2000, label: map[uint32]float64{1: 1000, 2: 10}}
+	eq(t, "cost", String(PlanWithStats(b, st)), `Project a
+  Expand b <-[@r0:#1]- a:#1
+    NodeScan b:#2
+`)
+}
+
+func TestCostKeepsLeftmostWhenCheaper(t *testing.T) {
+	// The same pattern, but now the leftmost Person end is the rarer scan, so the cost
+	// model keeps the anchor where Build placed it, the plan structural Plan also
+	// produces.
+	b := bound(t, "MATCH (a:Person)-[:KNOWS]->(b:Movie) RETURN a")
+	st := fakeStats{nodes: 1010, rels: 2000, label: map[uint32]float64{1: 10, 2: 1000}}
+	eq(t, "cost", String(PlanWithStats(b, st)), `Project a
+  Expand a -[@r0:#1]-> b:#2
+    NodeScan a:#1
+`)
+}
+
 func TestReanchorBailsVarLength(t *testing.T) {
 	// A variable-length step is not safely reversible by the simple subset, so the
 	// chain is left anchored as built even though b is the labeled end.

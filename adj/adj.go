@@ -374,6 +374,34 @@ func (a *Adj) openBase(s uint32) (*base, uint64, error) {
 	return b, offLen, nil
 }
 
+// freeOldBase returns a slot's current base CSR vectors to the pager free list.
+// A checkpoint calls it before rebuilding the slot, because the rebuild reads the
+// live relationships rather than the old base, so the old offset, neighbor, and
+// edge vectors are unreferenced once it starts. An empty slot (no offsets) owns no
+// base pages, so there is nothing to free.
+func (a *Adj) freeOldBase(s uint32) error {
+	offHead, offLen, nbrHead, edgHead, _, err := a.readDir(s)
+	if err != nil {
+		return err
+	}
+	if offLen == 0 {
+		return nil
+	}
+	for _, head := range []format.PageID{offHead, nbrHead, edgHead} {
+		if head == 0 {
+			continue
+		}
+		v, err := store.OpenVector(a.p, head, 8, 0)
+		if err != nil {
+			return err
+		}
+		if err := v.Free(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (a *Adj) readDir(s uint32) (offHead format.PageID, offLen uint64, nbrHead, edgHead format.PageID, runLen uint64, err error) {
 	var buf [dirStride]byte
 	if err = a.dir.Get(int(s), buf[:]); err != nil {
@@ -405,6 +433,7 @@ func (a *Adj) writeDir(s uint32, offHead format.PageID, offLen uint64, nbrHead, 
 // mid-checkpoint recovers either the old base or the new one, never a mix.
 func (a *Adj) Checkpoint(nodeCount uint64) error {
 	relCount := uint64(a.rels.Count())
+	oldSlotCount := a.dir.Count()
 
 	// Group live edges by slot and source, both directions.
 	group := map[uint32]map[uint64][]Neighbor{}
@@ -439,6 +468,16 @@ func (a *Adj) Checkpoint(nodeCount uint64) error {
 			if _, err := a.dir.Append(empty); err != nil {
 				return err
 			}
+		}
+	}
+
+	// Free the old base vectors of every slot that had one. The rebuild below
+	// builds each slot from the live relationships, not from the old base, so the
+	// old pages are unreferenced now; freeing them up front lets the fresh vectors
+	// reuse them instead of growing the file (doc 65 §2; doc 64 §6).
+	for s := range oldSlotCount {
+		if err := a.freeOldBase(uint32(s)); err != nil {
+			return err
 		}
 	}
 

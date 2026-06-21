@@ -918,6 +918,10 @@ func (t *diskTx) Commit() error {
 			_ = t.Abort()
 			return err
 		}
+		if err := t.validateExistence(); err != nil {
+			_ = t.Abort()
+			return err
+		}
 	}
 	t.done = true
 	t.e.oracle.End(t.snap)

@@ -364,6 +364,24 @@ func (db *DB) execSchema(cmd ast.SchemaCommand) (Summary, error) {
 			return Summary{ConstraintsRemoved: 1}, nil
 		}
 		return Summary{}, nil
+	case *ast.CreateIndex:
+		added, err := db.eng.CreateIndex(c.Name, c.Label, c.Props[0], c.IfNotExists)
+		if err != nil {
+			return Summary{}, err
+		}
+		if added {
+			return Summary{IndexesAdded: 1}, nil
+		}
+		return Summary{}, nil
+	case *ast.DropIndex:
+		removed, err := db.eng.DropIndex(c.Name, c.IfExists)
+		if err != nil {
+			return Summary{}, err
+		}
+		if removed {
+			return Summary{IndexesRemoved: 1}, nil
+		}
+		return Summary{}, nil
 	default:
 		return Summary{}, errors.New("gr: unsupported schema command")
 	}

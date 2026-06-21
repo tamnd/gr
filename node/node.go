@@ -140,6 +140,24 @@ func (s *Store) Labels(pos uint64) ([]uint32, error) {
 	if rec[0]&flagLive == 0 {
 		return nil, ErrNoSuchNode
 	}
+	return s.decodeRecLabels(rec[:])
+}
+
+// LabelsRaw returns the node's label tokens ignoring the live flag. A snapshot
+// reader that still sees a node another transaction has since deleted resolves
+// the retained label bytes through this, since the slot is kept until GC and any
+// label change before the delete would have left its own pre-image in the
+// overlay (consulted first by the caller).
+func (s *Store) LabelsRaw(pos uint64) ([]uint32, error) {
+	rec, err := s.readRec(pos)
+	if err != nil {
+		return nil, err
+	}
+	return s.decodeRecLabels(rec[:])
+}
+
+// decodeRecLabels reads the label bytes a node record points at and decodes them.
+func (s *Store) decodeRecLabels(rec []byte) ([]uint32, error) {
 	length := int(format.U16(rec[2:]))
 	if length == 0 {
 		return nil, nil

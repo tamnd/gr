@@ -82,11 +82,13 @@ type Catalog struct {
 
 	cons    map[string]Constraint // name -> live constraint
 	conSeq  []string              // constraint names in add order, for a stable listing
+	idx     map[string]Index      // name -> live index
+	idxSeq  []string              // index names in add order, for a stable listing
 	schemaN uint64                // count of schema records ever appended (monotonic)
 }
 
 func newCatalog(p *pager.Pager, secs *store.Sections, log *store.Log) *Catalog {
-	c := &Catalog{p: p, secs: secs, log: log, cons: make(map[string]Constraint)}
+	c := &Catalog{p: p, secs: secs, log: log, cons: make(map[string]Constraint), idx: make(map[string]Index)}
 	for i := range c.dicts {
 		c.dicts[i] = newDict()
 	}
@@ -158,6 +160,20 @@ func (c *Catalog) replay() error {
 			}
 			buf = buf[n:]
 			c.applyConstraintDrop(name)
+		case KindIndexAdd:
+			ix, n, err := decodeIndex(buf)
+			if err != nil {
+				return err
+			}
+			buf = buf[n:]
+			c.applyIndexAdd(ix)
+		case KindIndexDrop:
+			name, n, err := format.String(buf)
+			if err != nil {
+				return err
+			}
+			buf = buf[n:]
+			c.applyIndexDrop(name)
 		default:
 			return errBadCatalogRecord
 		}

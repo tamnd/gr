@@ -20,6 +20,14 @@ var ErrConstraintExists = errors.New("gr/catalog: constraint already exists")
 // given name is declared, so a plain DROP CONSTRAINT (no IF EXISTS) fails.
 var ErrNoSuchConstraint = errors.New("gr/catalog: no such constraint")
 
+// ErrIndexExists is returned by AddIndex when an index of the same name is
+// already declared, so a plain CREATE INDEX (no IF NOT EXISTS) fails loudly.
+var ErrIndexExists = errors.New("gr/catalog: index already exists")
+
+// ErrNoSuchIndex is returned by DropIndex when no index of the given name is
+// declared, so a plain DROP INDEX (no IF EXISTS) fails.
+var ErrNoSuchIndex = errors.New("gr/catalog: no such index")
+
 // The schema-record tags continue the dictionary tags (0,1,2) in the one catalog
 // Log. They are part of the on-disk format and must not change (doc 08 §8.1).
 const (
@@ -28,6 +36,11 @@ const (
 	// KindConstraintDrop records a constraint removal, a tombstone the replay
 	// applies over an earlier add so the append-only Log can express a drop.
 	KindConstraintDrop Kind = 4
+	// KindIndexAdd records an index declaration.
+	KindIndexAdd Kind = 5
+	// KindIndexDrop records an index removal, a tombstone the replay applies over
+	// an earlier add so the append-only Log can express a drop.
+	KindIndexDrop Kind = 6
 )
 
 // ConstraintKind classifies a constraint. The value is part of the on-disk
@@ -185,5 +198,133 @@ func (c *Catalog) ConstraintByName(name string) (Constraint, bool) {
 
 // SchemaOps returns how many schema records the catalog has ever applied, a
 // monotonic counter the engine folds into its catalog version so a constraint
-// add or drop invalidates plans bound against the old schema (doc 14 §8.4).
+// add or drop, or an index add or drop, invalidates plans bound against the old
+// schema (doc 14 §8.4). An index add or drop changes the access paths the planner
+// can choose, so it must invalidate cached plans just as a constraint change does.
 func (c *Catalog) SchemaOps() uint64 { return c.schemaN }
+
+// Index is one declared property index, recorded against a label and a property
+// tuple (doc 07 §4). Props holds the indexed property-key tokens in order; it has
+// one entry for a single-property index and several for a composite one (doc 07
+// §5). Label and Props are catalog tokens, not names. An index is an access path,
+// not an invariant, so unlike a Constraint it carries nothing to enforce.
+type Index struct {
+	Name  string
+	Label uint32
+	Props []uint32
+}
+
+// encodeIndex appends an index's body (everything after the kind tag). It shares
+// the constraint encoding's shape (name, label, prop tuple), minus the kind tag a
+// constraint carries, because an index has no kind to distinguish.
+func encodeIndex(dst []byte, ix Index) []byte {
+	dst = format.AppendString(dst, ix.Name)
+	dst = format.AppendUvarint(dst, uint64(ix.Label))
+	dst = format.AppendUvarint(dst, uint64(len(ix.Props)))
+	for _, p := range ix.Props {
+		dst = format.AppendUvarint(dst, uint64(p))
+	}
+	return dst
+}
+
+// decodeIndex reads an index body and returns it with the bytes consumed.
+func decodeIndex(b []byte) (Index, int, error) {
+	var ix Index
+	name, n, err := format.String(b)
+	if err != nil {
+		return ix, 0, err
+	}
+	ix.Name = name
+	off := n
+	label, n, err := format.Uvarint(b[off:])
+	if err != nil {
+		return ix, 0, err
+	}
+	ix.Label = uint32(label)
+	off += n
+	count, n, err := format.Uvarint(b[off:])
+	if err != nil {
+		return ix, 0, err
+	}
+	off += n
+	ix.Props = make([]uint32, count)
+	for i := range ix.Props {
+		p, n, err := format.Uvarint(b[off:])
+		if err != nil {
+			return ix, 0, err
+		}
+		ix.Props[i] = uint32(p)
+		off += n
+	}
+	return ix, off, nil
+}
+
+// applyIndexAdd records an index in memory and counts the schema op. It is the
+// shared body of replay and AddIndex.
+func (c *Catalog) applyIndexAdd(ix Index) {
+	if _, ok := c.idx[ix.Name]; !ok {
+		c.idxSeq = append(c.idxSeq, ix.Name)
+	}
+	c.idx[ix.Name] = ix
+	c.schemaN++
+}
+
+// applyIndexDrop removes an index in memory and counts the schema op.
+func (c *Catalog) applyIndexDrop(name string) {
+	if _, ok := c.idx[name]; ok {
+		delete(c.idx, name)
+		for i, n := range c.idxSeq {
+			if n == name {
+				c.idxSeq = append(c.idxSeq[:i], c.idxSeq[i+1:]...)
+				break
+			}
+		}
+	}
+	c.schemaN++
+}
+
+// AddIndex declares an index, appending its record to the Log and recording it in
+// memory. The append becomes durable when the enclosing transaction commits (it
+// is rolled back with the rest on abort). It errors if an index of the same name
+// already exists.
+func (c *Catalog) AddIndex(ix Index) error {
+	if _, ok := c.idx[ix.Name]; ok {
+		return ErrIndexExists
+	}
+	rec := encodeIndex([]byte{byte(KindIndexAdd)}, ix)
+	if err := c.appendSchema(rec); err != nil {
+		return err
+	}
+	c.applyIndexAdd(ix)
+	return nil
+}
+
+// DropIndex removes an index, appending a tombstone to the Log and removing it
+// from memory. It errors if no index of the name is declared.
+func (c *Catalog) DropIndex(name string) error {
+	if _, ok := c.idx[name]; !ok {
+		return ErrNoSuchIndex
+	}
+	rec := format.AppendString([]byte{byte(KindIndexDrop)}, name)
+	if err := c.appendSchema(rec); err != nil {
+		return err
+	}
+	c.applyIndexDrop(name)
+	return nil
+}
+
+// Indexes returns the declared indexes in add order. The slice is a fresh copy
+// the caller may keep; the Props slices inside are shared (read-only).
+func (c *Catalog) Indexes() []Index {
+	out := make([]Index, 0, len(c.idxSeq))
+	for _, name := range c.idxSeq {
+		out = append(out, c.idx[name])
+	}
+	return out
+}
+
+// IndexByName returns the index of the given name, if declared.
+func (c *Catalog) IndexByName(name string) (Index, bool) {
+	ix, ok := c.idx[name]
+	return ix, ok
+}

@@ -191,6 +191,42 @@ func (ov *Overlay) Resolve(key Key, r Seq) (Pre, bool) {
 	return Pre{}, false
 }
 
+// NodeCandidates returns the dense positions whose snapshot view at read sequence
+// r may differ from the base for a node's existence, its label set, or the given
+// property key: every position with a retained pre-image (of one of those kinds)
+// tagged after r. A base-built property index reflects the latest committed state,
+// so a snapshot reader can miss a node whose indexed value, label, or existence
+// changed after r; these candidates are exactly the positions a snapshot-correct
+// lookup must reconsider beyond the base index (doc 07 §9). The returned positions
+// are deduplicated; the caller filters them against the actual snapshot value.
+func (ov *Overlay) NodeCandidates(propKey uint32, r Seq) []uint64 {
+	ov.mu.RLock()
+	defer ov.mu.RUnlock()
+	var out []uint64
+	seen := make(map[uint64]struct{})
+	for k, ch := range ov.chains {
+		if k.Kind != NodeExist && k.Kind != NodeLabels && !(k.Kind == NodeProp && k.Sub == propKey) {
+			continue
+		}
+		relevant := false
+		for _, e := range ch {
+			if e.seq > r {
+				relevant = true
+				break
+			}
+		}
+		if !relevant {
+			continue
+		}
+		if _, dup := seen[k.Pos]; dup {
+			continue
+		}
+		seen[k.Pos] = struct{}{}
+		out = append(out, k.Pos)
+	}
+	return out
+}
+
 // GC drops pre-images no live snapshot can need: an entry tagged seq serves
 // snapshots whose read sequence is below seq, so once the watermark reaches seq
 // it is reclaimable (doc 06 §4.3).

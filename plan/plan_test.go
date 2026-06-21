@@ -213,6 +213,39 @@ func TestCostKeepsLeftmostWhenCheaper(t *testing.T) {
 `)
 }
 
+func TestJoinOrderPutsSmallerSideOnBuild(t *testing.T) {
+	// Two disjoint patterns join as a cartesian product, the builder putting the
+	// first pattern on the left and the second on the right (the build side). With
+	// Person rare and Movie abundant the left side is the smaller, so JoinOrder swaps
+	// them to keep the smaller Person scan on the right build side.
+	b := bound(t, "MATCH (a:Person), (b:Movie) RETURN a, b")
+	st := fakeStats{nodes: 1010, label: map[uint32]float64{1: 10, 2: 1000}}
+	eq(t, "join", String(PlanWithStats(b, st)), `Project a, b
+  Join on[]
+    NodeScan b:#2
+    NodeScan a:#1
+`)
+}
+
+func TestJoinOrderKeepsSmallerRight(t *testing.T) {
+	// The same patterns, but now Movie is the rarer scan and already sits on the
+	// right build side, so JoinOrder leaves the sides where the builder placed them.
+	b := bound(t, "MATCH (a:Person), (b:Movie) RETURN a, b")
+	st := fakeStats{nodes: 1010, label: map[uint32]float64{1: 1000, 2: 10}}
+	eq(t, "join", String(PlanWithStats(b, st)), `Project a, b
+  Join on[]
+    NodeScan a:#1
+    NodeScan b:#2
+`)
+}
+
+func TestJoinOrderStructuralKeepsBuildOrder(t *testing.T) {
+	// With no statistics the build side is the builder's pattern order, so the plan
+	// matches the structural Plan and the goldens do not move.
+	b := bound(t, "MATCH (a:Person), (b:Movie) RETURN a, b")
+	eq(t, "join", String(PlanWithStats(b, nil)), String(Plan(b)))
+}
+
 func TestReanchorBailsVarLength(t *testing.T) {
 	// A variable-length step is not safely reversible by the simple subset, so the
 	// chain is left anchored as built even though b is the labeled end.

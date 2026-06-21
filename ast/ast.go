@@ -22,11 +22,17 @@ type Pos struct {
 // and Rest holds the UNION-joined tails in order. For a schema command (CREATE
 // CONSTRAINT, DROP CONSTRAINT) Schema is set and First is nil: a schema command
 // is a whole statement on its own, not a clause inside a query (doc 08 §6.1).
+//
+// Explain marks a statement the EXPLAIN prefix introduced: the planner builds its
+// operator tree but the engine never runs it, so the result is the plan listing
+// rather than the statement's rows. The prefix attaches to the statement as a
+// whole, so it travels with the query whatever its body is.
 type Query struct {
 	Pos
-	First  *SingleQuery
-	Rest   []UnionTail
-	Schema SchemaCommand
+	First   *SingleQuery
+	Rest    []UnionTail
+	Schema  SchemaCommand
+	Explain bool
 }
 
 // SchemaCommand is a data-definition statement that changes the catalog rather

@@ -149,6 +149,23 @@ func pos(t lex.Token) ast.Pos { return ast.Pos{Line: t.Line, Col: t.Col} }
 // --- query and clauses ---
 
 func (p *parser) query() (*ast.Query, error) {
+	// EXPLAIN is a soft keyword that prefixes a whole statement (doc 25 §7.2): it
+	// is recognized only here, at the very start, so it stays usable as an ordinary
+	// identifier everywhere else. It attaches to whatever statement follows, a read,
+	// a write, or a schema command, and the body is parsed unchanged.
+	explain := p.atWord("EXPLAIN")
+	if explain {
+		p.advance()
+	}
+	q, err := p.queryBody()
+	if err != nil {
+		return nil, err
+	}
+	q.Explain = explain
+	return q, nil
+}
+
+func (p *parser) queryBody() (*ast.Query, error) {
 	if p.at(lex.Create) && p.wordIs(p.peek(1), "CONSTRAINT") {
 		return p.createConstraint()
 	}

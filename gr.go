@@ -340,7 +340,14 @@ func (db *DB) Exec(cypher string, params map[string]value.Value) (Summary, error
 func (db *DB) execSchema(cmd ast.SchemaCommand) (Summary, error) {
 	switch c := cmd.(type) {
 	case *ast.CreateConstraint:
-		added, err := db.eng.CreateUniqueConstraint(c.Name, c.Label, c.Props[0], c.IfNotExists)
+		var added bool
+		var err error
+		switch c.Type {
+		case ast.ConstraintExists:
+			added, err = db.eng.CreateExistenceConstraint(c.Name, c.Label, c.Props[0], c.IfNotExists)
+		default:
+			added, err = db.eng.CreateUniqueConstraint(c.Name, c.Label, c.Props[0], c.IfNotExists)
+		}
 		if err != nil {
 			return Summary{}, err
 		}

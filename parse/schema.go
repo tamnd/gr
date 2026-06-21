@@ -8,10 +8,12 @@ import (
 // createConstraint parses
 //
 //	CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (var:Label) REQUIRE var.prop IS UNIQUE
+//	CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (var:Label) REQUIRE var.prop IS NOT NULL
 //
-// the node uniqueness form (doc 08 §4.1, §6). The name is optional; the engine
-// derives one when it is omitted. This release supports single-property node
-// uniqueness; composite keys and relationship constraints are later work.
+// the node uniqueness and node existence forms (doc 08 §4.1, §6). The name is
+// optional; the engine derives one when it is omitted. This release supports
+// single-property node constraints; composite keys and relationship constraints are
+// later work.
 func (p *parser) createConstraint() (*ast.Query, error) {
 	start := p.advance() // CREATE
 	if _, err := p.expectWord("CONSTRAINT"); err != nil {
@@ -65,9 +67,20 @@ func (p *parser) createConstraint() (*ast.Query, error) {
 	if _, err := p.expect(lex.Is); err != nil {
 		return nil, err
 	}
+	// The predicate after IS chooses the constraint kind: UNIQUE for uniqueness,
+	// NOT NULL for existence. NOT is a real keyword, NULL too, while UNIQUE is a
+	// soft keyword matched as an identifier.
+	if p.accept(lex.Not) {
+		if _, err := p.expect(lex.Null); err != nil {
+			return nil, err
+		}
+		cc.Type = ast.ConstraintExists
+		return &ast.Query{Pos: pos(start), Schema: cc}, nil
+	}
 	if _, err := p.expectWord("UNIQUE"); err != nil {
 		return nil, err
 	}
+	cc.Type = ast.ConstraintUnique
 	return &ast.Query{Pos: pos(start), Schema: cc}, nil
 }
 

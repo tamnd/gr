@@ -59,6 +59,7 @@ type DiskEngine struct {
 	st     *stats.Stats
 	oracle *mvcc.Oracle
 	ov     *mvcc.Overlay
+	idx    *propIndexSet
 	closed bool
 }
 
@@ -120,8 +121,10 @@ func (e *DiskEngine) load(create bool) error {
 		if e.adj, err = adj.Create(e.p, e.secs, e.rels); err != nil {
 			return err
 		}
-		e.st, err = stats.Create(e.p, e.secs)
-		return err
+		if e.st, err = stats.Create(e.p, e.secs); err != nil {
+			return err
+		}
+		return e.rebuildIndexes()
 	}
 	if e.secs, err = store.OpenSections(e.p); err != nil {
 		return err
@@ -147,8 +150,10 @@ func (e *DiskEngine) load(create bool) error {
 	if e.adj, err = adj.Open(e.p, e.secs, e.rels); err != nil {
 		return err
 	}
-	e.st, err = stats.Open(e.p, e.secs)
-	return err
+	if e.st, err = stats.Open(e.p, e.secs); err != nil {
+		return err
+	}
+	return e.rebuildIndexes()
 }
 
 // commitPager makes the pager durable and advances the MVCC clock to the new
@@ -349,7 +354,10 @@ func (t *diskTx) snapLabels(pos uint64) ([]uint32, error) {
 	if pre, ok := t.e.ov.Resolve(mvcc.Key{Kind: mvcc.NodeLabels, Pos: pos}, t.readSeq); ok {
 		return pre.Labels, nil
 	}
-	return t.e.nodes.Labels(pos)
+	// LabelsRaw, not Labels: a snapshot may still see a node a later transaction
+	// deleted from the base, and its retained label bytes are correct here (the
+	// overlay above already covered any label change before that delete).
+	return t.e.nodes.LabelsRaw(pos)
 }
 
 // snapNodeProp returns a node property value (and presence) as of the snapshot.
@@ -939,6 +947,14 @@ func (t *diskTx) Commit() error {
 	// the freshly committed base.
 	for _, pp := range t.pending {
 		t.e.ov.Record(seq, pp.key, pp.pre)
+	}
+	// Refresh the property indexes from the freshly committed base so a later read
+	// seek sees this transaction's writes. The rebuild is the correctness-first
+	// maintenance form (doc 07 §9); a write pays it only when an index is declared.
+	if t.e.hasIndexes() {
+		if err := t.e.rebuildIndexes(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

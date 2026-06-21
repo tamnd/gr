@@ -107,6 +107,14 @@ type Tx interface {
 	// snapshot-visible neighbors. A zero relType expands all types.
 	Expand(id NodeID, relType Token, dir Direction, fn func(Neighbor) error) error
 
+	// IndexSeek yields the snapshot-visible nodes that carry label and hold value v
+	// for property key, using a declared property index as the access path (doc 07
+	// §4). The bool reports whether an index served the seek: false means no index
+	// is declared for (label, key) and the caller must fall back to a scan, so a
+	// consumer treats IndexSeek as an optional fast path, not a requirement. A null
+	// v matches nothing, since indexes do not store nulls (doc 07 §4.1).
+	IndexSeek(label, key Token, v value.Value, fn func(NodeID) error) (bool, error)
+
 	// --- statistics for the planner (doc 04 §14, "Statistics"; doc 11) ---
 
 	// Degree returns the number of relationships of a node along a direction.

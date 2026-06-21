@@ -74,8 +74,33 @@ type DropConstraint struct {
 	IfExists bool
 }
 
+// CreateIndex is a CREATE INDEX statement declaring a property index (doc 07 §4).
+// Name is the explicit index name, empty when the statement omits it (the engine
+// then derives one from the label and property). IfNotExists makes a repeat
+// creation a no-op rather than an error. Var is the pattern variable, Label the
+// node label it binds, and Props the indexed property keys in order (one for a
+// single-property index). This release supports single-property node indexes.
+type CreateIndex struct {
+	Pos
+	Name        string
+	IfNotExists bool
+	Var         string
+	Label       string
+	Props       []string
+}
+
+// DropIndex is a DROP INDEX statement, addressing an index by name. IfExists makes
+// dropping an absent index a no-op rather than an error.
+type DropIndex struct {
+	Pos
+	Name     string
+	IfExists bool
+}
+
 func (*CreateConstraint) schemaNode() {}
 func (*DropConstraint) schemaNode()   {}
+func (*CreateIndex) schemaNode()      {}
+func (*DropIndex) schemaNode()        {}
 
 // UnionTail is a UNION-joined query part. All distinguishes UNION ALL (keep
 // duplicates) from UNION (set union, deduplicated).

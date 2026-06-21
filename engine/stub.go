@@ -201,6 +201,12 @@ func (t *memTx) ScanLabel(label Token, fn func(NodeID) error) error {
 	return nil
 }
 
+// IndexSeek reports no index: the in-memory stub keeps no property indexes, so a
+// seek against it always falls back to the caller's scan (doc 07 §4).
+func (t *memTx) IndexSeek(label, key Token, v value.Value, fn func(NodeID) error) (bool, error) {
+	return false, nil
+}
+
 func (t *memTx) Expand(id NodeID, relType Token, dir Direction, fn func(Neighbor) error) error {
 	t.e.mu.Lock()
 	n, ok := t.e.nodes[id]

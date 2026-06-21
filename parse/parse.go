@@ -155,6 +155,12 @@ func (p *parser) query() (*ast.Query, error) {
 	if p.atWord("DROP") && p.wordIs(p.peek(1), "CONSTRAINT") {
 		return p.dropConstraint()
 	}
+	if p.at(lex.Create) && p.wordIs(p.peek(1), "INDEX") {
+		return p.createIndex()
+	}
+	if p.atWord("DROP") && p.wordIs(p.peek(1), "INDEX") {
+		return p.dropIndex()
+	}
 	start := p.cur()
 	first, err := p.singleQuery()
 	if err != nil {

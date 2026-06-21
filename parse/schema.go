@@ -104,6 +104,94 @@ func (p *parser) requireProp(boundVar string) (string, error) {
 	return prop.Text, nil
 }
 
+// createIndex parses
+//
+//	CREATE INDEX [name] [IF NOT EXISTS] FOR (var:Label) ON (var.prop)
+//
+// a node property index (doc 07 §4). The name is optional; the engine derives one
+// when it is omitted. This release supports single-property node indexes; composite
+// indexes and relationship indexes are later work. The grammar mirrors
+// createConstraint up to the FOR pattern, then takes ON (var.prop) where a
+// constraint takes REQUIRE.
+func (p *parser) createIndex() (*ast.Query, error) {
+	start := p.advance() // CREATE
+	if _, err := p.expectWord("INDEX"); err != nil {
+		return nil, err
+	}
+	ci := &ast.CreateIndex{Pos: pos(start)}
+	if p.at(lex.Ident) && !p.atWord("IF") && !p.atWord("FOR") {
+		ci.Name = p.advance().Text
+	}
+	if p.acceptWord("IF") {
+		if _, err := p.expect(lex.Not); err != nil {
+			return nil, err
+		}
+		if _, err := p.expectWord("EXISTS"); err != nil {
+			return nil, err
+		}
+		ci.IfNotExists = true
+	}
+	if _, err := p.expectWord("FOR"); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(lex.Lparen); err != nil {
+		return nil, err
+	}
+	v, err := p.expect(lex.Ident)
+	if err != nil {
+		return nil, err
+	}
+	ci.Var = v.Text
+	if _, err := p.expect(lex.Colon); err != nil {
+		return nil, err
+	}
+	label, err := p.expect(lex.Ident)
+	if err != nil {
+		return nil, err
+	}
+	ci.Label = label.Text
+	if _, err := p.expect(lex.Rparen); err != nil {
+		return nil, err
+	}
+	// ON is a real keyword (it also leads MERGE's ON CREATE / ON MATCH), so it is
+	// matched as a token, not as a soft keyword.
+	if _, err := p.expect(lex.On); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(lex.Lparen); err != nil {
+		return nil, err
+	}
+	prop, err := p.requireProp(ci.Var)
+	if err != nil {
+		return nil, err
+	}
+	ci.Props = []string{prop}
+	if _, err := p.expect(lex.Rparen); err != nil {
+		return nil, err
+	}
+	return &ast.Query{Pos: pos(start), Schema: ci}, nil
+}
+
+// dropIndex parses DROP INDEX name [IF EXISTS].
+func (p *parser) dropIndex() (*ast.Query, error) {
+	start := p.advance() // DROP
+	if _, err := p.expectWord("INDEX"); err != nil {
+		return nil, err
+	}
+	name, err := p.expect(lex.Ident)
+	if err != nil {
+		return nil, err
+	}
+	di := &ast.DropIndex{Pos: pos(start), Name: name.Text}
+	if p.acceptWord("IF") {
+		if _, err := p.expectWord("EXISTS"); err != nil {
+			return nil, err
+		}
+		di.IfExists = true
+	}
+	return &ast.Query{Pos: pos(start), Schema: di}, nil
+}
+
 // dropConstraint parses DROP CONSTRAINT name [IF EXISTS].
 func (p *parser) dropConstraint() (*ast.Query, error) {
 	start := p.advance() // DROP

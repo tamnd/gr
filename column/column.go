@@ -107,6 +107,28 @@ func Open(p *pager.Pager, secs *store.Sections, dirSec store.Section) (*Columns,
 	return &Columns{p: p, secs: secs, dirSec: dirSec, dir: dir, cols: map[uint32]*column{}}, nil
 }
 
+// Free returns every page this store occupies to the pager's free list: each
+// column's index Vector and values Log, and the directory Vector. The store is
+// dead afterward and must not be used again; the checkpoint calls this on the
+// naive columns it has folded into the segmented base so their pages can be
+// reused. Columns are opened lazily, so this materializes each one to reach its
+// chains.
+func (c *Columns) Free() error {
+	for k := range uint32(c.dir.Count()) {
+		col, err := c.ensureColumn(k)
+		if err != nil {
+			return err
+		}
+		if err := col.idx.Free(); err != nil {
+			return err
+		}
+		if err := col.vals.Free(); err != nil {
+			return err
+		}
+	}
+	return c.dir.Free()
+}
+
 // readDir decodes the directory cell for a key token.
 func (c *Columns) readDir(key uint32) (idxHead format.PageID, idxCount uint64, valsHead format.PageID, valsLen uint64, err error) {
 	var buf [dirStride]byte

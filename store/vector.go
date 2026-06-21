@@ -47,6 +47,11 @@ func OpenVector(p *pager.Pager, head format.PageID, stride, count int) (*Vector,
 	return &Vector{p: p, stride: stride, epp: usable(p) / stride, pages: ids, count: count}, nil
 }
 
+// Free returns every page the vector occupies to the pager's free list. The
+// vector is dead afterward and must not be used again; a checkpoint calls this on
+// a vector it has rebuilt into a fresh one so the old pages can be reused.
+func (v *Vector) Free() error { return freeChain(v.p, v.pages) }
+
 // Head returns the chain's first page id (persist this to reopen the vector).
 func (v *Vector) Head() format.PageID { return v.pages[0] }
 

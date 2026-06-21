@@ -39,6 +39,11 @@ func OpenLog(p *pager.Pager, head format.PageID, length int) (*Log, error) {
 	return &Log{p: p, pages: ids, cap: usable(p), len: length}, nil
 }
 
+// Free returns every page the log occupies to the pager's free list. The log is
+// dead afterward and must not be used again; a checkpoint calls this on a log it
+// has replaced so the old pages can be reused.
+func (l *Log) Free() error { return freeChain(l.p, l.pages) }
+
 // Head returns the chain's first page id (persist this to reopen the log).
 func (l *Log) Head() format.PageID { return l.pages[0] }
 

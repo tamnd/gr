@@ -177,3 +177,88 @@ func TestLogReadOutOfRange(t *testing.T) {
 		t.Fatal("want out-of-range error")
 	}
 }
+
+// collectFreePages drains the pager's free list, returning the ids it hands back.
+// It allocates until the page count grows, which signals the list is empty, then
+// the final grown page is discarded by the caller's reuse check.
+func freedPageSet(t *testing.T, p *pager.Pager, n int) map[format.PageID]bool {
+	t.Helper()
+	before := p.Header().PageCount
+	got := map[format.PageID]bool{}
+	for range n {
+		f, err := p.AllocPage(format.PageTypeData)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got[f.ID()] = true
+		p.Unpin(f)
+	}
+	if p.Header().PageCount != before {
+		t.Fatalf("page count grew from %d to %d reusing freed pages", before, p.Header().PageCount)
+	}
+	return got
+}
+
+// TestVectorFreeReusesPages builds a multi-page vector, frees it, and proves the
+// next allocations reuse exactly the freed pages without growing the file.
+func TestVectorFreeReusesPages(t *testing.T) {
+	fsys := vfs.NewMem()
+	p := openPager(t, fsys)
+	defer p.Close()
+
+	v, err := CreateVector(p, 8, format.PageTypeNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 3000 // spans several pages
+	for i := range n {
+		if _, err := v.Append(u64(uint64(i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pages := append([]format.PageID(nil), v.pages...)
+	if len(pages) < 2 {
+		t.Fatalf("vector only spans %d pages, want several", len(pages))
+	}
+	if err := v.Free(); err != nil {
+		t.Fatal(err)
+	}
+	reused := freedPageSet(t, p, len(pages))
+	for _, id := range pages {
+		if !reused[id] {
+			t.Fatalf("freed page %d was not reused", id)
+		}
+	}
+}
+
+// TestLogFreeReusesPages builds a multi-page log, frees it, and proves the next
+// allocations reuse exactly the freed pages without growing the file.
+func TestLogFreeReusesPages(t *testing.T) {
+	fsys := vfs.NewMem()
+	p := openPager(t, fsys)
+	defer p.Close()
+
+	l, err := CreateLog(p, format.PageTypeCatalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := bytes.Repeat([]byte{0xab}, 1000)
+	for range 50 { // spans several pages
+		if _, err := l.Append(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pages := append([]format.PageID(nil), l.pages...)
+	if len(pages) < 2 {
+		t.Fatalf("log only spans %d pages, want several", len(pages))
+	}
+	if err := l.Free(); err != nil {
+		t.Fatal(err)
+	}
+	reused := freedPageSet(t, p, len(pages))
+	for _, id := range pages {
+		if !reused[id] {
+			t.Fatalf("freed page %d was not reused", id)
+		}
+	}
+}

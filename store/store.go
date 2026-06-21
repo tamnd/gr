@@ -68,6 +68,18 @@ func walkChain(p *pager.Pager, head format.PageID) ([]format.PageID, error) {
 	return ids, nil
 }
 
+// freeChain returns every page id in a chain to the pager's free list. The store
+// that owned the chain must be discarded afterward; this is how a checkpoint
+// reclaims a base store it has replaced (doc 03 §8.4).
+func freeChain(p *pager.Pager, pages []format.PageID) error {
+	for _, id := range pages {
+		if err := p.FreePage(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // appendPage allocates a new chain page of the given type, links it after prev
 // (if prev is not NoPage), and returns its id.
 func appendPage(p *pager.Pager, prev format.PageID, t format.PageType) (format.PageID, error) {

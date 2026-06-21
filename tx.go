@@ -1,6 +1,7 @@
 package gr
 
 import (
+	"context"
 	"errors"
 
 	"github.com/tamnd/gr/ast"
@@ -105,24 +106,28 @@ func (db *DB) View(fn func(tx *Tx) error) error {
 
 // Update runs fn inside a read-write transaction (doc 16 §6.2). On a nil return it
 // commits, and on a non-nil return it rolls back and returns the error, so the
-// common write path is correct by construction. The closure must be re-runnable:
-// on the concurrent-writer path Update retries it against a fresh snapshot after a
-// conflict (doc 16 §6.4), and although the single-writer path never conflicts, so
-// the retry is dormant, the closure must hold no side effect outside the
+// common write path is correct by construction. It is [Retry] wrapped around a
+// begin, the closure, and a commit: on the concurrent-writer path a conflict at
+// commit re-runs the whole thing against a fresh snapshot, up to the database's
+// configured retry bound (doc 16 §6.4). The single-writer path never conflicts, so
+// the retry is dormant, but the closure must still be re-runnable: it must compute
+// the same writes from the same inputs each time and hold no side effect outside the
 // transaction that a re-run would double (doc 16 §6.2).
 func (db *DB) Update(fn func(tx *Tx) error) error {
 	if db.eng == nil {
 		return ErrClosed
 	}
-	tx, err := db.Begin(Write)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := fn(tx); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return Retry(context.Background(), db.maxRetries, func() error {
+		tx, err := db.Begin(Write)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if err := fn(tx); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
 }
 
 // Run executes a Cypher statement against the transaction and returns a streaming

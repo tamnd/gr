@@ -44,13 +44,21 @@ func (p *Pager) ReadPage(id format.PageID) (*Frame, error) {
 	return f, nil
 }
 
-// AllocPage grows the file by one page and returns a freshly zeroed, pinned
-// frame of the given type. The new page becomes durable at the next Commit.
+// AllocPage returns a freshly zeroed, pinned frame of the given type, reusing a
+// page from the free list when one is available and otherwise growing the file by
+// one page. The new page becomes durable at the next Commit.
 func (p *Pager) AllocPage(t format.PageType) (*Frame, error) {
 	if p.readOnly {
 		return nil, ErrReadOnly
 	}
-	id := format.PageID(p.header.PageCount)
+	id, ok, err := p.popFree()
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return p.reuse(id, t)
+	}
+	id = format.PageID(p.header.PageCount)
 	p.header.PageCount++
 	p.headerDirty = true
 	buf := make([]byte, p.pageSize)

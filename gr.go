@@ -139,7 +139,7 @@ func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, erro
 		_ = tx.Abort()
 		return nil, err
 	}
-	return &Result{cols: cur.Cols(), cursor: cur, tx: tx}, nil
+	return &Result{cols: cur.Cols(), cursor: cur, tx: tx, ownTx: true}, nil
 }
 
 // Summary reports the graph mutations a write statement performed, the normative
@@ -502,12 +502,15 @@ func (db *DB) tokenNamer(kind catalog.Kind) func(t engine.Token) (string, bool) 
 }
 
 // Result is a streaming Cypher query result: the output column names in order and
-// a Next/Close pair that pulls one row of column values at a time. It owns the
-// read transaction the query runs against, released by Close.
+// a Next/Close pair that pulls one row of column values at a time. An auto-commit
+// Query owns its read transaction and releases it on Close; a Result from a
+// managed transaction's Run borrows that transaction and leaves it for the caller
+// to commit or roll back, so Close only releases the cursor (ownTx is false).
 type Result struct {
 	cols   []string
 	cursor *exec.Cursor
 	tx     engine.Tx
+	ownTx  bool
 }
 
 // Columns returns the result's output column names in order.
@@ -532,14 +535,19 @@ func (r *Result) Next() ([]value.Value, bool, error) {
 // lookup by column name over positional access. It shares the cursor with Next.
 func (r *Result) NextRow() (eval.Row, bool, error) { return r.cursor.Next() }
 
-// Close releases the result's cursor and aborts its read transaction. It is safe
-// to call more than once.
+// Close releases the result's cursor. For an auto-commit Query result it also
+// aborts the read transaction it owns; for a managed-transaction Run result it
+// leaves the borrowed transaction untouched, since the caller commits or rolls it
+// back. It is safe to call more than once.
 func (r *Result) Close() error {
 	if r.cursor == nil {
 		return nil
 	}
 	cerr := r.cursor.Close()
-	terr := r.tx.Abort()
+	var terr error
+	if r.ownTx && r.tx != nil {
+		terr = r.tx.Abort()
+	}
 	r.cursor, r.tx = nil, nil
 	if cerr != nil {
 		return cerr

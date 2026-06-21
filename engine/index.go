@@ -92,6 +92,23 @@ func (e *DiskEngine) hasIndexes() bool {
 	return e.idx != nil && len(e.idx.defs) > 0
 }
 
+// HasNodeIndex reports whether a single-property node index is declared on the
+// given label and property, in SPI token space (doc 07 §4). The planner calls it
+// to decide whether a node scan with an equality filter has an index access path
+// available; a zero label or property is never indexed. The answer is part of the
+// catalog state the plan cache keys on (CatalogVersion bumps on an index add or
+// drop), so a plan compiled from this answer is invalidated when the answer
+// changes.
+func (e *DiskEngine) HasNodeIndex(label, prop Token) bool {
+	if label == 0 || prop == 0 {
+		return false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	_, ok := e.idx.defs[indexDefKey{label: toCat(label), prop: toCat(prop)}]
+	return ok
+}
+
 // CreateIndex declares a node property index on label.prop in its own write
 // transaction (doc 07 §4, doc 08 §6.1). It interns the label and property names,
 // records the index durably, commits, and builds the index over the existing data.

@@ -7,6 +7,7 @@ import (
 
 	"github.com/tamnd/gr/adj"
 	"github.com/tamnd/gr/catalog"
+	"github.com/tamnd/gr/colsegstore"
 	"github.com/tamnd/gr/column"
 	"github.com/tamnd/gr/idmap"
 	"github.com/tamnd/gr/mvcc"
@@ -55,6 +56,8 @@ type DiskEngine struct {
 	rels   *rel.Store
 	ncols  *column.Columns
 	rcols  *column.Columns
+	nseg   *colsegstore.Store
+	rseg   *colsegstore.Store
 	adj    *adj.Adj
 	st     *stats.Stats
 	oracle *mvcc.Oracle
@@ -118,6 +121,12 @@ func (e *DiskEngine) load(create bool) error {
 		if e.rcols, err = column.Create(e.p, e.secs, store.SecRelCols); err != nil {
 			return err
 		}
+		if e.nseg, err = createSegStore(e.p, e.secs, store.SecNodeColSeg); err != nil {
+			return err
+		}
+		if e.rseg, err = createSegStore(e.p, e.secs, store.SecRelColSeg); err != nil {
+			return err
+		}
 		if e.adj, err = adj.Create(e.p, e.secs, e.rels); err != nil {
 			return err
 		}
@@ -145,6 +154,12 @@ func (e *DiskEngine) load(create bool) error {
 		return err
 	}
 	if e.rcols, err = column.Open(e.p, e.secs, store.SecRelCols); err != nil {
+		return err
+	}
+	if e.nseg, err = openSegStore(e.p, e.secs, store.SecNodeColSeg); err != nil {
+		return err
+	}
+	if e.rseg, err = openSegStore(e.p, e.secs, store.SecRelColSeg); err != nil {
 		return err
 	}
 	if e.adj, err = adj.Open(e.p, e.secs, e.rels); err != nil {
@@ -282,6 +297,13 @@ func (e *DiskEngine) Checkpoint() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.adj.Checkpoint(uint64(e.nodes.Count())); err != nil {
+		return err
+	}
+	var err error
+	if e.nseg, err = e.foldSegmented(e.ncols, uint64(e.nodes.Count()), store.SecNodeColSeg); err != nil {
+		return err
+	}
+	if e.rseg, err = e.foldSegmented(e.rcols, uint64(e.rels.Count()), store.SecRelColSeg); err != nil {
 		return err
 	}
 	if _, err := e.commitPager(); err != nil {

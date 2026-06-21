@@ -45,6 +45,13 @@ const (
 	// SecStatsRel is the per-type relationship-count Vector (a count per
 	// relationship-type token; see package stats).
 	SecStatsRel
+	// SecNodeColSeg is the node segmented-column store directory (the compressed
+	// base columns; see package colsegstore). Its meta field holds the directory's
+	// segment-key count. Empty until the first checkpoint folds the naive columns
+	// into segments.
+	SecNodeColSeg
+	// SecRelColSeg is the relationship segmented-column store directory.
+	SecRelColSeg
 	// numSectionsInUse is the count of section ids currently defined. It must
 	// stay <= MaxSections; later milestones add ids before this marker.
 	numSectionsInUse

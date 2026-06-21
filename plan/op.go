@@ -502,84 +502,119 @@ func write(b *strings.Builder, o Op, depth int) {
 	for range depth {
 		b.WriteString("  ")
 	}
+	b.WriteString(nodeLabel(o))
+	b.WriteString("\n")
+	for _, c := range nodeChildren(o) {
+		write(b, c, depth+1)
+	}
+}
+
+// nodeLabel is the one-line text an operator renders to, without indentation,
+// children, or trailing newline. String and the annotated EXPLAIN renderer share
+// it so the two listings always name an operator the same way.
+func nodeLabel(o Op) string {
 	switch x := o.(type) {
 	case *Unit:
-		b.WriteString("Unit\n")
+		return "Unit"
 	case *Create:
-		b.WriteString("Create " + createLabel(x) + "\n")
-		write(b, x.Input, depth+1)
+		return "Create " + createLabel(x)
 	case *Merge:
-		b.WriteString("Merge " + mergeLabel(x) + "\n")
-		write(b, x.Input, depth+1)
-		write(b, x.Match, depth+1)
+		return "Merge " + mergeLabel(x)
 	case *Foreach:
-		b.WriteString("Foreach\n")
-		write(b, x.Input, depth+1)
-		write(b, x.Body, depth+1)
+		return "Foreach"
 	case *Set:
-		b.WriteString("Set " + setLabel(x) + "\n")
-		write(b, x.Input, depth+1)
+		return "Set " + setLabel(x)
 	case *Remove:
-		b.WriteString("Remove " + removeLabel(x) + "\n")
-		write(b, x.Input, depth+1)
+		return "Remove " + removeLabel(x)
 	case *Delete:
-		b.WriteString("Delete " + deleteLabel(x) + "\n")
-		write(b, x.Input, depth+1)
+		return "Delete " + deleteLabel(x)
 	case *Argument:
-		b.WriteString("Argument [" + strings.Join(x.Vars, ",") + "]\n")
+		return "Argument [" + strings.Join(x.Vars, ",") + "]"
 	case *NodeScan:
-		b.WriteString("NodeScan " + x.Var + labelSuffix(x.Labels) + "\n")
+		return "NodeScan " + x.Var + labelSuffix(x.Labels)
 	case *NodeIndexSeek:
-		b.WriteString("NodeIndexSeek " + seekLabel(x) + "\n")
+		return "NodeIndexSeek " + seekLabel(x)
 	case *Expand:
-		b.WriteString("Expand " + expandLabel(x) + "\n")
-		write(b, x.Input, depth+1)
+		return "Expand " + expandLabel(x)
 	case *Filter:
-		b.WriteString("Filter " + ast.Print(x.Pred) + "\n")
-		write(b, x.Input, depth+1)
+		return "Filter " + ast.Print(x.Pred)
 	case *BindPath:
-		b.WriteString("BindPath " + x.Var + " = [" + strings.Join(x.Elems, ",") + "]\n")
-		write(b, x.Input, depth+1)
+		return "BindPath " + x.Var + " = [" + strings.Join(x.Elems, ",") + "]"
 	case *ShortestPath:
-		b.WriteString("ShortestPath " + shortestLabel(x) + "\n")
-		write(b, x.Input, depth+1)
+		return "ShortestPath " + shortestLabel(x)
 	case *Project:
-		b.WriteString("Project" + distinct(x.Distinct) + " " + colList(x.Cols) + "\n")
-		write(b, x.Input, depth+1)
+		return "Project" + distinct(x.Distinct) + " " + colList(x.Cols)
 	case *Aggregate:
-		b.WriteString("Aggregate" + distinct(x.Distinct) + " by[" + colList(x.GroupKeys) + "] agg[" + colList(x.Aggs) + "]\n")
-		write(b, x.Input, depth+1)
+		return "Aggregate" + distinct(x.Distinct) + " by[" + colList(x.GroupKeys) + "] agg[" + colList(x.Aggs) + "]"
 	case *Join:
-		b.WriteString("Join on[" + strings.Join(x.On, ",") + "]\n")
-		write(b, x.Left, depth+1)
-		write(b, x.Right, depth+1)
+		return "Join on[" + strings.Join(x.On, ",") + "]"
 	case *Optional:
-		b.WriteString("Optional\n")
-		write(b, x.Input, depth+1)
-		write(b, x.Inner, depth+1)
+		return "Optional"
 	case *Unwind:
-		b.WriteString("Unwind " + ast.Print(x.Expr) + " AS " + x.Var + "\n")
-		if x.Input != nil {
-			write(b, x.Input, depth+1)
-		}
+		return "Unwind " + ast.Print(x.Expr) + " AS " + x.Var
 	case *Sort:
-		b.WriteString("Sort " + sortList(x.Keys) + "\n")
-		write(b, x.Input, depth+1)
+		return "Sort " + sortList(x.Keys)
 	case *Skip:
-		b.WriteString("Skip " + ast.Print(x.N) + "\n")
-		write(b, x.Input, depth+1)
+		return "Skip " + ast.Print(x.N)
 	case *Limit:
-		b.WriteString("Limit " + ast.Print(x.N) + "\n")
-		write(b, x.Input, depth+1)
+		return "Limit " + ast.Print(x.N)
 	case *Union:
-		all := ""
 		if x.All {
-			all = " ALL"
+			return "Union ALL"
 		}
-		b.WriteString("Union" + all + "\n")
-		write(b, x.Left, depth+1)
-		write(b, x.Right, depth+1)
+		return "Union"
 	}
+	return ""
+}
+
+// nodeChildren lists an operator's child subtrees in the order String renders
+// them, skipping the nil input a leading Unwind carries. It and nodeLabel are the
+// two pieces every tree walk over the rendered shape needs.
+func nodeChildren(o Op) []Op {
+	switch x := o.(type) {
+	case *Create:
+		return []Op{x.Input}
+	case *Merge:
+		return []Op{x.Input, x.Match}
+	case *Foreach:
+		return []Op{x.Input, x.Body}
+	case *Set:
+		return []Op{x.Input}
+	case *Remove:
+		return []Op{x.Input}
+	case *Delete:
+		return []Op{x.Input}
+	case *Expand:
+		return []Op{x.Input}
+	case *Filter:
+		return []Op{x.Input}
+	case *BindPath:
+		return []Op{x.Input}
+	case *ShortestPath:
+		return []Op{x.Input}
+	case *Project:
+		return []Op{x.Input}
+	case *Aggregate:
+		return []Op{x.Input}
+	case *Join:
+		return []Op{x.Left, x.Right}
+	case *Optional:
+		return []Op{x.Input, x.Inner}
+	case *Unwind:
+		if x.Input != nil {
+			return []Op{x.Input}
+		}
+		return nil
+	case *Sort:
+		return []Op{x.Input}
+	case *Skip:
+		return []Op{x.Input}
+	case *Limit:
+		return []Op{x.Input}
+	case *Union:
+		return []Op{x.Left, x.Right}
+	}
+	return nil
 }
 
 func distinct(d bool) string {

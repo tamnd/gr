@@ -347,6 +347,64 @@ func TestIndexPersistsAcrossReopen(t *testing.T) {
 	}
 }
 
+// TestCreateIndexOverExistingData confirms an index created over a populated graph
+// is built from the live data: the seek serves nodes that existed before the index
+// was declared, not just ones written afterward. CreateIndex rebuilds the index
+// from the live base, so the pre-existing rows are picked up.
+func TestCreateIndexOverExistingData(t *testing.T) {
+	fsys := vfs.NewMem()
+	e := openDisk(t, fsys, "buildover.gr")
+	defer e.Close()
+
+	// Populate Person nodes with no index declared yet.
+	label, _ := e.Intern(catalog.KindLabel, "Person")
+	key, _ := e.Intern(catalog.KindPropKey, "email")
+	tx, _ := e.Begin(true)
+	a, _ := tx.CreateNode([]Token{label})
+	b, _ := tx.CreateNode([]Token{label})
+	c, _ := tx.CreateNode([]Token{label})
+	tx.SetNodeProperty(a, key, value.String("a@x"))
+	tx.SetNodeProperty(b, key, value.String("b@x"))
+	tx.SetNodeProperty(c, key, value.String("a@x"))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// No index served the seek before the index existed.
+	rx0, _ := e.Begin(false)
+	if _, used := seekIDs(t, rx0, label, key, value.String("a@x")); used {
+		t.Fatal("a seek reported an index before one was declared")
+	}
+	rx0.Abort()
+
+	// Declare the index over the now-populated graph.
+	if _, err := e.CreateIndex("", "Person", "email", false); err != nil {
+		t.Fatal(err)
+	}
+
+	rx, _ := e.Begin(false)
+	defer rx.Abort()
+	got, used := seekIDs(t, rx, label, key, value.String("a@x"))
+	if !used {
+		t.Fatal("seek reported no index after CreateIndex")
+	}
+	if len(got) != 2 || !hasID(got, a) || !hasID(got, c) {
+		t.Fatalf("seek over pre-existing data = %v, want the two a@x nodes %d and %d", got, a, c)
+	}
+	// A later write is maintained alongside the back-filled rows.
+	wx, _ := e.Begin(true)
+	d, _ := wx.CreateNode([]Token{label})
+	wx.SetNodeProperty(d, key, value.String("a@x"))
+	if err := wx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	rx2, _ := e.Begin(false)
+	defer rx2.Abort()
+	if got, _ := seekIDs(t, rx2, label, key, value.String("a@x")); len(got) != 3 {
+		t.Fatalf("seek after a later write = %v, want three nodes", got)
+	}
+}
+
 // TestIndexDropStopsServing confirms a dropped index no longer serves seeks, so
 // the caller falls back to a scan.
 func TestIndexDropStopsServing(t *testing.T) {

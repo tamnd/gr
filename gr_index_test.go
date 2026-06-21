@@ -85,6 +85,38 @@ func TestExecIndexDoesNotChangeResults(t *testing.T) {
 	}
 }
 
+// TestExecCreateIndexOverPopulatedGraph confirms an index declared after the data
+// already exists serves queries over the pre-existing rows. A seek probes the index
+// and the retained equality filter can only trim, never add, so if the index were
+// not back-filled from the live data this query would return nothing.
+func TestExecCreateIndexOverPopulatedGraph(t *testing.T) {
+	db := openMem(t, "ixbuildover.gr")
+	defer func() { _ = db.Close() }()
+
+	mustExec(t, db, "CREATE (:Person {email: 'a@x'})", nil)
+	mustExec(t, db, "CREATE (:Person {email: 'b@x'})", nil)
+	mustExec(t, db, "CREATE (:Person {email: 'a@x'})", nil)
+
+	// Declare the index over the populated graph.
+	mustExec(t, db, "CREATE INDEX FOR (p:Person) ON (p.email)", nil)
+
+	rows := collectRows(t, db, "MATCH (p:Person) WHERE p.email = 'a@x' RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 2 {
+		t.Fatalf("count for a@x over a back-filled index = %d, want 2", n)
+	}
+	// A value present only before the index still resolves.
+	rows = collectRows(t, db, "MATCH (p:Person) WHERE p.email = 'b@x' RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 1 {
+		t.Fatalf("count for b@x over a back-filled index = %d, want 1", n)
+	}
+	// Writes after the build are maintained alongside the back-filled rows.
+	mustExec(t, db, "CREATE (:Person {email: 'a@x'})", nil)
+	rows = collectRows(t, db, "MATCH (p:Person) WHERE p.email = 'a@x' RETURN count(*) AS n", nil)
+	if n, _ := rows[0]["n"].AsInt(); n != 3 {
+		t.Fatalf("count for a@x after a later write = %d, want 3", n)
+	}
+}
+
 // TestExecIndexPersistsAcrossReopen confirms a declared index is present again
 // after a close and reopen and still serves queries.
 func TestExecIndexPersistsAcrossReopen(t *testing.T) {

@@ -83,6 +83,12 @@ func DecodeFloats(b []byte) ([]float64, error) {
 		ints, err = decodeConstant(b[1:])
 	case DICTIONARY:
 		ints, err = decodeDictInts(b[1:])
+	case BLOCK:
+		inner, uerr := unwrapBlock(b[1:])
+		if uerr != nil {
+			return nil, uerr
+		}
+		return DecodeFloats(inner)
 	default:
 		return nil, ErrBadSegment
 	}

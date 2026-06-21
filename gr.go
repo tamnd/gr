@@ -713,6 +713,36 @@ func (ix indexLookup) HasNodeIndex(label, prop uint32) bool {
 	return ix.eng.HasNodeIndex(engine.Token(label), engine.Token(prop))
 }
 
+// engineStats adapts the engine to the planner's Statistics seam, mapping the
+// planner's raw token integers to the engine's Token type and its uint64 counts to
+// the float64 the cost model works in. Like indexLookup it reads the engine's
+// committed catalog counters, so the plan cache, keyed on the catalog version,
+// invalidates a plan costed against counts that have since moved across a schema
+// change. It must not be used while a write transaction holds the engine lock, since
+// the count methods take the read lock and would deadlock against the held write
+// lock, the same restriction the index oracle has on that path.
+type engineStats struct{ eng *engine.DiskEngine }
+
+func (s engineStats) NodeCount() float64 { return float64(s.eng.NodeCount()) }
+
+func (s engineStats) RelCount() float64 { return float64(s.eng.RelCount()) }
+
+func (s engineStats) LabelCount(label uint32) float64 {
+	n, err := s.eng.NodeCountByLabel(engine.Token(label))
+	if err != nil {
+		return 0
+	}
+	return float64(n)
+}
+
+func (s engineStats) RelTypeCount(relType uint32) float64 {
+	n, err := s.eng.RelCountByType(engine.Token(relType))
+	if err != nil {
+		return 0
+	}
+	return float64(n)
+}
+
 // tokenNamer returns a reverse resolver for one catalog kind: a token to the name
 // it interns. It backs eval's entity functions (labels, type, keys, properties),
 // which return names rather than tokens (doc 09 §7).

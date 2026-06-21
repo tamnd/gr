@@ -256,7 +256,7 @@ func (e *DiskEngine) checkUniqueData(name string, label, prop uint32) error {
 		if !slices.Contains(cats, label) {
 			continue
 		}
-		v, ok, err := e.ncols.Get(prop, pos)
+		v, ok, err := e.baseNodeProp(prop, pos)
 		if err != nil {
 			return err
 		}
@@ -317,7 +317,7 @@ func (e *DiskEngine) checkExistenceData(name, propName string, label, prop uint3
 		}
 		present := false
 		if propInterned {
-			v, ok, err := e.ncols.Get(prop, pos)
+			v, ok, err := e.baseNodeProp(prop, pos)
 			if err != nil {
 				return err
 			}
@@ -369,7 +369,7 @@ func (e *DiskEngine) checkTypeData(name string, label, prop uint32, vt value.Typ
 		if !slices.Contains(cats, label) {
 			continue
 		}
-		v, ok, err := e.ncols.Get(prop, pos)
+		v, ok, err := e.baseNodeProp(prop, pos)
 		if err != nil {
 			return err
 		}

@@ -72,7 +72,7 @@ func (e *DiskEngine) rebuildIndexes() error {
 			if !slices.Contains(cats, dk.label) {
 				continue
 			}
-			v, ok, err := e.ncols.Get(dk.prop, pos)
+			v, ok, err := e.baseNodeProp(dk.prop, pos)
 			if err != nil {
 				return err
 			}

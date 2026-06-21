@@ -4,10 +4,10 @@ import (
 	"testing"
 
 	"github.com/tamnd/gr/catalog"
-	"github.com/tamnd/gr/colsegstore"
-	"github.com/tamnd/gr/column"
+	"github.com/tamnd/gr/pager"
 	"github.com/tamnd/gr/value"
 	"github.com/tamnd/gr/vfs"
+	"github.com/tamnd/gr/wal"
 )
 
 // nodePosFor resolves a node id to its dense position through the engine's id-map,
@@ -66,12 +66,14 @@ func TestCheckpointPopulatesSegmentedBase(t *testing.T) {
 	wantAbsent(t, e, toCat(name), posC)
 }
 
-// TestSegmentedBaseMatchesNaive checkpoints a graph with both node and
-// relationship properties and asserts the segmented base agrees with the naive
-// column at every live position, the invariant the read-path flip will rely on.
-func TestSegmentedBaseMatchesNaive(t *testing.T) {
+// TestCheckpointDrainsNaiveDelta checkpoints a graph with both node and
+// relationship properties, then asserts the naive delta is drained (the folded
+// values now live only in the segmented base) while the SPI still reads every
+// value back. This is the W2 contract: the read path consults the segmented base
+// with the naive store as a delta over it.
+func TestCheckpointDrainsNaiveDelta(t *testing.T) {
 	fsys := vfs.NewMem()
-	e := openDisk(t, fsys, "agree.gr")
+	e := openDisk(t, fsys, "drain.gr")
 	defer e.Close()
 
 	knows, _ := e.Intern(catalog.KindRelType, "KNOWS")
@@ -92,8 +94,211 @@ func TestSegmentedBaseMatchesNaive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertSegMatchesNaive(t, e.ncols, e.nseg, uint64(e.nodes.Count()))
-	assertSegMatchesNaive(t, e.rcols, e.rseg, uint64(e.rels.Count()))
+	// The delta is drained: no key carries a present value in the naive store.
+	if got := len(e.ncols.Keys()); got != 0 {
+		t.Fatalf("node delta not drained: %d keys remain", got)
+	}
+	if got := len(e.rcols.Keys()); got != 0 {
+		t.Fatalf("rel delta not drained: %d keys remain", got)
+	}
+
+	// The values now read back through the segmented base via the SPI.
+	rx, _ := e.Begin(false)
+	defer rx.Abort()
+	if v, _ := rx.NodeProperty(a, tag); mustStr(t, v) != "x" {
+		t.Fatalf("a.tag = %v, want x", v)
+	}
+	if v, _ := rx.NodeProperty(b, tag); mustStr(t, v) != "y" {
+		t.Fatalf("b.tag = %v, want y", v)
+	}
+	if v, _ := rx.RelProperty(r, since); mustInt(t, v) != 2015 {
+		t.Fatalf("r.since = %v, want 2015", v)
+	}
+}
+
+// TestDeltaShadowsBaseAfterCheckpoint proves a write after a checkpoint shadows
+// the folded base value, and a removal after a checkpoint hides it, both through
+// the naive delta over the segmented base.
+func TestDeltaShadowsBaseAfterCheckpoint(t *testing.T) {
+	fsys := vfs.NewMem()
+	e := openDisk(t, fsys, "shadow.gr")
+	defer e.Close()
+
+	name, _ := e.Intern(catalog.KindPropKey, "name")
+	tx, _ := e.Begin(true)
+	a, _ := tx.CreateNode(nil)
+	b, _ := tx.CreateNode(nil)
+	tx.SetNodeProperty(a, name, value.String("old-a"))
+	tx.SetNodeProperty(b, name, value.String("keep-b"))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	// After the checkpoint: overwrite a, remove b. Both values are only in the base.
+	tx2, _ := e.Begin(true)
+	tx2.SetNodeProperty(a, name, value.String("new-a"))
+	tx2.SetNodeProperty(b, name, value.Null) // removal -> tombstone over the base
+	if err := tx2.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	rx, _ := e.Begin(false)
+	defer rx.Abort()
+	if v, _ := rx.NodeProperty(a, name); mustStr(t, v) != "new-a" {
+		t.Fatalf("a.name = %v, want new-a (delta shadows base)", v)
+	}
+	if v, err := rx.NodeProperty(b, name); err != nil || !v.IsNull() {
+		t.Fatalf("b.name = %v err=%v, want null (tombstone hides base)", v, err)
+	}
+}
+
+// TestMultiCheckpointAccumulates writes across two checkpoints and asserts both
+// values survive: the second fold merges the new delta over the base the first
+// fold produced, rather than rebuilding from the delta alone.
+func TestMultiCheckpointAccumulates(t *testing.T) {
+	fsys := vfs.NewMem()
+	e := openDisk(t, fsys, "accum.gr")
+	defer e.Close()
+
+	first, _ := e.Intern(catalog.KindPropKey, "first")
+	second, _ := e.Intern(catalog.KindPropKey, "second")
+
+	tx, _ := e.Begin(true)
+	a, _ := tx.CreateNode(nil)
+	tx.SetNodeProperty(a, first, value.Int(1))
+	tx.Commit()
+	if err := e.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A different key after the first fold; the second fold must keep the first.
+	tx2, _ := e.Begin(true)
+	tx2.SetNodeProperty(a, second, value.Int(2))
+	tx2.Commit()
+	if err := e.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	rx, _ := e.Begin(false)
+	defer rx.Abort()
+	if v, _ := rx.NodeProperty(a, first); mustInt(t, v) != 1 {
+		t.Fatalf("a.first = %v, want 1 (survived second fold)", v)
+	}
+	if v, _ := rx.NodeProperty(a, second); mustInt(t, v) != 2 {
+		t.Fatalf("a.second = %v, want 2", v)
+	}
+}
+
+// TestSnapshotStableAcrossCheckpoint proves an open read snapshot keeps seeing its
+// values even after a later transaction overwrites them and a checkpoint folds the
+// new values into the base: the overlay still answers the old snapshot.
+func TestSnapshotStableAcrossCheckpoint(t *testing.T) {
+	fsys := vfs.NewMem()
+	e := openDisk(t, fsys, "snap.gr")
+	defer e.Close()
+
+	name, _ := e.Intern(catalog.KindPropKey, "name")
+	tx, _ := e.Begin(true)
+	a, _ := tx.CreateNode(nil)
+	tx.SetNodeProperty(a, name, value.String("v1"))
+	tx.Commit()
+	if err := e.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open a reader, then overwrite and checkpoint underneath it.
+	old, _ := e.Begin(false)
+	defer old.Abort()
+
+	tx2, _ := e.Begin(true)
+	tx2.SetNodeProperty(a, name, value.String("v2"))
+	tx2.Commit()
+	if err := e.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	if v, _ := old.NodeProperty(a, name); mustStr(t, v) != "v1" {
+		t.Fatalf("old snapshot a.name = %v, want v1", v)
+	}
+	now, _ := e.Begin(false)
+	defer now.Abort()
+	if v, _ := now.NodeProperty(a, name); mustStr(t, v) != "v2" {
+		t.Fatalf("fresh snapshot a.name = %v, want v2", v)
+	}
+}
+
+// TestPropertyKeysAfterCheckpoint proves NodePropertyKeys finds a property folded
+// into the base, not just one written since the last checkpoint, because the
+// candidate keys union the delta and the base.
+func TestPropertyKeysAfterCheckpoint(t *testing.T) {
+	fsys := vfs.NewMem()
+	e := openDisk(t, fsys, "keys.gr")
+	defer e.Close()
+
+	folded, _ := e.Intern(catalog.KindPropKey, "folded")
+	fresh, _ := e.Intern(catalog.KindPropKey, "fresh")
+
+	tx, _ := e.Begin(true)
+	a, _ := tx.CreateNode(nil)
+	tx.SetNodeProperty(a, folded, value.Int(1))
+	tx.Commit()
+	if err := e.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	tx2, _ := e.Begin(true)
+	tx2.SetNodeProperty(a, fresh, value.Int(2))
+	tx2.Commit()
+
+	rx, _ := e.Begin(false)
+	defer rx.Abort()
+	keys, err := rx.NodePropertyKeys(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("property keys = %v, want both folded and fresh", keys)
+	}
+}
+
+// TestSegmentedBaseRecoversAfterCrash proves the checkpoint's section swap is
+// crash safe: after a checkpoint commits, snapshotting the media without a clean
+// close and reopening recovers the folded base from the WAL, with the values
+// intact and the naive delta drained.
+func TestSegmentedBaseRecoversAfterCrash(t *testing.T) {
+	fsys := vfs.NewMem()
+	e := openDisk(t, fsys, "crash.gr")
+
+	name, _ := e.Intern(catalog.KindPropKey, "name")
+	tx, _ := e.Begin(true)
+	a, _ := tx.CreateNode(nil)
+	tx.SetNodeProperty(a, name, value.String("durable"))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Crash: snapshot the media with no clean close, reopen on the copy.
+	crashed := fsys.Snapshot()
+	e2, err := Open(crashed, "crash.gr", pager.Options{Sync: wal.SyncFull, SaltSeed: 1})
+	if err != nil {
+		t.Fatalf("reopen after crash: %v", err)
+	}
+	defer e2.Close()
+
+	if got := len(e2.ncols.Keys()); got != 0 {
+		t.Fatalf("recovered delta not drained: %d keys", got)
+	}
+	name2, _ := e2.Lookup(catalog.KindPropKey, "name")
+	rx, _ := e2.Begin(false)
+	defer rx.Abort()
+	if v, _ := rx.NodeProperty(a, name2); mustStr(t, v) != "durable" {
+		t.Fatalf("recovered a.name = %v, want durable", v)
+	}
 }
 
 // TestSegmentedBaseSurvivesReopen proves the folded segments are durable: after a
@@ -180,26 +385,3 @@ func wantAbsent(t *testing.T, e *DiskEngine, key uint32, pos uint64) {
 	}
 }
 
-// assertSegMatchesNaive checks the segmented store agrees with the naive column at
-// every position over [0, count) for every key the naive store knows.
-func assertSegMatchesNaive(t *testing.T, naive *column.Columns, seg *colsegstore.Store, count uint64) {
-	t.Helper()
-	for _, key := range naive.Keys() {
-		for pos := range count {
-			nv, nok, err := naive.Get(key, pos)
-			if err != nil {
-				t.Fatal(err)
-			}
-			sv, sok, err := seg.Get(key, pos)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if nok != sok {
-				t.Fatalf("key %d pos %d presence: naive=%v seg=%v", key, pos, nok, sok)
-			}
-			if nok && !nv.Equal(sv) {
-				t.Fatalf("key %d pos %d: naive=%v seg=%v", key, pos, nv, sv)
-			}
-		}
-	}
-}

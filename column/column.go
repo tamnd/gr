@@ -34,11 +34,33 @@ import (
 // count, then its values Log head and byte length.
 const dirStride = 32
 
-// idxStride is one index cell: a flags byte (bit 0 = present), then the value's
-// length and offset into the values Log. Bytes 1..3 are reserved padding.
+// idxStride is one index cell: a flags byte (bit 0 = present, bit 1 = tombstone),
+// then the value's length and offset into the values Log. Bytes 1..3 are reserved
+// padding.
 const idxStride = 16
 
-const flagPresent = 0x01
+const (
+	flagPresent   = 0x01
+	flagTombstone = 0x02
+)
+
+// Presence is the three-valued result of reading this store as a delta layer over
+// a base (see [Columns.GetDelta]): a value is present, a tombstone marks it
+// deleted, or the position carries no entry so a layered read falls through to the
+// base.
+type Presence uint8
+
+const (
+	// Missing means no entry in this layer: a position with no index cell, a key
+	// with no column, or a cleared cell with neither flag set (a gap fill from a
+	// later write growing the index). A layered read falls through to the base.
+	Missing Presence = iota
+	// Present means a value is stored at this position.
+	Present
+	// Deleted means a tombstone: the read resolves absent and does not fall
+	// through, so a delta removal hides a value in the base.
+	Deleted
+)
 
 // Columns is one columnar property store (node or relationship), anchored at its
 // directory section. Open columns are cached; an unopened column is materialized
@@ -248,6 +270,74 @@ func (c *Columns) Remove(key uint32, pos uint64) error {
 	}
 	cell[0] &^= flagPresent
 	return col.idx.Set(int(pos), cell[:])
+}
+
+// GetDelta reads property key at position pos treating this store as a delta layer
+// over a base: it reports whether the position is present (with its value),
+// tombstoned, or missing. A missing position has no index cell, a cleared cell
+// with neither flag set, or a key with no column, all of which a layered read
+// resolves by falling through to the base. A tombstone resolves absent without
+// falling through. This is the read the engine uses once the store is a
+// post-checkpoint delta over the segmented base (doc 14 §4.7).
+func (c *Columns) GetDelta(key uint32, pos uint64) (value.Value, Presence, error) {
+	if int(key) >= c.dir.Count() {
+		return value.Null, Missing, nil
+	}
+	col, err := c.ensureColumn(key)
+	if err != nil {
+		return value.Null, Missing, err
+	}
+	if int(pos) >= col.idx.Count() {
+		return value.Null, Missing, nil
+	}
+	var cell [idxStride]byte
+	if err := col.idx.Get(int(pos), cell[:]); err != nil {
+		return value.Null, Missing, err
+	}
+	switch {
+	case cell[0]&flagPresent != 0:
+		n := format.U32(cell[4:8])
+		off := format.U64(cell[8:16])
+		buf := make([]byte, n)
+		if err := col.vals.Read(int(off), int(n), buf); err != nil {
+			return value.Null, Missing, err
+		}
+		v, _, err := format.DecodeValue(buf)
+		if err != nil {
+			return value.Null, Missing, err
+		}
+		return v, Present, nil
+	case cell[0]&flagTombstone != 0:
+		return value.Null, Deleted, nil
+	default:
+		return value.Null, Missing, nil
+	}
+}
+
+// Tombstone marks property key at position pos as deleted in this delta layer, so
+// a layered read resolves it absent without falling through to the base. It grows
+// the index to cover pos if needed and clears any present flag there. This is the
+// removal form once the store is a delta over a base: a plain [Columns.Remove]
+// only clears the present flag, which a base read cannot tell apart from a never
+// written position, so it would wrongly expose the base value. Durable when the
+// transaction commits.
+func (c *Columns) Tombstone(key uint32, pos uint64) error {
+	col, err := c.ensureColumn(key)
+	if err != nil {
+		return err
+	}
+	empty := make([]byte, idxStride)
+	for col.idx.Count() <= int(pos) {
+		if _, err := col.idx.Append(empty); err != nil {
+			return err
+		}
+	}
+	var cell [idxStride]byte
+	cell[0] = flagTombstone
+	if err := col.idx.Set(int(pos), cell[:]); err != nil {
+		return err
+	}
+	return c.writeDir(key, col)
 }
 
 // Keys returns the property-key tokens that have a column in this store. A key

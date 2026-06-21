@@ -44,6 +44,7 @@ package adj
 import (
 	"slices"
 
+	"github.com/tamnd/gr/colcodec"
 	"github.com/tamnd/gr/format"
 	"github.com/tamnd/gr/pager"
 	"github.com/tamnd/gr/rel"
@@ -72,15 +73,21 @@ type Neighbor struct {
 // tokens are dense, so slots are dense and the directory Vector packs tightly.
 func slot(relType uint32, d Dir) uint32 { return relType*2 + uint32(d) }
 
-// dirStride is one base-directory cell: the offset array's head and length, the
-// neighbor and edge arrays' heads, and the shared run length.
+// dirStride is one base-directory cell. The three CSR arrays of a slot are stored
+// compressed as colcodec blobs packed into one append-only log (doc 15 §15), so a
+// cell records the log's head page, the byte length of each of the three blobs in
+// log order (offsets, neighbors, edges), and the logical offset count. The blob
+// byte lengths slice the three apart; the offset count bounds the source range
+// without decoding.
 const dirStride = 40
 
-// base holds the opened base CSR arrays for one slot.
+// base holds the decoded base CSR arrays for one slot. openBase decodes the three
+// compressed blobs once and caches the result here, so a run lookup indexes plain
+// slices rather than re-reading pages (doc 15 §15.9).
 type base struct {
-	off *store.Vector // u64 offsets, length nodeCount+1
-	nbr *store.Vector // u64 neighbor node positions
-	edg *store.Vector // u64 edge (relationship) positions
+	off []uint64 // offsets, length nodeCount+1
+	nbr []uint64 // neighbor node positions
+	edg []uint64 // edge (relationship) positions
 }
 
 // Adj is the adjacency index over a relationship store.
@@ -297,15 +304,7 @@ func (a *Adj) baseDegree(s uint32, src uint64) (int64, error) {
 	if b == nil || src+1 >= offLen {
 		return 0, nil
 	}
-	lo, err := getU64(b.off, int(src))
-	if err != nil {
-		return 0, err
-	}
-	hi, err := getU64(b.off, int(src+1))
-	if err != nil {
-		return 0, err
-	}
-	return int64(hi - lo), nil
+	return int64(b.off[src+1] - b.off[src]), nil
 }
 
 // baseRun returns the base CSR run for a source in a slot, or nil if the slot has
@@ -321,57 +320,68 @@ func (a *Adj) baseRun(s uint32, src uint64) ([]Neighbor, error) {
 	if b == nil || src+1 >= offLen {
 		return nil, nil
 	}
-	lo, err := getU64(b.off, int(src))
-	if err != nil {
-		return nil, err
-	}
-	hi, err := getU64(b.off, int(src+1))
-	if err != nil {
-		return nil, err
-	}
+	lo, hi := b.off[src], b.off[src+1]
 	out := make([]Neighbor, 0, hi-lo)
 	for k := lo; k < hi; k++ {
-		node, err := getU64(b.nbr, int(k))
-		if err != nil {
-			return nil, err
-		}
-		edge, err := getU64(b.edg, int(k))
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, Neighbor{Node: node, Edge: edge})
+		out = append(out, Neighbor{Node: b.nbr[k], Edge: b.edg[k]})
 	}
 	return out, nil
 }
 
-// openBase materializes and caches a slot's base arrays from its directory cell.
-// It returns the offset-array length so callers can bound the source range.
+// openBase decodes and caches a slot's base arrays from its directory cell. It
+// returns the offset-array length so callers can bound the source range. The three
+// arrays are colcodec blobs packed in one log; this decodes all three at once and
+// caches them, so a later run lookup for the same slot reads from memory.
 func (a *Adj) openBase(s uint32) (*base, uint64, error) {
-	offHead, offLen, nbrHead, edgHead, runLen, err := a.readDir(s)
+	c, err := a.readDir(s)
 	if err != nil {
 		return nil, 0, err
 	}
-	if offLen == 0 {
+	if c.offLen == 0 {
 		return nil, 0, nil
 	}
 	if b, ok := a.cache[s]; ok {
-		return b, offLen, nil
+		return b, c.offLen, nil
 	}
-	off, err := store.OpenVector(a.p, offHead, 8, int(offLen))
+	total := int(c.offBytes + c.nbrBytes + c.edgBytes)
+	log, err := store.OpenLog(a.p, c.logHead, total)
 	if err != nil {
 		return nil, 0, err
 	}
-	nbr, err := store.OpenVector(a.p, nbrHead, 8, int(runLen))
+	blob := make([]byte, total)
+	if err := log.Read(0, total, blob); err != nil {
+		return nil, 0, err
+	}
+	off, err := decodeArray(blob[:c.offBytes])
 	if err != nil {
 		return nil, 0, err
 	}
-	edg, err := store.OpenVector(a.p, edgHead, 8, int(runLen))
+	nbr, err := decodeArray(blob[c.offBytes : c.offBytes+c.nbrBytes])
+	if err != nil {
+		return nil, 0, err
+	}
+	edg, err := decodeArray(blob[c.offBytes+c.nbrBytes:])
 	if err != nil {
 		return nil, 0, err
 	}
 	b := &base{off: off, nbr: nbr, edg: edg}
 	a.cache[s] = b
-	return b, offLen, nil
+	return b, c.offLen, nil
+}
+
+// decodeArray decodes one colcodec integer blob into unsigned positions. The CSR
+// arrays are all non-negative (offsets, dense node ids, dense edge ids), so the
+// int64 the codec yields maps straight back to the uint64 it was encoded from.
+func decodeArray(blob []byte) ([]uint64, error) {
+	vals, err := colcodec.Decode(blob)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]uint64, len(vals))
+	for i, v := range vals {
+		out[i] = uint64(v)
+	}
+	return out, nil
 }
 
 // freeOldBase returns a slot's current base CSR vectors to the pager free list.
@@ -380,48 +390,51 @@ func (a *Adj) openBase(s uint32) (*base, uint64, error) {
 // edge vectors are unreferenced once it starts. An empty slot (no offsets) owns no
 // base pages, so there is nothing to free.
 func (a *Adj) freeOldBase(s uint32) error {
-	offHead, offLen, nbrHead, edgHead, _, err := a.readDir(s)
+	c, err := a.readDir(s)
 	if err != nil {
 		return err
 	}
-	if offLen == 0 {
+	if c.offLen == 0 || c.logHead == 0 {
 		return nil
 	}
-	for _, head := range []format.PageID{offHead, nbrHead, edgHead} {
-		if head == 0 {
-			continue
-		}
-		v, err := store.OpenVector(a.p, head, 8, 0)
-		if err != nil {
-			return err
-		}
-		if err := v.Free(); err != nil {
-			return err
-		}
+	log, err := store.OpenLog(a.p, c.logHead, 0)
+	if err != nil {
+		return err
 	}
-	return nil
+	return log.Free()
 }
 
-func (a *Adj) readDir(s uint32) (offHead format.PageID, offLen uint64, nbrHead, edgHead format.PageID, runLen uint64, err error) {
-	var buf [dirStride]byte
-	if err = a.dir.Get(int(s), buf[:]); err != nil {
-		return
-	}
-	offHead = format.PageID(format.U64(buf[0:8]))
-	offLen = format.U64(buf[8:16])
-	nbrHead = format.PageID(format.U64(buf[16:24]))
-	edgHead = format.PageID(format.U64(buf[24:32]))
-	runLen = format.U64(buf[32:40])
-	return
+// dirCell is one slot's decoded directory entry: the compressed-blob log's head
+// page, the byte lengths of the offsets, neighbors, and edges blobs (in that log
+// order), and the logical offset count (nodeCount+1). An empty slot has logHead
+// zero and offLen zero.
+type dirCell struct {
+	logHead                    format.PageID
+	offBytes, nbrBytes, edgBytes uint64
+	offLen                     uint64
 }
 
-func (a *Adj) writeDir(s uint32, offHead format.PageID, offLen uint64, nbrHead, edgHead format.PageID, runLen uint64) error {
+func (a *Adj) readDir(s uint32) (dirCell, error) {
 	var buf [dirStride]byte
-	format.PutU64(buf[0:8], uint64(offHead))
-	format.PutU64(buf[8:16], offLen)
-	format.PutU64(buf[16:24], uint64(nbrHead))
-	format.PutU64(buf[24:32], uint64(edgHead))
-	format.PutU64(buf[32:40], runLen)
+	if err := a.dir.Get(int(s), buf[:]); err != nil {
+		return dirCell{}, err
+	}
+	return dirCell{
+		logHead:  format.PageID(format.U64(buf[0:8])),
+		offBytes: format.U64(buf[8:16]),
+		nbrBytes: format.U64(buf[16:24]),
+		edgBytes: format.U64(buf[24:32]),
+		offLen:   format.U64(buf[32:40]),
+	}, nil
+}
+
+func (a *Adj) writeDir(s uint32, c dirCell) error {
+	var buf [dirStride]byte
+	format.PutU64(buf[0:8], uint64(c.logHead))
+	format.PutU64(buf[8:16], c.offBytes)
+	format.PutU64(buf[16:24], c.nbrBytes)
+	format.PutU64(buf[24:32], c.edgBytes)
+	format.PutU64(buf[32:40], c.offLen)
 	return a.dir.Set(int(s), buf[:])
 }
 
@@ -486,44 +499,31 @@ func (a *Adj) Checkpoint(nodeCount uint64) error {
 		perSrc := group[uint32(s)]
 		if len(perSrc) == 0 {
 			// No edges for this slot: write an empty cell.
-			if err := a.writeDir(uint32(s), 0, 0, 0, 0, 0); err != nil {
+			if err := a.writeDir(uint32(s), dirCell{}); err != nil {
 				return err
 			}
 			continue
 		}
-		off, err := store.CreateVector(a.p, 8, format.PageTypeRelGroup)
-		if err != nil {
-			return err
-		}
-		nbr, err := store.CreateVector(a.p, 8, format.PageTypeRelGroup)
-		if err != nil {
-			return err
-		}
-		edg, err := store.CreateVector(a.p, 8, format.PageTypeRelGroup)
-		if err != nil {
-			return err
-		}
+		// Build the three CSR arrays in memory: the offset array (cumulative degree),
+		// the neighbor array (each source's run sorted), and the parallel edge array.
+		offsets := make([]uint64, nodeCount+1)
+		var nbrs, edges []uint64
 		var running uint64
-		if err := appendU64(off, running); err != nil { // offset[0] = 0
-			return err
-		}
 		for i := range nodeCount {
 			list := perSrc[i]
 			slices.SortFunc(list, cmpNeighbor)
 			for _, nb := range list {
-				if err := appendU64(nbr, nb.Node); err != nil {
-					return err
-				}
-				if err := appendU64(edg, nb.Edge); err != nil {
-					return err
-				}
+				nbrs = append(nbrs, nb.Node)
+				edges = append(edges, nb.Edge)
 			}
 			running += uint64(len(list))
-			if err := appendU64(off, running); err != nil {
-				return err
-			}
+			offsets[i+1] = running
 		}
-		if err := a.writeDir(uint32(s), off.Head(), nodeCount+1, nbr.Head(), edg.Head(), running); err != nil {
+		cell, err := a.writeSlotBlobs(offsets, nbrs, edges)
+		if err != nil {
+			return err
+		}
+		if err := a.writeDir(uint32(s), cell); err != nil {
 			return err
 		}
 	}
@@ -555,17 +555,42 @@ func (a *Adj) DeltaLen() int {
 	return n
 }
 
-func getU64(v *store.Vector, i int) (uint64, error) {
-	var buf [8]byte
-	if err := v.Get(i, buf[:]); err != nil {
-		return 0, err
+// writeSlotBlobs compresses a slot's three CSR arrays and packs them into one
+// fresh log, returning the directory cell that locates them. Each array is run
+// through the colcodec cascade, which picks the smallest scheme for its shape: the
+// monotone offsets fall to delta-FOR, the sorted-per-run neighbors to delta, the
+// clustered edge ids to FOR (doc 15 §15.2-§15.4). The blobs are appended in the
+// fixed order offsets, neighbors, edges, so the byte lengths in the cell slice
+// them apart on read.
+func (a *Adj) writeSlotBlobs(offsets, nbrs, edges []uint64) (dirCell, error) {
+	offBlob := encodeArray(offsets)
+	nbrBlob := encodeArray(nbrs)
+	edgBlob := encodeArray(edges)
+	log, err := store.CreateLog(a.p, format.PageTypeRelGroup)
+	if err != nil {
+		return dirCell{}, err
 	}
-	return format.U64(buf[:]), nil
+	for _, blob := range [][]byte{offBlob, nbrBlob, edgBlob} {
+		if _, err := log.Append(blob); err != nil {
+			return dirCell{}, err
+		}
+	}
+	return dirCell{
+		logHead:  log.Head(),
+		offBytes: uint64(len(offBlob)),
+		nbrBytes: uint64(len(nbrBlob)),
+		edgBytes: uint64(len(edgBlob)),
+		offLen:   uint64(len(offsets)),
+	}, nil
 }
 
-func appendU64(v *store.Vector, x uint64) error {
-	var buf [8]byte
-	format.PutU64(buf[:], x)
-	_, err := v.Append(buf[:])
-	return err
+// encodeArray compresses a CSR array of unsigned positions with the colcodec
+// cascade. The uint64-to-int64 cast is bit-preserving and the matching cast in
+// decodeArray reverses it, so a dense id with its top bit set still round-trips.
+func encodeArray(vals []uint64) []byte {
+	ints := make([]int64, len(vals))
+	for i, v := range vals {
+		ints[i] = int64(v)
+	}
+	return colcodec.Encode(ints)
 }

@@ -1,6 +1,7 @@
 package eval
 
 import (
+	"github.com/tamnd/gr/catalog"
 	"github.com/tamnd/gr/engine"
 	"github.com/tamnd/gr/value"
 )
@@ -70,7 +71,8 @@ func (f *fakeTx) CreateRel(engine.NodeID, engine.NodeID, engine.Token) (engine.R
 	return 0, nil
 }
 func (f *fakeTx) DeleteRel(engine.RelID) error                                   { return nil }
-func (f *fakeTx) InternPropKey(string) (engine.Token, error)                     { return 0, nil }
+func (f *fakeTx) Intern(catalog.Kind, string) (engine.Token, error)              { return 0, nil }
+func (f *fakeTx) Lookup(catalog.Kind, string) (engine.Token, bool)               { return 0, false }
 func (f *fakeTx) SetNodeProperty(engine.NodeID, engine.Token, value.Value) error { return nil }
 func (f *fakeTx) SetRelProperty(engine.RelID, engine.Token, value.Value) error   { return nil }
 func (f *fakeTx) AddLabel(engine.NodeID, engine.Token) error                     { return nil }

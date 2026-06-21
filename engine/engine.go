@@ -14,7 +14,10 @@
 // engine lands in M1.
 package engine
 
-import "github.com/tamnd/gr/value"
+import (
+	"github.com/tamnd/gr/catalog"
+	"github.com/tamnd/gr/value"
+)
 
 // NodeID is the stable element id of a node (doc 04 §3, the two-id scheme's
 // public half). It is opaque to the query stack.
@@ -127,13 +130,23 @@ type Tx interface {
 	AddLabel(id NodeID, label Token) error
 	// RemoveLabel removes a label from a node.
 	RemoveLabel(id NodeID, label Token) error
-	// InternPropKey maps a property-key name to its token, assigning one if new,
-	// as part of this write transaction. A clause whose keys are only known at
-	// run time (a map-form SET over a parameter map, doc 13 §6.4) cannot intern
-	// them before the transaction opens, so it interns them here under the write
-	// lock the transaction already holds. The token becomes durable when the
-	// transaction commits. It errors on a read transaction.
-	InternPropKey(name string) (Token, error)
+	// Intern maps a label, relationship-type, or property-key name to its token,
+	// assigning one if new, as part of this write transaction. A write clause's
+	// names cannot all be interned before the transaction opens: a map-form SET's
+	// keys are known only at run time (doc 13 §6.4), and interning before the
+	// transaction would leave orphan tokens behind if the transaction then aborts
+	// (doc 13 §16). So a write interns its names here, under the write lock the
+	// transaction already holds, and the tokens become durable on commit and roll
+	// back on abort. It errors on a read transaction.
+	Intern(kind catalog.Kind, name string) (Token, error)
+
+	// Lookup resolves an already-interned name to its token within this
+	// transaction's catalog view, reporting false if the name is unknown. It is
+	// lock-free (a write transaction already holds the engine lock, a read
+	// transaction needs no lock for an append-only dictionary read) and sees names
+	// this transaction has interned but not yet committed, so a write can bind its
+	// own freshly interned names while it still holds the write lock (doc 13 §9).
+	Lookup(kind catalog.Kind, name string) (Token, bool)
 
 	// --- lifecycle ---
 

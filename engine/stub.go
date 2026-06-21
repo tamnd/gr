@@ -2,8 +2,10 @@ package engine
 
 import (
 	"errors"
+	"strconv"
 	"sync"
 
+	"github.com/tamnd/gr/catalog"
 	"github.com/tamnd/gr/value"
 )
 
@@ -22,14 +24,14 @@ var (
 // against the SPI before the real storage engine (M1) lands. M1 replaces this
 // with the durable, snapshot-isolated implementation behind the same interface.
 type MemEngine struct {
-	mu      sync.Mutex
-	nodes   map[NodeID]*memNode
-	rels    map[RelID]*memRel
-	nextN   NodeID
-	nextR   RelID
-	propKey map[string]Token
-	nextTok Token
-	closed  bool
+	mu       sync.Mutex
+	nodes    map[NodeID]*memNode
+	rels     map[RelID]*memRel
+	nextN    NodeID
+	nextR    RelID
+	interned map[string]Token
+	nextTok  Token
+	closed   bool
 }
 
 type memNode struct {
@@ -48,12 +50,12 @@ type memRel struct {
 // NewMemEngine returns an empty in-memory stub engine.
 func NewMemEngine() *MemEngine {
 	return &MemEngine{
-		nodes:   make(map[NodeID]*memNode),
-		rels:    make(map[RelID]*memRel),
-		nextN:   1,
-		nextR:   1,
-		propKey: make(map[string]Token),
-		// Interned keys start well above the small tokens tests assign by hand,
+		nodes:    make(map[NodeID]*memNode),
+		rels:     make(map[RelID]*memRel),
+		nextN:    1,
+		nextR:    1,
+		interned: make(map[string]Token),
+		// Interned names start well above the small tokens tests assign by hand,
 		// so a run-time intern never collides with a fixture's literal token.
 		nextTok: 1000,
 	}
@@ -330,19 +332,27 @@ func removeRel(s []RelID, id RelID) []RelID {
 	return s
 }
 
-func (t *memTx) InternPropKey(name string) (Token, error) {
+func (t *memTx) Intern(kind catalog.Kind, name string) (Token, error) {
 	if !t.write {
 		return 0, ErrReadOnlyTx
 	}
 	t.e.mu.Lock()
 	defer t.e.mu.Unlock()
-	if tok, ok := t.e.propKey[name]; ok {
+	key := strconv.Itoa(int(kind)) + ":" + name
+	if tok, ok := t.e.interned[key]; ok {
 		return tok, nil
 	}
 	tok := t.e.nextTok
 	t.e.nextTok++
-	t.e.propKey[name] = tok
+	t.e.interned[key] = tok
 	return tok, nil
+}
+
+func (t *memTx) Lookup(kind catalog.Kind, name string) (Token, bool) {
+	t.e.mu.Lock()
+	defer t.e.mu.Unlock()
+	tok, ok := t.e.interned[strconv.Itoa(int(kind))+":"+name]
+	return tok, ok
 }
 
 func (t *memTx) SetNodeProperty(id NodeID, key Token, v value.Value) error {

@@ -165,12 +165,13 @@ type Summary struct {
 // transaction, and commits once the whole statement has run; any error aborts the
 // transaction, leaving the database unchanged.
 //
-// The names a CREATE introduces (labels, relationship types, property keys) are
-// interned before the transaction begins, because interning is its own durable
-// transaction and the engine's write lock is not reentrant (doc 13 §9). A
-// statement that turns out to write nothing still runs; a read-only statement runs
-// too and reports an empty summary, so Exec is a superset of Query for callers that
-// do not need streamed rows.
+// The transaction is begun first, then the names a write clause introduces
+// (labels, relationship types, property keys) are interned inside it through the
+// write SPI (doc 13 §9): interning under the held write lock keeps the new tokens
+// part of this transaction, so an abort rolls them back and leaves no orphan token
+// (doc 13 §16). A statement that turns out to write nothing still runs; a
+// read-only statement runs too and reports an empty summary, so Exec is a superset
+// of Query for callers that do not need streamed rows.
 //
 // params supplies the values for the statement's $-parameters; a nil map is fine
 // for a parameterless statement.
@@ -185,18 +186,23 @@ func (db *DB) Exec(cypher string, params map[string]value.Value) (Summary, error
 	if q.Schema != nil {
 		return db.execSchema(q.Schema)
 	}
-	if err := db.internWriteNames(q); err != nil {
-		return Summary{}, err
-	}
-	b, err := bind.Bind(q, bind.NewEngineCatalog(db.eng), false)
-	if err != nil {
-		return Summary{}, err
-	}
-	op := plan.Plan(b)
 	tx, err := db.eng.Begin(true)
 	if err != nil {
 		return Summary{}, err
 	}
+	if err := internWriteNames(tx, q); err != nil {
+		_ = tx.Abort()
+		return Summary{}, err
+	}
+	// Bind against the transaction's own catalog view, not the engine's: the write
+	// tx holds the engine lock, so an engine lookup would deadlock, and binding
+	// through the tx lets the statement resolve the names it just interned.
+	b, err := bind.Bind(q, bind.NewEngineCatalog(tx), false)
+	if err != nil {
+		_ = tx.Abort()
+		return Summary{}, err
+	}
+	op := plan.Plan(b)
 	eff := &exec.SideEffects{}
 	ctx := &exec.Ctx{
 		Tx:          tx,
@@ -270,30 +276,31 @@ func drain(op plan.Op, ctx *exec.Ctx) error {
 
 // internWriteNames interns every label, relationship type, and property key a
 // statement's write clauses introduce, so the subsequent bind resolves them to
-// known tokens. It interns nothing for a name already in the catalog (interning is
-// idempotent but commits a durable transaction, so the Lookup avoids needless
-// commits) and touches only write clauses (a name read by MATCH must stay unknown
-// when absent, matching nothing rather than being created).
-func (db *DB) internWriteNames(q *ast.Query) error {
+// known tokens. It interns inside the open write transaction (tx.Intern), so the
+// new tokens are part of this transaction and roll back with it on abort (doc 13
+// §16); interning is idempotent, so a name already in the catalog is a no-op. It
+// touches only write clauses: a name read by MATCH must stay unknown when absent,
+// matching nothing rather than being created.
+func internWriteNames(tx engine.Tx, q *ast.Query) error {
 	for _, sq := range singleQueries(q) {
 		for _, c := range sq.Clauses {
 			switch cl := c.(type) {
 			case *ast.Create:
 				for _, pp := range cl.Patterns {
-					if err := db.internPatternNames(pp); err != nil {
+					if err := internPatternNames(tx, pp); err != nil {
 						return err
 					}
 				}
 			case *ast.Merge:
-				if err := db.internMergeNames(cl); err != nil {
+				if err := internMergeNames(tx, cl); err != nil {
 					return err
 				}
 			case *ast.Set:
-				if err := db.internSetNames(cl); err != nil {
+				if err := internSetItemNames(tx, cl.Items); err != nil {
 					return err
 				}
 			case *ast.Foreach:
-				if err := db.internForeachNames(cl); err != nil {
+				if err := internForeachNames(tx, cl); err != nil {
 					return err
 				}
 			}
@@ -305,28 +312,21 @@ func (db *DB) internWriteNames(q *ast.Query) error {
 	return nil
 }
 
-// internSetNames interns the names a SET clause introduces: the property key of
-// each single-property assignment and every label of each label addition. The
-// map forms (SET n = m, SET n += m) carry no static key, so the switch skips
-// them; their keys come from the value at run time and the executor interns them
-// inside the write transaction through Tx.InternPropKey (doc 13 §6.4).
-func (db *DB) internSetNames(s *ast.Set) error {
-	return db.internSetItemNames(s.Items)
-}
-
 // internSetItemNames interns the static names a list of SET items introduces, the
-// shared body of internSetNames and the ON CREATE / ON MATCH parts of MERGE. The
-// map forms carry no static key (see internSetNames).
-func (db *DB) internSetItemNames(items []ast.SetItem) error {
+// body of a SET clause and of MERGE's ON CREATE / ON MATCH parts. The map forms
+// (SET n = m, SET n += m) carry no static key, so the switch skips them; their
+// keys come from the value at run time and the executor interns them inside the
+// write transaction through Tx.Intern (doc 13 §6.4).
+func internSetItemNames(tx engine.Tx, items []ast.SetItem) error {
 	for _, it := range items {
 		switch it.Op {
 		case ast.SetProperty:
-			if err := db.internName(catalog.KindPropKey, it.Key); err != nil {
+			if err := internName(tx, catalog.KindPropKey, it.Key); err != nil {
 				return err
 			}
 		case ast.SetLabels:
 			for _, l := range it.Labels {
-				if err := db.internName(catalog.KindLabel, l); err != nil {
+				if err := internName(tx, catalog.KindLabel, l); err != nil {
 					return err
 				}
 			}
@@ -339,38 +339,38 @@ func (db *DB) internSetItemNames(items []ast.SetItem) error {
 // and property keys of its pattern (it may create the whole pattern, so its names
 // must resolve like CREATE's, doc 13 §11.2) and the static names of its ON CREATE
 // and ON MATCH set items.
-func (db *DB) internMergeNames(m *ast.Merge) error {
-	if err := db.internPatternNames(m.Pattern); err != nil {
+func internMergeNames(tx engine.Tx, m *ast.Merge) error {
+	if err := internPatternNames(tx, m.Pattern); err != nil {
 		return err
 	}
-	if err := db.internSetItemNames(m.OnCreate); err != nil {
+	if err := internSetItemNames(tx, m.OnCreate); err != nil {
 		return err
 	}
-	return db.internSetItemNames(m.OnMatch)
+	return internSetItemNames(tx, m.OnMatch)
 }
 
 // internForeachNames interns the static names a FOREACH body introduces. The body
 // holds only write clauses (doc 13 §10.2); each is interned like its top-level
 // form, and a nested FOREACH recurses. REMOVE and DELETE introduce no names.
-func (db *DB) internForeachNames(f *ast.Foreach) error {
+func internForeachNames(tx engine.Tx, f *ast.Foreach) error {
 	for _, c := range f.Body {
 		switch cl := c.(type) {
 		case *ast.Create:
 			for _, pp := range cl.Patterns {
-				if err := db.internPatternNames(pp); err != nil {
+				if err := internPatternNames(tx, pp); err != nil {
 					return err
 				}
 			}
 		case *ast.Merge:
-			if err := db.internMergeNames(cl); err != nil {
+			if err := internMergeNames(tx, cl); err != nil {
 				return err
 			}
 		case *ast.Set:
-			if err := db.internSetNames(cl); err != nil {
+			if err := internSetItemNames(tx, cl.Items); err != nil {
 				return err
 			}
 		case *ast.Foreach:
-			if err := db.internForeachNames(cl); err != nil {
+			if err := internForeachNames(tx, cl); err != nil {
 				return err
 			}
 		}
@@ -380,50 +380,49 @@ func (db *DB) internForeachNames(f *ast.Foreach) error {
 
 // internPatternNames interns the names of one CREATE path pattern: each node's
 // labels and property keys, and each relationship's type and property keys.
-func (db *DB) internPatternNames(pp *ast.PathPattern) error {
-	if err := db.internNode(pp.Start); err != nil {
+func internPatternNames(tx engine.Tx, pp *ast.PathPattern) error {
+	if err := internNode(tx, pp.Start); err != nil {
 		return err
 	}
 	for _, step := range pp.Chain {
 		for _, ty := range step.Rel.Types {
-			if err := db.internName(catalog.KindRelType, ty); err != nil {
+			if err := internName(tx, catalog.KindRelType, ty); err != nil {
 				return err
 			}
 		}
-		if err := db.internProps(step.Rel.Properties); err != nil {
+		if err := internProps(tx, step.Rel.Properties); err != nil {
 			return err
 		}
-		if err := db.internNode(step.Node); err != nil {
+		if err := internNode(tx, step.Node); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (db *DB) internNode(np *ast.NodePattern) error {
+func internNode(tx engine.Tx, np *ast.NodePattern) error {
 	for _, l := range np.Labels {
-		if err := db.internName(catalog.KindLabel, l); err != nil {
+		if err := internName(tx, catalog.KindLabel, l); err != nil {
 			return err
 		}
 	}
-	return db.internProps(np.Properties)
+	return internProps(tx, np.Properties)
 }
 
-func (db *DB) internProps(props []ast.PropEntry) error {
+func internProps(tx engine.Tx, props []ast.PropEntry) error {
 	for _, pe := range props {
-		if err := db.internName(catalog.KindPropKey, pe.Key); err != nil {
+		if err := internName(tx, catalog.KindPropKey, pe.Key); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// internName ensures a name is in the catalog, interning it only when absent.
-func (db *DB) internName(kind catalog.Kind, name string) error {
-	if _, ok := db.eng.Lookup(kind, name); ok {
-		return nil
-	}
-	_, err := db.eng.Intern(kind, name)
+// internName ensures a name is in the catalog as part of this write transaction.
+// tx.Intern is idempotent, returning the existing token for a name already present
+// and appending one only for a new name, so this needs no Lookup guard.
+func internName(tx engine.Tx, kind catalog.Kind, name string) error {
+	_, err := tx.Intern(kind, name)
 	return err
 }
 

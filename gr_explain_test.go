@@ -96,6 +96,69 @@ func TestExplainShowsIndexSeek(t *testing.T) {
 	}
 }
 
+// TestExplainShowsRowEstimates confirms the read path annotates the plan with the
+// cost model's per-operator row estimates: with three Person nodes, the scan line
+// carries an estimate drawn from the live label count, so EXPLAIN shows not just the
+// plan but the cardinalities it was chosen on.
+func TestExplainShowsRowEstimates(t *testing.T) {
+	db := openMem(t, "explainrows.gr")
+	defer func() { _ = db.Close() }()
+
+	mustExec(t, db, "CREATE (:Person), (:Person), (:Person)", nil)
+
+	plan := planText(t, db, "EXPLAIN MATCH (p:Person) RETURN p")
+	if !strings.Contains(plan, "(est. rows ") {
+		t.Fatalf("plan carries no row estimates:\n%s", plan)
+	}
+	if !strings.Contains(plan, "NodeScan p:#1  (est. rows 3)") {
+		t.Fatalf("scan estimate does not reflect the three Person nodes:\n%s", plan)
+	}
+}
+
+// TestExplainWriteTxOmitsEstimates confirms EXPLAIN inside a write transaction shows
+// the plan without estimates: the transaction holds the engine lock, so it passes no
+// statistics for the same reason it passes no index oracle, and the listing must
+// still render rather than block.
+func TestExplainWriteTxOmitsEstimates(t *testing.T) {
+	db := openMem(t, "explainwritetxrows.gr")
+	defer func() { _ = db.Close() }()
+
+	tx, err := db.Begin(Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.Run("EXPLAIN MATCH (p:Person) RETURN p", nil)
+	if err != nil {
+		t.Fatalf("write-tx EXPLAIN: %v", err)
+	}
+	defer func() { _ = res.Close() }()
+	var sawScan, sawEstimate bool
+	for {
+		row, ok, err := res.Next()
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if !ok {
+			break
+		}
+		s, _ := row[0].AsString()
+		if strings.Contains(s, "NodeScan") {
+			sawScan = true
+		}
+		if strings.Contains(s, "(est. rows ") {
+			sawEstimate = true
+		}
+	}
+	if !sawScan {
+		t.Fatal("write-tx EXPLAIN did not render the plan")
+	}
+	if sawEstimate {
+		t.Fatal("write-tx EXPLAIN carried estimates despite holding the engine lock")
+	}
+}
+
 // TestExplainRejectsSchemaCommand confirms EXPLAIN of a schema command is an error:
 // a schema command changes the catalog outside the operator pipeline, so it has no
 // plan to render.

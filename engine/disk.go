@@ -299,11 +299,25 @@ func (e *DiskEngine) Checkpoint() error {
 	if err := e.adj.Checkpoint(uint64(e.nodes.Count())); err != nil {
 		return err
 	}
+	// Merge the naive delta over the current base into a fresh segmented base, then
+	// drain the delta to empty so the next checkpoint window starts clean. The
+	// merge reads the old base, so compute both fresh stores before swapping them
+	// in, then repoint the naive columns at fresh empty stores (their old pages,
+	// like the old segmented stores, fall to later reclamation).
 	var err error
-	if e.nseg, err = e.foldSegmented(e.ncols, uint64(e.nodes.Count()), store.SecNodeColSeg); err != nil {
+	newNseg, err := e.foldSegmented(e.ncols, e.nseg, uint64(e.nodes.Count()), store.SecNodeColSeg)
+	if err != nil {
 		return err
 	}
-	if e.rseg, err = e.foldSegmented(e.rcols, uint64(e.rels.Count()), store.SecRelColSeg); err != nil {
+	newRseg, err := e.foldSegmented(e.rcols, e.rseg, uint64(e.rels.Count()), store.SecRelColSeg)
+	if err != nil {
+		return err
+	}
+	e.nseg, e.rseg = newNseg, newRseg
+	if e.ncols, err = column.Create(e.p, e.secs, store.SecNodeCols); err != nil {
+		return err
+	}
+	if e.rcols, err = column.Create(e.p, e.secs, store.SecRelCols); err != nil {
 		return err
 	}
 	if _, err := e.commitPager(); err != nil {
@@ -407,7 +421,7 @@ func (t *diskTx) snapNodeProp(pos uint64, key uint32) (value.Value, bool, error)
 	if pre, ok := t.e.ov.Resolve(mvcc.Key{Kind: mvcc.NodeProp, Pos: pos, Sub: key}, t.readSeq); ok {
 		return pre.Val, pre.Present, nil
 	}
-	return t.e.ncols.Get(key, pos)
+	return t.e.baseNodeProp(key, pos)
 }
 
 // snapRelProp returns a relationship property value (and presence) as of the snapshot.
@@ -415,7 +429,7 @@ func (t *diskTx) snapRelProp(pos uint64, key uint32) (value.Value, bool, error) 
 	if pre, ok := t.e.ov.Resolve(mvcc.Key{Kind: mvcc.RelProp, Pos: pos, Sub: key}, t.readSeq); ok {
 		return pre.Val, pre.Present, nil
 	}
-	return t.e.rcols.Get(key, pos)
+	return t.e.baseRelProp(key, pos)
 }
 
 // nodePos resolves a node id to its dense position, requiring it visible.
@@ -537,7 +551,7 @@ func (t *diskTx) NodePropertyKeys(id NodeID) ([]Token, error) {
 		return nil, err
 	}
 	var out []Token
-	for _, k := range t.e.ncols.Keys() {
+	for _, k := range basePropKeys(t.e.ncols, t.e.nseg) {
 		_, ok, err := t.snapNodeProp(pos, k)
 		if err != nil {
 			return nil, err
@@ -556,7 +570,7 @@ func (t *diskTx) RelPropertyKeys(id RelID) ([]Token, error) {
 		return nil, err
 	}
 	var out []Token
-	for _, k := range t.e.rcols.Keys() {
+	for _, k := range basePropKeys(t.e.rcols, t.e.rseg) {
 		_, ok, err := t.snapRelProp(pos, k)
 		if err != nil {
 			return nil, err
@@ -829,7 +843,7 @@ func (t *diskTx) SetNodeProperty(id NodeID, key Token, v value.Value) error {
 		return err
 	}
 	c := toCat(key)
-	old, present, err := t.e.ncols.Get(c, pos)
+	old, present, err := t.e.baseNodeProp(c, pos)
 	if err != nil {
 		return err
 	}
@@ -838,7 +852,10 @@ func (t *diskTx) SetNodeProperty(id NodeID, key Token, v value.Value) error {
 		pre: mvcc.Pre{Present: present, Val: old},
 	})
 	if v.IsNull() {
-		return t.e.ncols.Remove(c, pos)
+		// Tombstone, not Remove: the naive store is a delta over the segmented
+		// base, so a removal must hide any folded base value rather than clear a
+		// flag a base read cannot tell apart from a never written position.
+		return t.e.ncols.Tombstone(c, pos)
 	}
 	return t.e.ncols.Set(c, pos, v)
 }
@@ -852,7 +869,7 @@ func (t *diskTx) SetRelProperty(id RelID, key Token, v value.Value) error {
 		return err
 	}
 	c := toCat(key)
-	old, present, err := t.e.rcols.Get(c, pos)
+	old, present, err := t.e.baseRelProp(c, pos)
 	if err != nil {
 		return err
 	}
@@ -861,7 +878,8 @@ func (t *diskTx) SetRelProperty(id RelID, key Token, v value.Value) error {
 		pre: mvcc.Pre{Present: present, Val: old},
 	})
 	if v.IsNull() {
-		return t.e.rcols.Remove(c, pos)
+		// See SetNodeProperty: a delta removal tombstones the base value.
+		return t.e.rcols.Tombstone(c, pos)
 	}
 	return t.e.rcols.Set(c, pos, v)
 }

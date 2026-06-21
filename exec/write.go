@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/tamnd/gr/bind"
+	"github.com/tamnd/gr/catalog"
 	"github.com/tamnd/gr/engine"
 	"github.com/tamnd/gr/eval"
 	"github.com/tamnd/gr/plan"
@@ -515,7 +516,7 @@ func mapPairs(ctx *Ctx, v value.Value) ([]propPair, error) {
 	if m, ok := v.AsMap(); ok {
 		pairs := make([]propPair, 0, len(m))
 		for name, val := range m {
-			tok, err := ctx.Tx.InternPropKey(name)
+			tok, err := ctx.Tx.Intern(catalog.KindPropKey, name)
 			if err != nil {
 				return nil, err
 			}

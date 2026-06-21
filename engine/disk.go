@@ -866,21 +866,34 @@ func (t *diskTx) RemoveLabel(id NodeID, label Token) error {
 	return t.e.st.AddLabel(c, -1)
 }
 
-// InternPropKey interns a property-key name within this write transaction. The
-// catalog appends the new name to its pager-backed log, which becomes durable
-// when this transaction commits and is rolled back if it aborts. It takes no
-// lock: a write transaction already holds the engine's exclusive lock, so it
-// must not re-take it (the lock is not reentrant). The engine's Intern method is
-// the standalone equivalent for between-transaction schema setup.
-func (t *diskTx) InternPropKey(name string) (Token, error) {
+// Intern interns a name within this write transaction. The catalog appends the
+// new name to its pager-backed log, which becomes durable when this transaction
+// commits and is rolled back if it aborts, so an aborted write leaves no orphan
+// token. It takes no lock: a write transaction already holds the engine's
+// exclusive lock, so it must not re-take it (the lock is not reentrant). The
+// engine's own Intern method is the standalone equivalent for between-transaction
+// schema setup.
+func (t *diskTx) Intern(kind catalog.Kind, name string) (Token, error) {
 	if !t.write {
 		return 0, ErrReadOnlyTx
 	}
-	c, _, err := t.e.cat.Intern(catalog.KindPropKey, name)
+	c, _, err := t.e.cat.Intern(kind, name)
 	if err != nil {
 		return 0, err
 	}
 	return toTok(c), nil
+}
+
+// Lookup resolves an interned name to its token from this transaction's catalog
+// view. It reads the catalog directly without locking: a write transaction holds
+// the engine lock for its whole life, so it must not re-take it, and the catalog
+// it reads includes the names this transaction has just interned (doc 13 §9).
+func (t *diskTx) Lookup(kind catalog.Kind, name string) (Token, bool) {
+	c, ok := t.e.cat.Lookup(kind, name)
+	if !ok {
+		return 0, false
+	}
+	return toTok(c), true
 }
 
 // recordLabels retains the current label set as the pre-image for older snapshots.

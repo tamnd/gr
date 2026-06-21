@@ -192,6 +192,77 @@ func TestRunWriteReturnsRows(t *testing.T) {
 	}
 }
 
+// TestRunAutoCommitsWrite confirms the database-level Run infers a write, executes
+// it in an implicit transaction, commits before returning, and reports the mutation
+// through the result's Summary, with the write visible to a later read.
+func TestRunAutoCommitsWrite(t *testing.T) {
+	db := openMem(t, "r1.gr")
+
+	res, err := db.Run("CREATE (p:Person {name:$n}) RETURN p.name AS name",
+		map[string]value.Value{"n": value.String("Ada")})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	row, ok, err := res.NextRow()
+	if err != nil || !ok {
+		t.Fatalf("run next: ok=%v err=%v", ok, err)
+	}
+	if name, _ := row["name"].AsString(); name != "Ada" {
+		t.Fatalf("returned name = %q, want Ada", name)
+	}
+	if s := res.Summary(); s.NodesCreated != 1 || s.PropertiesSet != 1 {
+		t.Fatalf("summary = %+v, want 1 node / 1 prop", s)
+	}
+	if err := res.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if got := personCount(t, db); got != 1 {
+		t.Fatalf("after auto-commit Run, Person count = %d, want 1", got)
+	}
+}
+
+// TestRunAutoReadsSnapshot confirms the database-level Run infers a read and streams
+// the row, committing nothing of its own.
+func TestRunAutoReadsSnapshot(t *testing.T) {
+	db := openMem(t, "r2.gr")
+	if _, err := db.Exec("CREATE (:Person {name:'Ada'})", nil); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	res, err := db.Run("MATCH (p:Person) RETURN p.name AS name", nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	defer func() { _ = res.Close() }()
+	row, ok, err := res.NextRow()
+	if err != nil || !ok {
+		t.Fatalf("run next: ok=%v err=%v", ok, err)
+	}
+	if name, _ := row["name"].AsString(); name != "Ada" {
+		t.Fatalf("read name = %q, want Ada", name)
+	}
+	if s := res.Summary(); s.NodesCreated != 0 {
+		t.Fatalf("read summary = %+v, want zero", s)
+	}
+}
+
+// TestRunSchemaCommand confirms a schema command run through the database-level Run
+// applies and reports its change through the result's Summary.
+func TestRunSchemaCommand(t *testing.T) {
+	db := openMem(t, "r3.gr")
+
+	res, err := db.Run("CREATE CONSTRAINT person_name FOR (p:Person) REQUIRE p.name IS UNIQUE", nil)
+	if err != nil {
+		t.Fatalf("run schema: %v", err)
+	}
+	if s := res.Summary(); s.ConstraintsAdded != 1 {
+		t.Fatalf("schema summary = %+v, want 1 constraint added", s)
+	}
+	if err := res.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
 // TestExplicitCommit drives a transaction by hand: Begin, Exec, Commit, and a
 // deferred Rollback that is a no-op once the commit has finished.
 func TestExplicitCommit(t *testing.T) {

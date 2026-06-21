@@ -7,7 +7,6 @@ import (
 	"github.com/tamnd/gr/bind"
 	"github.com/tamnd/gr/catalog"
 	"github.com/tamnd/gr/engine"
-	"github.com/tamnd/gr/eval"
 	"github.com/tamnd/gr/exec"
 	"github.com/tamnd/gr/parse"
 	"github.com/tamnd/gr/plan"
@@ -195,47 +194,11 @@ func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value
 // catalog view (doc 13 §9), so the write takes no lock it does not already hold and
 // leaves no orphan token on rollback (doc 13 §16).
 func (tx *Tx) runWrite(q *ast.Query, params map[string]value.Value) (*Result, error) {
-	if err := internWriteNames(tx.etx, q); err != nil {
-		return nil, err
-	}
-	b, err := bind.Bind(q, bind.NewEngineCatalog(tx.etx), false)
+	cols, buf, summary, err := tx.db.execWriteBuffered(tx.etx, q, params)
 	if err != nil {
 		return nil, err
 	}
-	eff := &exec.SideEffects{}
-	ctx := tx.readCtx(b, params)
-	ctx.Effects = eff
-	cur, err := exec.Open(plan.Plan(b), ctx)
-	if err != nil {
-		return nil, err
-	}
-	cols := cur.Cols()
-	var buf []eval.Row
-	for {
-		row, ok, err := cur.Next()
-		if err != nil {
-			_ = cur.Close()
-			return nil, err
-		}
-		if !ok {
-			break
-		}
-		buf = append(buf, cloneRow(row))
-	}
-	if err := cur.Close(); err != nil {
-		return nil, err
-	}
-	return &Result{cols: cols, buf: buf, eff: eff, tx: tx.etx, ownTx: false}, nil
-}
-
-// cloneRow copies a row map so a buffered write result does not alias a row the
-// executor may reuse for the next Next call.
-func cloneRow(row eval.Row) eval.Row {
-	out := make(eval.Row, len(row))
-	for k, v := range row {
-		out[k] = v
-	}
-	return out
+	return &Result{cols: cols, buf: buf, summary: summary, tx: tx.etx, ownTx: false}, nil
 }
 
 // Exec runs a Cypher write statement against the transaction and returns a summary

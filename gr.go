@@ -126,20 +126,136 @@ func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, erro
 	if err != nil {
 		return nil, err
 	}
-	ctx := &exec.Ctx{
-		Tx:          tx,
-		Params:      params,
-		Resolve:     exec.ResolverFromBound(entry.Bound),
-		LabelName:   db.tokenNamer(catalog.KindLabel),
-		RelTypeName: db.tokenNamer(catalog.KindRelType),
-		PropKeyName: db.tokenNamer(catalog.KindPropKey),
-	}
-	cur, err := exec.Open(entry.Op, ctx)
+	cur, err := exec.Open(entry.Op, db.execCtx(tx, entry.Bound, params))
 	if err != nil {
 		_ = tx.Abort()
 		return nil, err
 	}
 	return &Result{cols: cur.Cols(), cursor: cur, tx: tx, ownTx: true}, nil
+}
+
+// execCtx builds the execution context shared by every run of a statement: the
+// transaction it runs against, the parameter map, the resolver from the bound
+// query, and the reverse token namers the entity functions need. A write run sets
+// Effects on the returned context to collect its mutation counts.
+func (db *DB) execCtx(etx engine.Tx, b *bind.Bound, params map[string]value.Value) *exec.Ctx {
+	return &exec.Ctx{
+		Tx:          etx,
+		Params:      params,
+		Resolve:     exec.ResolverFromBound(b),
+		LabelName:   db.tokenNamer(catalog.KindLabel),
+		RelTypeName: db.tokenNamer(catalog.KindRelType),
+		PropKeyName: db.tokenNamer(catalog.KindPropKey),
+	}
+}
+
+// execWriteBuffered interns, binds, plans, and runs a write statement against an
+// open transaction to exhaustion, materializing its RETURN rows and collecting its
+// mutation counts. It is the shared body of every eagerly executed write: the
+// database-level auto-commit Run, and the managed transaction's Run. Running to
+// exhaustion before returning is what keeps a write all-or-nothing: every mutation
+// lands before the caller sees a row, so a half-consumed result cannot leave the
+// statement partly applied at commit. It does not begin, commit, or abort the
+// transaction; the caller owns that.
+func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]value.Value) ([]string, []eval.Row, Summary, error) {
+	if err := internWriteNames(etx, q); err != nil {
+		return nil, nil, Summary{}, err
+	}
+	b, err := bind.Bind(q, bind.NewEngineCatalog(etx), false)
+	if err != nil {
+		return nil, nil, Summary{}, err
+	}
+	eff := &exec.SideEffects{}
+	ctx := db.execCtx(etx, b, params)
+	ctx.Effects = eff
+	cur, err := exec.Open(plan.Plan(b), ctx)
+	if err != nil {
+		return nil, nil, Summary{}, err
+	}
+	cols := cur.Cols()
+	var buf []eval.Row
+	for {
+		row, ok, err := cur.Next()
+		if err != nil {
+			_ = cur.Close()
+			return nil, nil, Summary{}, err
+		}
+		if !ok {
+			break
+		}
+		buf = append(buf, cloneRow(row))
+	}
+	if err := cur.Close(); err != nil {
+		return nil, nil, Summary{}, err
+	}
+	return cols, buf, summaryOf(eff), nil
+}
+
+// cloneRow copies a row map so a buffered write result does not alias a row the
+// executor may reuse for the next Next call.
+func cloneRow(row eval.Row) eval.Row {
+	out := make(eval.Row, len(row))
+	for k, v := range row {
+		out[k] = v
+	}
+	return out
+}
+
+// Run executes a Cypher statement in an implicit transaction and returns a result
+// (doc 16 §6.7, §7.1). It is the database-level single entry point that infers the
+// access mode from the statement so a caller need not pick Query versus Exec: a read
+// runs against a snapshot and streams lazily, committing nothing; a write runs in an
+// implicit write transaction, executes eagerly, and commits before Run returns, with
+// its RETURN rows buffered and its mutations reported through the result's Summary; a
+// schema command runs through execSchema and reports its change through Summary. This
+// is the seam the CLI and server marshal one statement at a time onto (doc 16 §6.7).
+//
+// params supplies the values for the statement's $-parameters; a nil map is fine for
+// a parameterless statement. The caller must Close the result; for a write or schema
+// result Close has nothing to release, since the implicit transaction has already
+// committed.
+func (db *DB) Run(cypher string, params map[string]value.Value) (*Result, error) {
+	if db.eng == nil {
+		return nil, ErrClosed
+	}
+	q, err := parse.Parse(cypher)
+	if err != nil {
+		return nil, err
+	}
+	if q.Schema != nil {
+		s, err := db.execSchema(q.Schema)
+		if err != nil {
+			return nil, err
+		}
+		return &Result{summary: s}, nil
+	}
+	if queryHasWrites(q) {
+		return db.runAutoWrite(q, params)
+	}
+	return db.Query(cypher, params)
+}
+
+// runAutoWrite executes a write statement in an implicit write transaction and
+// commits it before returning, so the auto-commit Run keeps a single write statement
+// all-or-nothing at the statement boundary. The statement runs eagerly to exhaustion
+// (execWriteBuffered), so every mutation lands and the RETURN rows are materialized
+// before the commit; any error aborts the transaction and leaves the database
+// unchanged. The returned result iterates the buffered rows and reports the mutations
+// through Summary; it owns no open transaction, so Close has nothing to release.
+func (db *DB) runAutoWrite(q *ast.Query, params map[string]value.Value) (*Result, error) {
+	tx, err := db.eng.Begin(true)
+	if err != nil {
+		return nil, err
+	}
+	cols, buf, summary, err := db.execWriteBuffered(tx, q, params)
+	if err != nil {
+		_ = tx.Abort()
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &Result{cols: cols, buf: buf, summary: summary}, nil
 }
 
 // Summary reports the graph mutations a write statement performed, the normative
@@ -204,15 +320,8 @@ func (db *DB) Exec(cypher string, params map[string]value.Value) (Summary, error
 	}
 	op := plan.Plan(b)
 	eff := &exec.SideEffects{}
-	ctx := &exec.Ctx{
-		Tx:          tx,
-		Params:      params,
-		Resolve:     exec.ResolverFromBound(b),
-		LabelName:   db.tokenNamer(catalog.KindLabel),
-		RelTypeName: db.tokenNamer(catalog.KindRelType),
-		PropKeyName: db.tokenNamer(catalog.KindPropKey),
-		Effects:     eff,
-	}
+	ctx := db.execCtx(tx, b, params)
+	ctx.Effects = eff
 	if err := drain(op, ctx); err != nil {
 		_ = tx.Abort()
 		return Summary{}, err
@@ -513,13 +622,13 @@ func (db *DB) tokenNamer(kind catalog.Kind) func(t engine.Token) (string, bool) 
 // leave the statement partly applied at commit); the result then iterates the
 // buffer and reports the mutation counts through Summary.
 type Result struct {
-	cols   []string
-	cursor *exec.Cursor
-	buf    []eval.Row
-	bufIdx int
-	eff    *exec.SideEffects
-	tx     engine.Tx
-	ownTx  bool
+	cols    []string
+	cursor  *exec.Cursor
+	buf     []eval.Row
+	bufIdx  int
+	summary Summary
+	tx      engine.Tx
+	ownTx   bool
 }
 
 // Columns returns the result's output column names in order.
@@ -561,12 +670,7 @@ func (r *Result) NextRow() (eval.Row, bool, error) { return r.next() }
 // Summary reports the graph mutations a write statement run through Run performed
 // (doc 13 §3). It is the zero summary for a read result, which mutates nothing, and
 // it is complete as soon as Run returns, since a write executes eagerly.
-func (r *Result) Summary() Summary {
-	if r.eff == nil {
-		return Summary{}
-	}
-	return summaryOf(r.eff)
-}
+func (r *Result) Summary() Summary { return r.summary }
 
 // Close releases the result's cursor. For an auto-commit Query result it also
 // aborts the read transaction it owns; for a managed-transaction Run result it

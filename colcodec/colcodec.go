@@ -69,6 +69,8 @@ func (c Codec) String() string {
 		return "FOR"
 	case DELTA:
 		return "DELTA"
+	case DICTIONARY:
+		return "DICTIONARY"
 	default:
 		return "UNKNOWN"
 	}
@@ -125,7 +127,7 @@ func PeekCodec(b []byte) (Codec, error) {
 		return 0, ErrBadSegment
 	}
 	switch Codec(b[0]) {
-	case RAW, CONSTANT, RLE, FOR, DELTA:
+	case RAW, CONSTANT, RLE, FOR, DELTA, DICTIONARY:
 		return Codec(b[0]), nil
 	default:
 		return 0, ErrBadSegment

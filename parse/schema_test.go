@@ -75,6 +75,100 @@ func TestParseCreateConstraintNamedIfNotExists(t *testing.T) {
 	}
 }
 
+func TestParseCreateIndex(t *testing.T) {
+	q, err := parse.Parse("CREATE INDEX FOR (p:Person) ON (p.email)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ci, ok := q.Schema.(*ast.CreateIndex)
+	if !ok {
+		t.Fatalf("Schema is %T, want *ast.CreateIndex", q.Schema)
+	}
+	if ci.Name != "" || ci.IfNotExists {
+		t.Fatalf("unexpected name/ifnotexists: %q %v", ci.Name, ci.IfNotExists)
+	}
+	if ci.Var != "p" || ci.Label != "Person" {
+		t.Fatalf("var/label = %q/%q", ci.Var, ci.Label)
+	}
+	if len(ci.Props) != 1 || ci.Props[0] != "email" {
+		t.Fatalf("props = %v", ci.Props)
+	}
+	if q.First != nil {
+		t.Fatal("schema command should leave First nil")
+	}
+}
+
+func TestParseCreateIndexNamedIfNotExists(t *testing.T) {
+	q, err := parse.Parse("CREATE INDEX person_email IF NOT EXISTS FOR (p:Person) ON (p.email)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ci := q.Schema.(*ast.CreateIndex)
+	if ci.Name != "person_email" {
+		t.Fatalf("name = %q", ci.Name)
+	}
+	if !ci.IfNotExists {
+		t.Fatal("IfNotExists not set")
+	}
+}
+
+func TestParseDropIndex(t *testing.T) {
+	q, err := parse.Parse("DROP INDEX person_email")
+	if err != nil {
+		t.Fatal(err)
+	}
+	di, ok := q.Schema.(*ast.DropIndex)
+	if !ok {
+		t.Fatalf("Schema is %T, want *ast.DropIndex", q.Schema)
+	}
+	if di.Name != "person_email" || di.IfExists {
+		t.Fatalf("name/ifexists = %q/%v", di.Name, di.IfExists)
+	}
+}
+
+func TestParseDropIndexIfExists(t *testing.T) {
+	q, err := parse.Parse("DROP INDEX i IF EXISTS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	di := q.Schema.(*ast.DropIndex)
+	if !di.IfExists {
+		t.Fatal("IfExists not set")
+	}
+}
+
+// TestParseIndexErrors confirms the index grammar rejects malformed statements.
+func TestParseIndexErrors(t *testing.T) {
+	bad := []string{
+		"CREATE INDEX FOR (p:Person) ON (q.email)", // wrong variable
+		"CREATE INDEX FOR p:Person ON (p.email)",   // missing parens around pattern
+		"CREATE INDEX FOR (p:Person) (p.email)",    // missing ON
+		"CREATE INDEX FOR (p:Person) ON p.email",   // missing parens around property
+		"CREATE INDEX FOR (p:Person) ON (p.email",  // unclosed property parens
+		"DROP INDEX",      // missing name
+		"DROP INDEX i IF", // dangling IF
+	}
+	for _, src := range bad {
+		if _, err := parse.Parse(src); err == nil {
+			t.Fatalf("Parse(%q): expected an error, got none", src)
+		}
+	}
+}
+
+// TestParseIndexSoftKeyword confirms INDEX remains usable as an ordinary name in a
+// normal query, since the index grammar matches it as a soft keyword rather than
+// reserving it.
+func TestParseIndexSoftKeyword(t *testing.T) {
+	for _, src := range []string{
+		"MATCH (index) RETURN index",
+		"MATCH (n:Index) RETURN n",
+	} {
+		if _, err := parse.Parse(src); err != nil {
+			t.Fatalf("Parse(%q): %v", src, err)
+		}
+	}
+}
+
 func TestParseDropConstraint(t *testing.T) {
 	q, err := parse.Parse("DROP CONSTRAINT person_email")
 	if err != nil {

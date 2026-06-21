@@ -61,6 +61,9 @@ func (f *fakeTx) NodeLabels(id engine.NodeID) ([]engine.Token, error) {
 }
 func (f *fakeTx) HasLabel(engine.NodeID, engine.Token) (bool, error)      { return false, nil }
 func (f *fakeTx) ScanLabel(engine.Token, func(engine.NodeID) error) error { return nil }
+func (f *fakeTx) IndexSeek(engine.Token, engine.Token, value.Value, func(engine.NodeID) error) (bool, error) {
+	return false, nil
+}
 func (f *fakeTx) Expand(engine.NodeID, engine.Token, engine.Direction, func(engine.Neighbor) error) error {
 	return nil
 }

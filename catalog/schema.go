@@ -38,6 +38,9 @@ const (
 	// UniqueNode is a node uniqueness constraint: among the nodes carrying the
 	// label, the property tuple is unique (nulls are exempt, doc 08 §4.1).
 	UniqueNode ConstraintKind = 0
+	// ExistsNode is a node existence constraint: every node carrying the label
+	// must hold a present, non-null value for the property (doc 08 §4.1).
+	ExistsNode ConstraintKind = 1
 )
 
 // Constraint is one schema constraint, recorded against a label and a property

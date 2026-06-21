@@ -30,6 +30,37 @@ func TestParseCreateConstraint(t *testing.T) {
 	}
 }
 
+func TestParseCreateConstraintUniqueType(t *testing.T) {
+	q, err := parse.Parse("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc := q.Schema.(*ast.CreateConstraint)
+	if cc.Type != ast.ConstraintUnique {
+		t.Fatalf("type = %v, want ConstraintUnique", cc.Type)
+	}
+}
+
+func TestParseCreateExistenceConstraint(t *testing.T) {
+	q, err := parse.Parse("CREATE CONSTRAINT person_email IF NOT EXISTS FOR (p:Person) REQUIRE p.email IS NOT NULL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc, ok := q.Schema.(*ast.CreateConstraint)
+	if !ok {
+		t.Fatalf("Schema is %T, want *ast.CreateConstraint", q.Schema)
+	}
+	if cc.Type != ast.ConstraintExists {
+		t.Fatalf("type = %v, want ConstraintExists", cc.Type)
+	}
+	if cc.Name != "person_email" || !cc.IfNotExists {
+		t.Fatalf("name/ifnotexists = %q/%v", cc.Name, cc.IfNotExists)
+	}
+	if cc.Var != "p" || cc.Label != "Person" || len(cc.Props) != 1 || cc.Props[0] != "email" {
+		t.Fatalf("var/label/props = %q/%q/%v", cc.Var, cc.Label, cc.Props)
+	}
+}
+
 func TestParseCreateConstraintNamedIfNotExists(t *testing.T) {
 	q, err := parse.Parse("CREATE CONSTRAINT person_email IF NOT EXISTS FOR (p:Person) REQUIRE p.email IS UNIQUE")
 	if err != nil {
@@ -89,6 +120,7 @@ func TestParseConstraintErrors(t *testing.T) {
 		"CREATE CONSTRAINT FOR (p:Person) REQUIRE q.email IS UNIQUE",       // wrong variable
 		"CREATE CONSTRAINT FOR p:Person REQUIRE p.email IS UNIQUE",         // missing parens
 		"CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS",              // missing UNIQUE
+		"CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS NOT",          // NOT without NULL
 		"CREATE CONSTRAINT FOR (p:Person) p.email IS UNIQUE",               // missing REQUIRE
 		"CREATE CONSTRAINT IF EXISTS FOR (p:Person) REQUIRE p.x IS UNIQUE", // IF without NOT
 		"DROP CONSTRAINT",      // missing name

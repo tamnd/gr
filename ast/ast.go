@@ -35,12 +35,27 @@ type SchemaCommand interface {
 	schemaNode()
 }
 
+// ConstraintType is the kind of constraint a CREATE CONSTRAINT declares (doc 08
+// §4.1). The value is the parser's classification of the REQUIRE clause; the
+// engine maps it to its own durable constraint kind.
+type ConstraintType uint8
+
+const (
+	// ConstraintUnique requires the property tuple to be unique among a label's
+	// nodes (REQUIRE v.p IS UNIQUE). Nulls are exempt.
+	ConstraintUnique ConstraintType = iota
+	// ConstraintExists requires the property to be present and non-null on every
+	// node of a label (REQUIRE v.p IS NOT NULL).
+	ConstraintExists
+)
+
 // CreateConstraint is a CREATE CONSTRAINT statement. Name is the explicit
 // constraint name, empty when the statement omits it (the engine then derives one
-// from the label and property). IfNotExists makes a repeat creation a no-op rather
-// than an error. Var is the pattern variable, Label the node label it binds, and
+// from the kind, label, and property). IfNotExists makes a repeat creation a no-op
+// rather than an error. Var is the pattern variable, Label the node label it binds,
 // Props the constrained property keys in order (one for a single-property
-// uniqueness constraint). This release supports node uniqueness only.
+// constraint), and Type the constraint kind. This release supports single-property
+// node uniqueness and node existence.
 type CreateConstraint struct {
 	Pos
 	Name        string
@@ -48,6 +63,7 @@ type CreateConstraint struct {
 	Var         string
 	Label       string
 	Props       []string
+	Type        ConstraintType
 }
 
 // DropConstraint is a DROP CONSTRAINT statement, addressing a constraint by name.

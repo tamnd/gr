@@ -10,10 +10,13 @@ import (
 )
 
 // ConstraintError is the typed error a write raises when it would violate a
-// declared constraint (doc 13 §12, doc 08 §4). It carries the constraint's name
-// and the label, property, and offending value so the caller can report a clean
-// diagnostic, and it aborts the transaction that hit it (doc 13 §16).
+// declared constraint (doc 13 §12, doc 08 §4). It carries the constraint's kind
+// and name and the label and property so the caller can report a clean diagnostic,
+// and it aborts the transaction that hit it (doc 13 §16). Value holds the
+// offending value for a uniqueness violation; it is empty for an existence
+// violation, where the problem is the absence of a value.
 type ConstraintError struct {
+	Kind       catalog.ConstraintKind
 	Constraint string
 	Label      string
 	Property   string
@@ -21,6 +24,10 @@ type ConstraintError struct {
 }
 
 func (e *ConstraintError) Error() string {
+	if e.Kind == catalog.ExistsNode {
+		return fmt.Sprintf("gr/engine: existence constraint %q violated: %s.%s is missing",
+			e.Constraint, e.Label, e.Property)
+	}
 	return fmt.Sprintf("gr/engine: uniqueness constraint %q violated: %s.%s already has value %s",
 		e.Constraint, e.Label, e.Property, e.Value)
 }
@@ -35,9 +42,11 @@ func uniqueKey(v value.Value) string {
 
 // autoConstraintName is the generated name of an unnamed constraint, derived from
 // its kind, label, and property so a DROP CONSTRAINT can still address it and a
-// repeat CREATE collides with itself (doc 08 §4.3).
-func autoConstraintName(label, prop string) string {
-	return "unique_" + label + "_" + prop
+// repeat CREATE collides with itself (doc 08 §4.3). The kind prefix keeps a
+// uniqueness and an existence constraint on the same label and property from
+// colliding on one generated name.
+func autoConstraintName(prefix, label, prop string) string {
+	return prefix + "_" + label + "_" + prop
 }
 
 // CreateUniqueConstraint declares a node uniqueness constraint on label.prop in
@@ -51,7 +60,7 @@ func (e *DiskEngine) CreateUniqueConstraint(name, label, prop string, ifNotExist
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if name == "" {
-		name = autoConstraintName(label, prop)
+		name = autoConstraintName("unique", label, prop)
 	}
 	if _, exists := e.cat.ConstraintByName(name); exists {
 		if ifNotExists {
@@ -80,6 +89,60 @@ func (e *DiskEngine) CreateUniqueConstraint(name, label, prop string, ifNotExist
 	if err := e.cat.AddConstraint(catalog.Constraint{
 		Name:  name,
 		Kind:  catalog.UniqueNode,
+		Label: lt,
+		Props: []uint32{pt},
+	}); err != nil {
+		return false, err
+	}
+	if _, err := e.commitPager(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// CreateExistenceConstraint declares a node existence constraint on label.prop in
+// its own write transaction (doc 08 §6.1). It mirrors CreateUniqueConstraint: it
+// interns the label and property names, validates that the existing data already
+// satisfies existence (every label-node carries a non-null value for the property,
+// doc 08 §6.4), records the constraint durably, and commits. It returns whether a
+// constraint was added: false (no error) when the constraint already exists and
+// ifNotExists is set, true otherwise. Existing data that violates existence fails
+// the call with a [ConstraintError] and leaves the catalog unchanged.
+func (e *DiskEngine) CreateExistenceConstraint(name, label, prop string, ifNotExists bool) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if name == "" {
+		name = autoConstraintName("exists", label, prop)
+	}
+	if _, exists := e.cat.ConstraintByName(name); exists {
+		if ifNotExists {
+			return false, nil
+		}
+		return false, catalog.ErrConstraintExists
+	}
+	// Validate the existing data first, against whatever tokens the label and
+	// property already have. An un-interned label names no stored node, so the
+	// constraint is vacuously satisfied; an un-interned property, with a stored
+	// label, means no label-node carries the property, so a non-empty label group
+	// violates existence. checkExistenceData handles both by reading the column,
+	// which returns absent for an un-interned key.
+	if lt, ok := e.cat.Lookup(catalog.KindLabel, label); ok {
+		pt, pok := e.cat.Lookup(catalog.KindPropKey, prop)
+		if err := e.checkExistenceData(name, prop, lt, pt, pok); err != nil {
+			return false, err
+		}
+	}
+	lt, _, err := e.cat.Intern(catalog.KindLabel, label)
+	if err != nil {
+		return false, err
+	}
+	pt, _, err := e.cat.Intern(catalog.KindPropKey, prop)
+	if err != nil {
+		return false, err
+	}
+	if err := e.cat.AddConstraint(catalog.Constraint{
+		Name:  name,
+		Kind:  catalog.ExistsNode,
 		Label: lt,
 		Props: []uint32{pt},
 	}); err != nil {
@@ -161,6 +224,63 @@ func (t *diskTx) validateUnique() error {
 			continue
 		}
 		if err := t.e.checkUniqueData(con.Name, con.Label, con.Props[0]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkExistenceData scans the committed nodes carrying label and reports a
+// [ConstraintError] if any of them lacks a present, non-null value for prop. It
+// reads the base stores directly under the engine's held lock, so it sees the
+// latest committed state (and, at commit time, the writer's own in-place writes).
+// propInterned says whether the property key exists in the catalog: when it does
+// not, no node carries the property, so any node in the label group violates the
+// constraint, and the column is not read (catalog token 0 is a valid key, so a
+// blind read of an un-interned token would alias the wrong column). propName names
+// the property for the diagnostic, since an un-interned token has no catalog name.
+// The tokens are catalog tokens.
+func (e *DiskEngine) checkExistenceData(name, propName string, label, prop uint32, propInterned bool) error {
+	n := uint64(e.nodes.Count())
+	for pos := uint64(0); pos < n; pos++ {
+		if !e.nodes.Exists(pos) {
+			continue
+		}
+		cats, err := e.nodes.Labels(pos)
+		if err != nil {
+			return err
+		}
+		if !slices.Contains(cats, label) {
+			continue
+		}
+		present := false
+		if propInterned {
+			v, ok, err := e.ncols.Get(prop, pos)
+			if err != nil {
+				return err
+			}
+			present = ok && !v.IsNull()
+		}
+		if !present {
+			lname, _ := e.cat.Name(catalog.KindLabel, label)
+			return &ConstraintError{Kind: catalog.ExistsNode, Constraint: name, Label: lname, Property: propName}
+		}
+	}
+	return nil
+}
+
+// validateExistence re-checks every declared existence constraint against the
+// writer's committed-plus-pending state, called from Commit alongside
+// validateUnique. Like the uniqueness check it is a correctness-first whole-group
+// rescan (doc 07 §9); an incremental check is the M4 refinement. A declared
+// constraint's property is always interned, so propInterned is true here.
+func (t *diskTx) validateExistence() error {
+	for _, con := range t.e.cat.Constraints() {
+		if con.Kind != catalog.ExistsNode || len(con.Props) != 1 {
+			continue
+		}
+		pname, _ := t.e.cat.Name(catalog.KindPropKey, con.Props[0])
+		if err := t.e.checkExistenceData(con.Name, pname, con.Label, con.Props[0], true); err != nil {
 			return err
 		}
 	}

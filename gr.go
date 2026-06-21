@@ -43,9 +43,10 @@ var ErrSchemaCommand = errors.New("gr: schema commands run through Exec, not Que
 // over the underlying file; queries run against snapshots the engine hands out.
 // It also owns the plan cache, so a repeated query shape reuses its compiled plan.
 type DB struct {
-	path  string
-	eng   *engine.DiskEngine
-	cache *plan.Cache
+	path       string
+	eng        *engine.DiskEngine
+	cache      *plan.Cache
+	maxRetries int
 }
 
 // Options configure how a database is opened. The zero value is the default:
@@ -67,6 +68,10 @@ type Options struct {
 	// default ([plan.DefaultCacheSize]). A negative value is treated as the
 	// default, not as a disabled cache.
 	PlanCacheSize int
+	// MaxRetries bounds how many times Update re-runs its closure after a conflict;
+	// 0 uses [DefaultMaxRetries]. It is dormant on the single-writer path, where a
+	// write transaction never conflicts.
+	MaxRetries int
 }
 
 // Open opens the database at path, creating it with a fresh graph structure if it
@@ -86,7 +91,11 @@ func Open(path string, opt Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DB{path: path, eng: eng, cache: plan.NewCache(opt.PlanCacheSize)}, nil
+	maxRetries := opt.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = DefaultMaxRetries
+	}
+	return &DB{path: path, eng: eng, cache: plan.NewCache(opt.PlanCacheSize), maxRetries: maxRetries}, nil
 }
 
 // Path returns the database file path.

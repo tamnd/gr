@@ -2,8 +2,11 @@ package gr
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/tamnd/gr/catalog"
 )
 
 // planText runs an EXPLAIN statement through Run and joins its "plan" column rows
@@ -156,6 +159,40 @@ func TestExplainWriteTxOmitsEstimates(t *testing.T) {
 	}
 	if sawEstimate {
 		t.Fatal("write-tx EXPLAIN carried estimates despite holding the engine lock")
+	}
+}
+
+// TestExplainCostPicksRarerIndex is the end-to-end discriminator for cost-based
+// access-path selection: a scan with two usable indexes seeks on the rarer label,
+// not the first one in the pattern. The pattern lists Common before Rare, so the old
+// structural rule would seek on Common; with Common abundant and Rare scarce, the
+// cost model seeks on Rare instead, and EXPLAIN shows the choice.
+func TestExplainCostPicksRarerIndex(t *testing.T) {
+	db := openMem(t, "explaincostpick.gr")
+	defer func() { _ = db.Close() }()
+
+	mustExec(t, db, "CREATE INDEX FOR (p:Common) ON (p.k)", nil)
+	mustExec(t, db, "CREATE INDEX FOR (p:Rare) ON (p.k)", nil)
+	// One node carries both labels and matches the equality; five more make Common
+	// abundant while Rare stays scarce.
+	mustExec(t, db, "CREATE (:Common:Rare {k: 1})", nil)
+	for range 5 {
+		mustExec(t, db, "CREATE (:Common {k: 2})", nil)
+	}
+
+	rare, ok := db.eng.Lookup(catalog.KindLabel, "Rare")
+	if !ok {
+		t.Fatal("Rare label was not interned")
+	}
+	common, ok := db.eng.Lookup(catalog.KindLabel, "Common")
+	if !ok {
+		t.Fatal("Common label was not interned")
+	}
+
+	plan := planText(t, db, "EXPLAIN MATCH (p:Common:Rare) WHERE p.k = 1 RETURN p")
+	wantPrimary := fmt.Sprintf("NodeIndexSeek p:#%d&#%d(", rare, common)
+	if !strings.Contains(plan, wantPrimary) {
+		t.Fatalf("cost model did not seek on the rarer label:\n%s\nwant %q", plan, wantPrimary)
 	}
 }
 

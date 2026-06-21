@@ -345,6 +345,8 @@ func (db *DB) execSchema(cmd ast.SchemaCommand) (Summary, error) {
 		switch c.Type {
 		case ast.ConstraintExists:
 			added, err = db.eng.CreateExistenceConstraint(c.Name, c.Label, c.Props[0], c.IfNotExists)
+		case ast.ConstraintPropertyType:
+			added, err = db.eng.CreateTypeConstraint(c.Name, c.Label, c.Props[0], c.PropType, c.IfNotExists)
 		default:
 			added, err = db.eng.CreateUniqueConstraint(c.Name, c.Label, c.Props[0], c.IfNotExists)
 		}

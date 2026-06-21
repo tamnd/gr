@@ -1,16 +1,21 @@
 package parse
 
 import (
+	"strings"
+
 	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/lex"
+	"github.com/tamnd/gr/value"
 )
 
 // createConstraint parses
 //
 //	CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (var:Label) REQUIRE var.prop IS UNIQUE
 //	CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (var:Label) REQUIRE var.prop IS NOT NULL
+//	CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (var:Label) REQUIRE var.prop IS :: TYPE
 //
-// the node uniqueness and node existence forms (doc 08 §4.1, §6). The name is
+// the node uniqueness, node existence, and node property-type forms (doc 08 §4.1,
+// §6). The IS :: TYPE form also accepts the IS TYPED TYPE synonym. The name is
 // optional; the engine derives one when it is omitted. This release supports
 // single-property node constraints; composite keys and relationship constraints are
 // later work.
@@ -68,8 +73,10 @@ func (p *parser) createConstraint() (*ast.Query, error) {
 		return nil, err
 	}
 	// The predicate after IS chooses the constraint kind: UNIQUE for uniqueness,
-	// NOT NULL for existence. NOT is a real keyword, NULL too, while UNIQUE is a
-	// soft keyword matched as an identifier.
+	// NOT NULL for existence, and :: TYPE (or the TYPED TYPE synonym) for a property
+	// type. NOT and NULL are real keywords, while UNIQUE, TYPED, and the type names
+	// are soft keywords matched as identifiers. A type predicate opens with a colon
+	// (the lexer emits :: as two Colon tokens) or the word TYPED.
 	if p.accept(lex.Not) {
 		if _, err := p.expect(lex.Null); err != nil {
 			return nil, err
@@ -77,11 +84,56 @@ func (p *parser) createConstraint() (*ast.Query, error) {
 		cc.Type = ast.ConstraintExists
 		return &ast.Query{Pos: pos(start), Schema: cc}, nil
 	}
+	if p.accept(lex.Colon) {
+		if _, err := p.expect(lex.Colon); err != nil {
+			return nil, err
+		}
+		vt, err := p.propType()
+		if err != nil {
+			return nil, err
+		}
+		cc.Type = ast.ConstraintPropertyType
+		cc.PropType = vt
+		return &ast.Query{Pos: pos(start), Schema: cc}, nil
+	}
+	if p.acceptWord("TYPED") {
+		vt, err := p.propType()
+		if err != nil {
+			return nil, err
+		}
+		cc.Type = ast.ConstraintPropertyType
+		cc.PropType = vt
+		return &ast.Query{Pos: pos(start), Schema: cc}, nil
+	}
 	if _, err := p.expectWord("UNIQUE"); err != nil {
 		return nil, err
 	}
 	cc.Type = ast.ConstraintUnique
 	return &ast.Query{Pos: pos(start), Schema: cc}, nil
+}
+
+// propType parses a property-type name in a REQUIRE v.p IS :: TYPE clause and maps
+// it to a value type. This release recognizes the four scalar Cypher types whose
+// values gr stores natively: BOOLEAN, STRING, INTEGER, and FLOAT (doc 08 §4.1). The
+// names are soft keywords matched as identifiers, so the source case is kept and
+// compared case-insensitively here.
+func (p *parser) propType() (value.Type, error) {
+	name, err := p.expect(lex.Ident)
+	if err != nil {
+		return 0, err
+	}
+	switch strings.ToUpper(name.Text) {
+	case "BOOLEAN":
+		return value.TypeBool, nil
+	case "STRING":
+		return value.TypeString, nil
+	case "INTEGER":
+		return value.TypeInt, nil
+	case "FLOAT":
+		return value.TypeFloat, nil
+	default:
+		return 0, p.errAt(name, "unsupported property type "+name.Text+", want BOOLEAN, STRING, INTEGER, or FLOAT")
+	}
 }
 
 // requireProp parses a `var.prop` property reference in a REQUIRE clause, checking

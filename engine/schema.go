@@ -14,22 +14,30 @@ import (
 // and name and the label and property so the caller can report a clean diagnostic,
 // and it aborts the transaction that hit it (doc 13 §16). Value holds the
 // offending value for a uniqueness violation; it is empty for an existence
-// violation, where the problem is the absence of a value.
+// violation, where the problem is the absence of a value. Want and Got hold the
+// declared and actual type names for a property-type violation.
 type ConstraintError struct {
 	Kind       catalog.ConstraintKind
 	Constraint string
 	Label      string
 	Property   string
 	Value      string
+	Want       string
+	Got        string
 }
 
 func (e *ConstraintError) Error() string {
-	if e.Kind == catalog.ExistsNode {
+	switch e.Kind {
+	case catalog.ExistsNode:
 		return fmt.Sprintf("gr/engine: existence constraint %q violated: %s.%s is missing",
 			e.Constraint, e.Label, e.Property)
+	case catalog.TypedNode:
+		return fmt.Sprintf("gr/engine: type constraint %q violated: %s.%s requires %s but has %s",
+			e.Constraint, e.Label, e.Property, e.Want, e.Got)
+	default:
+		return fmt.Sprintf("gr/engine: uniqueness constraint %q violated: %s.%s already has value %s",
+			e.Constraint, e.Label, e.Property, e.Value)
 	}
-	return fmt.Sprintf("gr/engine: uniqueness constraint %q violated: %s.%s already has value %s",
-		e.Constraint, e.Label, e.Property, e.Value)
 }
 
 // uniqueKey is the comparison key for a uniqueness constraint: the value's type
@@ -145,6 +153,60 @@ func (e *DiskEngine) CreateExistenceConstraint(name, label, prop string, ifNotEx
 		Kind:  catalog.ExistsNode,
 		Label: lt,
 		Props: []uint32{pt},
+	}); err != nil {
+		return false, err
+	}
+	if _, err := e.commitPager(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// CreateTypeConstraint declares a node property-type constraint on label.prop in
+// its own write transaction (doc 08 §6.1). It mirrors CreateExistenceConstraint: it
+// interns the label and property names, validates that the existing data already
+// satisfies the type (every present, non-null value for the property on a label-node
+// is of the declared type, doc 08 §4.1), records the constraint durably, and
+// commits. It returns whether a constraint was added: false (no error) when the
+// constraint already exists and ifNotExists is set, true otherwise. Existing data
+// that violates the type fails the call with a [ConstraintError] and leaves the
+// catalog unchanged.
+func (e *DiskEngine) CreateTypeConstraint(name, label, prop string, vt value.Type, ifNotExists bool) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if name == "" {
+		name = autoConstraintName("type", label, prop)
+	}
+	if _, exists := e.cat.ConstraintByName(name); exists {
+		if ifNotExists {
+			return false, nil
+		}
+		return false, catalog.ErrConstraintExists
+	}
+	// Validate the existing data first. An un-interned label or property names no
+	// stored value of the property, so the constraint is vacuously satisfied: a type
+	// constraint only restricts values that are present, unlike existence.
+	if lt, ok := e.cat.Lookup(catalog.KindLabel, label); ok {
+		if pt, ok := e.cat.Lookup(catalog.KindPropKey, prop); ok {
+			if err := e.checkTypeData(name, lt, pt, vt); err != nil {
+				return false, err
+			}
+		}
+	}
+	lt, _, err := e.cat.Intern(catalog.KindLabel, label)
+	if err != nil {
+		return false, err
+	}
+	pt, _, err := e.cat.Intern(catalog.KindPropKey, prop)
+	if err != nil {
+		return false, err
+	}
+	if err := e.cat.AddConstraint(catalog.Constraint{
+		Name:      name,
+		Kind:      catalog.TypedNode,
+		Label:     lt,
+		Props:     []uint32{pt},
+		ValueType: uint8(vt),
 	}); err != nil {
 		return false, err
 	}
@@ -281,6 +343,61 @@ func (t *diskTx) validateExistence() error {
 		}
 		pname, _ := t.e.cat.Name(catalog.KindPropKey, con.Props[0])
 		if err := t.e.checkExistenceData(con.Name, pname, con.Label, con.Props[0], true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkTypeData scans the committed nodes carrying label and reports a
+// [ConstraintError] if any present, non-null value for prop is not of the declared
+// type vt. It reads the base stores directly under the engine's held lock, so it
+// sees the latest committed state (and, at commit time, the writer's own in-place
+// writes). A type constraint restricts only values that are present: an absent or
+// null property is allowed, the same exemption uniqueness grants and the opposite of
+// existence. The tokens are catalog tokens.
+func (e *DiskEngine) checkTypeData(name string, label, prop uint32, vt value.Type) error {
+	n := uint64(e.nodes.Count())
+	for pos := uint64(0); pos < n; pos++ {
+		if !e.nodes.Exists(pos) {
+			continue
+		}
+		cats, err := e.nodes.Labels(pos)
+		if err != nil {
+			return err
+		}
+		if !slices.Contains(cats, label) {
+			continue
+		}
+		v, ok, err := e.ncols.Get(prop, pos)
+		if err != nil {
+			return err
+		}
+		if !ok || v.IsNull() {
+			continue
+		}
+		if v.Type() != vt {
+			lname, _ := e.cat.Name(catalog.KindLabel, label)
+			pname, _ := e.cat.Name(catalog.KindPropKey, prop)
+			return &ConstraintError{
+				Kind: catalog.TypedNode, Constraint: name, Label: lname, Property: pname,
+				Want: vt.String(), Got: v.Type().String(),
+			}
+		}
+	}
+	return nil
+}
+
+// validateType re-checks every declared property-type constraint against the
+// writer's committed-plus-pending state, called from Commit alongside validateUnique
+// and validateExistence. Like the other checks it is a correctness-first whole-group
+// rescan (doc 07 §9); an incremental check is the M4 refinement.
+func (t *diskTx) validateType() error {
+	for _, con := range t.e.cat.Constraints() {
+		if con.Kind != catalog.TypedNode || len(con.Props) != 1 {
+			continue
+		}
+		if err := t.e.checkTypeData(con.Name, con.Label, con.Props[0], value.Type(con.ValueType)); err != nil {
 			return err
 		}
 	}

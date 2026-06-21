@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/tamnd/gr/column"
+	"github.com/tamnd/gr/format"
 	"github.com/tamnd/gr/pager"
 	"github.com/tamnd/gr/store"
 	"github.com/tamnd/gr/value"
@@ -224,3 +225,40 @@ func crashCampaign(t *testing.T, mode vfs.TripMode, label string) {
 func TestColumnCrashCampaignCrash(t *testing.T) { crashCampaign(t, vfs.TripCrash, "crash") }
 func TestColumnCrashCampaignTorn(t *testing.T)  { crashCampaign(t, vfs.TripTear, "torn") }
 func TestColumnCrashCampaignFsync(t *testing.T) { crashCampaign(t, vfs.TripFsyncFail, "fsync") }
+
+// TestColumnsFreeReturnsPages proves Free returns the store's pages to the
+// pager's free list: after freeing a populated store the next allocation reuses a
+// page rather than growing the file.
+func TestColumnsFreeReturnsPages(t *testing.T) {
+	fsys := vfs.NewMem()
+	p := openPager(t, fsys)
+	defer p.Close()
+
+	secs, err := store.CreateSections(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := column.Create(p, secs, store.SecNodeCols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	must(t, c.Set(0, 0, value.String("alice")))
+	must(t, c.Set(1, 0, value.Int(30)))
+	must(t, c.Set(0, 5, value.String("bob")))
+	if err := p.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.Free(); err != nil {
+		t.Fatal(err)
+	}
+	before := p.Header().PageCount
+	f, err := p.AllocPage(format.PageTypeData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Header().PageCount != before {
+		t.Fatalf("page count grew from %d to %d after freeing a store", before, p.Header().PageCount)
+	}
+	p.Unpin(f)
+}

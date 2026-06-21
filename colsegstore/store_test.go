@@ -5,6 +5,7 @@ import (
 
 	"github.com/tamnd/gr/colseg"
 	"github.com/tamnd/gr/colsegstore"
+	"github.com/tamnd/gr/format"
 	"github.com/tamnd/gr/value"
 	"github.com/tamnd/gr/vfs"
 )
@@ -89,4 +90,37 @@ func TestStoreReopen(t *testing.T) {
 	if got := len(s2.Keys()); got != 3 {
 		t.Fatalf("reopened key count = %d, want 3", got)
 	}
+}
+
+// TestStoreFreeReturnsPages proves Free returns the store's pages to the pager's
+// free list: after freeing a populated store the next allocation reuses a page
+// rather than growing the file.
+func TestStoreFreeReturnsPages(t *testing.T) {
+	fsys := vfs.NewMem()
+	p := openPager(t, fsys)
+	defer p.Close()
+
+	s, err := colsegstore.CreateStore(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	must(t, s.Append(0, 0, value.TypeInt, []colseg.Cell{present(value.Int(1)), present(value.Int(2))}))
+	must(t, s.Append(0, 2, value.TypeInt, []colseg.Cell{present(value.Int(3))}))
+	must(t, s.Append(2, 0, value.TypeString, []colseg.Cell{present(value.String("x"))}))
+	if err := p.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Free(); err != nil {
+		t.Fatal(err)
+	}
+	before := p.Header().PageCount
+	f, err := p.AllocPage(format.PageTypeData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Header().PageCount != before {
+		t.Fatalf("page count grew from %d to %d after freeing a store", before, p.Header().PageCount)
+	}
+	p.Unpin(f)
 }

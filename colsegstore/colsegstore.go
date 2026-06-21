@@ -98,6 +98,17 @@ func (c *Column) BlobLen() int            { return c.blob.Len() }
 // SegmentCount is the number of segments in the column.
 func (c *Column) SegmentCount() int { return c.dir.Count() }
 
+// Free returns the column's pages to the pager's free list: the segment directory
+// Vector and the blob Log. The column is dead afterward and must not be used
+// again; the checkpoint calls this on a segmented base it has rebuilt so the old
+// pages can be reused.
+func (c *Column) Free() error {
+	if err := c.dir.Free(); err != nil {
+		return err
+	}
+	return c.blob.Free()
+}
+
 // Append adds a segment covering positions [firstPos, firstPos+len(cells)),
 // encoding the cells through colseg. Segments must be appended in position order
 // with no gap or overlap: the first segment must start at 0 and each later one

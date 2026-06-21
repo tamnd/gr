@@ -58,6 +58,27 @@ func OpenStore(p *pager.Pager, dirHead format.PageID, dirCount int) (*Store, err
 func (s *Store) DirHead() format.PageID { return s.dir.Head() }
 func (s *Store) DirCount() int          { return s.dir.Count() }
 
+// Free returns every page the store occupies to the pager's free list: each
+// column's pages and the key directory Vector. The store is dead afterward and
+// must not be used again; the checkpoint calls this on the segmented base it has
+// rebuilt into a fresh one so the old pages can be reused. A key with a zero cell
+// has no column and costs nothing to skip.
+func (s *Store) Free() error {
+	for _, key := range s.Keys() {
+		col, ok, err := s.column(key)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if err := col.Free(); err != nil {
+			return err
+		}
+	}
+	return s.dir.Free()
+}
+
 // readCell decodes the directory cell for a key token.
 func (s *Store) readCell(key uint32) (dirHead format.PageID, blobHead format.PageID, dirCount int, blobLen int, err error) {
 	var buf [colCellStride]byte

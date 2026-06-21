@@ -49,6 +49,16 @@ const (
 	// DELTA stores the first value then signed varints of successive differences
 	// (doc 03 §15.5, doc 15 §11), compact for a monotone or near-monotone sequence.
 	DELTA Codec = 4
+	// Codec id 5 is DICTIONARY, the string column's dictionary form, defined in
+	// strings.go since it carries string-typed data.
+	//
+	// DELTAFOR is the composite codec doc 03 §15.5 names for the CSR offset array:
+	// delta to the successive differences, then frame-of-reference plus bit-packing
+	// over those differences. It beats plain DELTA when the differences are small and
+	// uniform (a degree array, a monotone id or timestamp run, a sorted neighbor
+	// run), because it packs each difference in a fixed few bits instead of a whole
+	// varint byte.
+	DELTAFOR Codec = 6
 )
 
 // ErrBadSegment means a segment's bytes are malformed: an unknown codec id, a
@@ -71,6 +81,8 @@ func (c Codec) String() string {
 		return "DELTA"
 	case DICTIONARY:
 		return "DICTIONARY"
+	case DELTAFOR:
+		return "DELTAFOR"
 	default:
 		return "UNKNOWN"
 	}
@@ -97,7 +109,7 @@ func Choose(vals []int64) Codec {
 	bestSize := len(EncodeWith(RAW, vals))
 	// The preference order is also the tie-break order: an earlier candidate only
 	// loses to a strictly smaller later one, so equal sizes keep the earlier pick.
-	for _, c := range []Codec{DELTA, FOR, RLE, CONSTANT} {
+	for _, c := range []Codec{DELTA, DELTAFOR, FOR, RLE, CONSTANT} {
 		body, ok := encode(c, vals)
 		if !ok {
 			continue
@@ -127,7 +139,7 @@ func PeekCodec(b []byte) (Codec, error) {
 		return 0, ErrBadSegment
 	}
 	switch Codec(b[0]) {
-	case RAW, CONSTANT, RLE, FOR, DELTA, DICTIONARY:
+	case RAW, CONSTANT, RLE, FOR, DELTA, DICTIONARY, DELTAFOR:
 		return Codec(b[0]), nil
 	default:
 		return 0, ErrBadSegment
@@ -148,6 +160,8 @@ func encode(c Codec, vals []int64) ([]byte, bool) {
 		return encodeFOR(vals), true
 	case DELTA:
 		return encodeDelta(vals), true
+	case DELTAFOR:
+		return encodeDeltaFOR(vals), true
 	default:
 		return nil, false
 	}
@@ -201,6 +215,12 @@ func encodeRLE(vals []int64) []byte {
 }
 
 func encodeFOR(vals []int64) []byte {
+	if len(vals) == 0 {
+		dst := []byte{byte(FOR)}
+		dst = format.AppendUvarint(dst, 0)
+		dst = format.AppendVarint(dst, 0)
+		return append(dst, 0) // base 0, width 0, no packed body
+	}
 	base := vals[0]
 	var maxDelta uint64
 	for _, v := range vals {
@@ -237,6 +257,28 @@ func encodeDelta(vals []int64) []byte {
 	return dst
 }
 
+// encodeDeltaFOR writes the composite: the element count, the first value, then a
+// frame-of-reference segment over the successive differences. The differences (the
+// degrees, for an offset array) are small and uniform for a monotone run, so FOR
+// packs them in a fixed few bits where plain DELTA spends a varint byte each. The
+// embedded FOR segment is the entire remainder of the body, so decode needs no
+// length for it.
+func encodeDeltaFOR(vals []int64) []byte {
+	dst := []byte{byte(DELTAFOR)}
+	dst = format.AppendUvarint(dst, uint64(len(vals)))
+	if len(vals) == 0 {
+		return dst
+	}
+	dst = format.AppendVarint(dst, vals[0])
+	diffs := make([]int64, len(vals)-1)
+	prev := vals[0]
+	for i, v := range vals[1:] {
+		diffs[i] = v - prev
+		prev = v
+	}
+	return append(dst, EncodeWith(FOR, diffs)...)
+}
+
 // Decode reverses Encode: it reads the leading codec id and decodes the body into
 // the original values. It returns ErrBadSegment for any malformed input rather
 // than panicking.
@@ -256,9 +298,39 @@ func Decode(b []byte) ([]int64, error) {
 		return decodeFOR(body)
 	case DELTA:
 		return decodeDelta(body)
+	case DELTAFOR:
+		return decodeDeltaFOR(body)
 	default:
 		return nil, ErrBadSegment
 	}
+}
+
+func decodeDeltaFOR(b []byte) ([]int64, error) {
+	n, off, err := readCount(b)
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	first, fn, err := format.Varint(b[off:])
+	if err != nil {
+		return nil, ErrBadSegment
+	}
+	off += fn
+	diffs, err := Decode(b[off:])
+	if err != nil {
+		return nil, err
+	}
+	if len(diffs) != n-1 {
+		return nil, ErrBadSegment
+	}
+	out := make([]int64, n)
+	out[0] = first
+	for i := 1; i < n; i++ {
+		out[i] = out[i-1] + diffs[i-1]
+	}
+	return out, nil
 }
 
 func decodeRaw(b []byte) ([]int64, error) {

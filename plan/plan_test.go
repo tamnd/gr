@@ -270,6 +270,34 @@ func TestJoinOrderStructuralKeepsBuildOrder(t *testing.T) {
 	eq(t, "join", String(PlanWithStats(b, nil)), String(Plan(b)))
 }
 
+func TestWcojRewritesTriangle(t *testing.T) {
+	// A triangle's closing edge is an expand-into over the expand that produces the
+	// apex. With a non-trivial average degree the binary plan's intermediate (every
+	// neighbor of b as a candidate c) dwarfs the closing matches, so the cost model
+	// replaces the two edges with an Intersect that computes c as the neighbors of b
+	// that also reach a. The subtree binding a and b is left as the anchored a->b chain.
+	b := bound(t, "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c)-[:KNOWS]->(a) RETURN a")
+	st := fakeStats{nodes: 1000, rels: 5000, label: map[uint32]float64{1: 10}, relType: map[uint32]float64{1: 5000}}
+	eq(t, "wcoj", String(PlanWithStats(b, st)), `Project a
+  Intersect c <= b -[@r1:#1]-> & a <-[@r2:#1]-
+    Expand a -[@r0:#1]-> b
+      NodeScan a:#1
+`)
+}
+
+func TestWcojStructuralUnchanged(t *testing.T) {
+	// With no statistics the triangle keeps the builder's binary expand-into plan, so
+	// the structural Plan is unchanged and the planner goldens hold.
+	b := bound(t, "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c)-[:KNOWS]->(a) RETURN a")
+	eq(t, "wcoj", String(PlanWithStats(b, nil)), String(Plan(b)))
+	eq(t, "wcoj", String(Plan(b)), `Project a
+  Expand c -[@r2:#1]-> a (into)
+    Expand b -[@r1:#1]-> c
+      Expand a -[@r0:#1]-> b
+        NodeScan a:#1
+`)
+}
+
 func TestReanchorBailsVarLength(t *testing.T) {
 	// A variable-length step is not safely reversible by the simple subset, so the
 	// chain is left anchored as built even though b is the labeled end.

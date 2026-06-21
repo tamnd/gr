@@ -27,6 +27,9 @@ func Optimize(o Op, st Statistics) Op {
 	if ch, ok := extractChain(o); ok {
 		return reanchor(ch, st)
 	}
+	if w, ok := wcojRewrite(o, st); ok {
+		return w
+	}
 	return mapChildren(o, func(c Op) Op { return Optimize(c, st) })
 }
 
@@ -317,6 +320,8 @@ func mapChildren(o Op, f func(Op) Op) Op {
 			Types: x.Types, ToLabels: x.ToLabels, Dir: x.Dir,
 			VarLen: x.VarLen, ToBound: x.ToBound,
 		}
+	case *Intersect:
+		return &Intersect{Input: f(x.Input), Var: x.Var, Labels: x.Labels, Legs: x.Legs}
 	case *Project:
 		return &Project{Input: f(x.Input), Cols: x.Cols, Distinct: x.Distinct}
 	case *Aggregate:

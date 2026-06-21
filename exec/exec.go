@@ -232,6 +232,14 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 			op = &expandOp{spec: x, input: input, peers: sib}
 		}
 		return op, append(inPeers, x.Rel), nil
+	case *plan.Intersect:
+		input, inPeers, err := compileRel(x.Input, peers)
+		if err != nil {
+			return nil, nil, err
+		}
+		sib := append([]string(nil), inPeers...)
+		op := &intersectOp{spec: x, input: input, peers: sib}
+		return op, append(inPeers, x.Legs[0].Rel, x.Legs[1].Rel), nil
 	case *plan.Filter:
 		input, inPeers, err := compileRel(x.Input, peers)
 		if err != nil {

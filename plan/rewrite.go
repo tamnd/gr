@@ -79,6 +79,14 @@ func rebuildChildren(o Op) (Op, bool) {
 		y := *x
 		y.Input = in
 		return &y, true
+	case *Intersect:
+		in, ch := apply(x.Input)
+		if !ch {
+			return x, false
+		}
+		y := *x
+		y.Input = in
+		return &y, true
 	case *Filter:
 		in, ch := apply(x.Input)
 		if !ch {
@@ -212,6 +220,12 @@ func pushFilter(f *Filter) (Op, bool) {
 			return &Filter{Input: pushed, Pred: x.Pred}, true
 		}
 	case *Expand:
+		if subset(v, outputVars(x.Input)) {
+			y := *x
+			y.Input = &Filter{Input: x.Input, Pred: f.Pred}
+			return &y, true
+		}
+	case *Intersect:
 		if subset(v, outputVars(x.Input)) {
 			y := *x
 			y.Input = &Filter{Input: x.Input, Pred: f.Pred}

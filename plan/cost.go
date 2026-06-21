@@ -87,6 +87,19 @@ func EstimateRows(o Op, st Statistics) float64 {
 			rows *= DefaultPredSelectivity
 		}
 		return rows
+	case *Intersect:
+		// The apex is adjacent to both bound endpoints, so its candidates are bounded by
+		// the smaller side's fan-out, and the closing adjacency keeps only the fraction
+		// that also reaches the other endpoint. Costing it at the smaller degree times an
+		// equality selectivity is what makes the planner prefer it over the binary plan
+		// whose intermediate is the full larger fan-out (doc 11 §5.5).
+		d0 := avgDegree(x.Legs[0].Types, st)
+		d1 := avgDegree(x.Legs[1].Types, st)
+		rows := EstimateRows(x.Input, st) * minf(d0, d1) * DefaultEqualitySelectivity
+		for range x.Labels {
+			rows *= DefaultPredSelectivity
+		}
+		return rows
 	case *Filter:
 		return EstimateRows(x.Input, st) * selectivity(x.Pred)
 	case *BindPath:
@@ -306,4 +319,11 @@ func max0(x float64) float64 {
 		return 0
 	}
 	return x
+}
+
+func minf(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
 }

@@ -134,6 +134,34 @@ type ShortestPath struct {
 	All     bool
 }
 
+// Intersect closes a cycle by producing a node that is adjacent to two
+// already-bound nodes, computed as the intersection of their neighbor sets: the
+// worst-case-optimal join for a triangle (doc 11 §5). The binary-join plan for a
+// triangle expands to the apex from one side, materializing every candidate, then
+// trims with an expand-into; for a high-degree side that intermediate dwarfs the
+// closing matches. Intersect instead intersects the two sides' neighbor lists, so
+// it touches only the smaller side and produces no large intermediate, the AGM-bound
+// advantage WCOJ has on cyclic patterns. Var is the apex node it binds and Labels
+// the labels that node must carry; Legs[0] and Legs[1] are the two edges that reach
+// the apex from the bound endpoints, each binding its own relationship variable.
+type Intersect struct {
+	Input  Op
+	Var    string
+	Labels []bind.NameRef
+	Legs   [2]IntersectLeg
+}
+
+// IntersectLeg is one edge reaching an Intersect's apex from an already-bound node:
+// From is the bound endpoint, Rel the relationship variable the leg binds, Types the
+// resolved type set (empty matches any), and Dir the direction written from From
+// toward the apex.
+type IntersectLeg struct {
+	From  string
+	Rel   string
+	Types []bind.NameRef
+	Dir   ast.Direction
+}
+
 // Create is the write operator that materializes a CREATE clause's patterns. It
 // runs once per input row (the read part feeds it; a leading CREATE runs over the
 // single Unit row), creating every new node and relationship, binding each to its
@@ -357,6 +385,7 @@ func (*Argument) op()      {}
 func (*NodeScan) op()      {}
 func (*NodeIndexSeek) op() {}
 func (*Expand) op()        {}
+func (*Intersect) op()     {}
 func (*Filter) op()        {}
 func (*BindPath) op()      {}
 func (*ShortestPath) op()  {}
@@ -415,6 +444,12 @@ func outputVars(o Op) map[string]bool {
 		s := outputVars(x.Input)
 		s[x.Rel] = true
 		s[x.To] = true
+		return s
+	case *Intersect:
+		s := outputVars(x.Input)
+		s[x.Var] = true
+		s[x.Legs[0].Rel] = true
+		s[x.Legs[1].Rel] = true
 		return s
 	case *Filter:
 		return outputVars(x.Input)
@@ -536,6 +571,8 @@ func nodeLabel(o Op) string {
 		return "NodeIndexSeek " + seekLabel(x)
 	case *Expand:
 		return "Expand " + expandLabel(x)
+	case *Intersect:
+		return "Intersect " + intersectLabel(x)
 	case *Filter:
 		return "Filter " + ast.Print(x.Pred)
 	case *BindPath:
@@ -585,6 +622,8 @@ func nodeChildren(o Op) []Op {
 	case *Delete:
 		return []Op{x.Input}
 	case *Expand:
+		return []Op{x.Input}
+	case *Intersect:
 		return []Op{x.Input}
 	case *Filter:
 		return []Op{x.Input}
@@ -664,6 +703,24 @@ func expandLabel(x *Expand) string {
 		tail += " (into)"
 	}
 	return x.From + " " + left + "[" + rel + typeSuffix(x.Types) + "]" + right + " " + x.To + tail
+}
+
+// intersectLabel renders an Intersect: the apex variable with its labels, then the
+// two legs that reach it, as "c:#label <= a -[r1:#t]-> & b -[r2:#t]->". The arrow on
+// each leg shows the direction from the bound endpoint toward the apex.
+func intersectLabel(x *Intersect) string {
+	return x.Var + labelSuffix(x.Labels) + " <= " + legLabel(x.Legs[0]) + " & " + legLabel(x.Legs[1])
+}
+
+func legLabel(l IntersectLeg) string {
+	left, right := "-", "-"
+	switch l.Dir {
+	case ast.DirOut:
+		right = "->"
+	case ast.DirIn:
+		left = "<-"
+	}
+	return l.From + " " + left + "[" + l.Rel + typeSuffix(l.Types) + "]" + right
 }
 
 // shortestLabel renders a ShortestPath operator's pattern: the search kind, the

@@ -232,6 +232,79 @@ func TestExplainCostAnchorsRarerEnd(t *testing.T) {
 	}
 }
 
+// TestExplainCostJoinBuildsSmallerSide is the end-to-end discriminator for build-side
+// selection: a join of two disjoint patterns keeps the smaller scan on the build side,
+// the right input the executor holds in its hash table. The pattern lists Tag before
+// Doc, so the builder puts Tag on the left; with Tag rare and Doc abundant the cost
+// model swaps them, and EXPLAIN renders the rare Tag scan as the join's second (build)
+// child, after the abundant Doc scan.
+func TestExplainCostJoinBuildsSmallerSide(t *testing.T) {
+	db := openMem(t, "explaincostjoin.gr")
+	defer func() { _ = db.Close() }()
+
+	mustExec(t, db, "CREATE (:Tag)", nil)
+	for range 5 {
+		mustExec(t, db, "CREATE (:Doc)", nil)
+	}
+
+	tag, ok := db.eng.Lookup(catalog.KindLabel, "Tag")
+	if !ok {
+		t.Fatal("Tag label was not interned")
+	}
+	doc, ok := db.eng.Lookup(catalog.KindLabel, "Doc")
+	if !ok {
+		t.Fatal("Doc label was not interned")
+	}
+
+	plan := planText(t, db, "EXPLAIN MATCH (a:Tag), (b:Doc) RETURN a, b")
+	docScan := strings.Index(plan, fmt.Sprintf("NodeScan b:#%d", doc))
+	tagScan := strings.Index(plan, fmt.Sprintf("NodeScan a:#%d", tag))
+	if docScan < 0 || tagScan < 0 {
+		t.Fatalf("plan is missing a scan:\n%s", plan)
+	}
+	if tagScan < docScan {
+		t.Fatalf("rare Tag scan is on the probe side, not the build side:\n%s", plan)
+	}
+}
+
+// TestJoinSwapKeepsResults confirms swapping a join's build side does not change the
+// rows it returns: the cartesian product of two disjoint patterns is the same multiset
+// whichever side builds, so the cost-ordered plan returns exactly the structural one's
+// rows.
+func TestJoinSwapKeepsResults(t *testing.T) {
+	db := openMem(t, "joinswapresults.gr")
+	defer func() { _ = db.Close() }()
+
+	mustExec(t, db, "CREATE (:Tag {n: 1})", nil)
+	mustExec(t, db, "CREATE (:Doc {n: 10}), (:Doc {n: 20}), (:Doc {n: 30})", nil)
+
+	res, err := db.Query("MATCH (a:Tag), (b:Doc) RETURN a.n + b.n AS s", nil)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer func() { _ = res.Close() }()
+	got := map[int64]bool{}
+	for {
+		row, ok, err := res.Next()
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if !ok {
+			break
+		}
+		n, _ := row[0].AsInt()
+		got[n] = true
+	}
+	for _, want := range []int64{11, 21, 31} {
+		if !got[want] {
+			t.Fatalf("missing join row %d, got %v", want, got)
+		}
+	}
+	if len(got) != 3 {
+		t.Fatalf("join returned %d distinct rows, want 3: %v", len(got), got)
+	}
+}
+
 // TestExplainRejectsSchemaCommand confirms EXPLAIN of a schema command is an error:
 // a schema command changes the catalog outside the operator pipeline, so it has no
 // plan to render.

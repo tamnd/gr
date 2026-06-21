@@ -166,6 +166,29 @@ func (s *Store) Get(key uint32, pos uint64) (value.Value, bool, error) {
 	return col.Get(pos)
 }
 
+// Locate returns the ordinal of the segment covering pos in key's column and that
+// segment's first position, or ok false when the key has no column or pos is past
+// its coverage. It decodes no blob, so the engine can front the read with a
+// decoded-segment cache keyed by the ordinal (doc 14 §4).
+func (s *Store) Locate(key uint32, pos uint64) (ord int, firstPos uint64, ok bool, err error) {
+	col, ok, err := s.column(key)
+	if err != nil || !ok {
+		return 0, 0, false, err
+	}
+	return col.Locate(pos)
+}
+
+// DecodeSegment decodes the whole segment at ordinal ord of key's column into its
+// cells. The engine calls it only on a cache miss, then caches the returned cells. A
+// key with no column returns nil cells.
+func (s *Store) DecodeSegment(key uint32, ord int) ([]colseg.Cell, error) {
+	col, ok, err := s.column(key)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return col.DecodeSegment(ord)
+}
+
 // Keys returns the key tokens that have a directory cell. A key in the result may
 // still carry a zero cell (no column yet); Get on it reads as absent.
 func (s *Store) Keys() []uint32 {

@@ -506,9 +506,18 @@ func (db *DB) tokenNamer(kind catalog.Kind) func(t engine.Token) (string, bool) 
 // Query owns its read transaction and releases it on Close; a Result from a
 // managed transaction's Run borrows that transaction and leaves it for the caller
 // to commit or roll back, so Close only releases the cursor (ownTx is false).
+//
+// A read streams lazily from a cursor. A write statement run through a managed
+// transaction's Run executes eagerly and materializes its RETURN rows into buf, so
+// every mutation lands before Run returns (a half-consumed write would otherwise
+// leave the statement partly applied at commit); the result then iterates the
+// buffer and reports the mutation counts through Summary.
 type Result struct {
 	cols   []string
 	cursor *exec.Cursor
+	buf    []eval.Row
+	bufIdx int
+	eff    *exec.SideEffects
 	tx     engine.Tx
 	ownTx  bool
 }
@@ -516,11 +525,25 @@ type Result struct {
 // Columns returns the result's output column names in order.
 func (r *Result) Columns() []string { return r.cols }
 
+// next pulls the next row from whichever backing the result has: the live cursor
+// for a read, or the materialized buffer for an eagerly executed write.
+func (r *Result) next() (eval.Row, bool, error) {
+	if r.cursor != nil {
+		return r.cursor.Next()
+	}
+	if r.bufIdx >= len(r.buf) {
+		return nil, false, nil
+	}
+	row := r.buf[r.bufIdx]
+	r.bufIdx++
+	return row, true, nil
+}
+
 // Next pulls the next result row as a slice of column values aligned to Columns,
 // returning ok false at the end of the stream. A column absent from the row binds
 // to the null value, the schema-optional reading rule (doc 08 §5.3).
 func (r *Result) Next() ([]value.Value, bool, error) {
-	row, ok, err := r.cursor.Next()
+	row, ok, err := r.next()
 	if err != nil || !ok {
 		return nil, ok, err
 	}
@@ -532,8 +555,18 @@ func (r *Result) Next() ([]value.Value, bool, error) {
 }
 
 // NextRow pulls the next result row as a name-keyed map, for callers that prefer
-// lookup by column name over positional access. It shares the cursor with Next.
-func (r *Result) NextRow() (eval.Row, bool, error) { return r.cursor.Next() }
+// lookup by column name over positional access. It shares the backing with Next.
+func (r *Result) NextRow() (eval.Row, bool, error) { return r.next() }
+
+// Summary reports the graph mutations a write statement run through Run performed
+// (doc 13 §3). It is the zero summary for a read result, which mutates nothing, and
+// it is complete as soon as Run returns, since a write executes eagerly.
+func (r *Result) Summary() Summary {
+	if r.eff == nil {
+		return Summary{}
+	}
+	return summaryOf(r.eff)
+}
 
 // Close releases the result's cursor. For an auto-commit Query result it also
 // aborts the read transaction it owns; for a managed-transaction Run result it

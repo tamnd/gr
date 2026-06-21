@@ -55,10 +55,11 @@ var ErrExplainSchema = errors.New("gr: cannot EXPLAIN a schema command")
 // over the underlying file; queries run against snapshots the engine hands out.
 // It also owns the plan cache, so a repeated query shape reuses its compiled plan.
 type DB struct {
-	path       string
-	eng        *engine.DiskEngine
-	cache      *plan.Cache
-	maxRetries int
+	path        string
+	eng         *engine.DiskEngine
+	cache       *plan.Cache
+	maxRetries  int
+	driftFactor float64
 }
 
 // Options configure how a database is opened. The zero value is the default:
@@ -84,6 +85,12 @@ type Options struct {
 	// 0 uses [DefaultMaxRetries]. It is dormant on the single-writer path, where a
 	// write transaction never conflicts.
 	MaxRetries int
+	// ReplanDriftFactor sets how far the data may drift under a fixed schema before a
+	// cached plan is recompiled: a label or type whose share of the graph changes by
+	// more than this multiple since the plan was costed triggers a re-plan (doc 11
+	// §7). 0 uses [plan.DefaultDriftFactor]; a value of one or less disables adaptive
+	// re-planning, leaving a cached plan in place until the schema changes.
+	ReplanDriftFactor float64
 }
 
 // Open opens the database at path, creating it with a fresh graph structure if it
@@ -107,7 +114,17 @@ func Open(path string, opt Options) (*DB, error) {
 	if maxRetries <= 0 {
 		maxRetries = DefaultMaxRetries
 	}
-	return &DB{path: path, eng: eng, cache: plan.NewCache(opt.PlanCacheSize), maxRetries: maxRetries}, nil
+	driftFactor := opt.ReplanDriftFactor
+	if driftFactor == 0 {
+		driftFactor = plan.DefaultDriftFactor
+	}
+	return &DB{
+		path:        path,
+		eng:         eng,
+		cache:       plan.NewCache(opt.PlanCacheSize),
+		maxRetries:  maxRetries,
+		driftFactor: driftFactor,
+	}, nil
 }
 
 // Path returns the database file path.
@@ -634,9 +651,18 @@ func summaryOf(e *exec.SideEffects) Summary {
 // hit or by parsing, binding, and planning on a miss (then caching the result).
 // The cache key pairs the normalized text with the engine's catalog version, so a
 // schema change misses the entries bound against the old catalog (doc 14 §8.4).
+//
+// A schema change is not the only thing that can stale a plan: a cost decision baked
+// into a cached plan can go stale as the data drifts under a fixed schema (doc 11
+// §7). So a cache hit also checks whether the live statistics have drifted far enough
+// from the plan's basis to re-plan; if they have, the entry is recompiled and
+// replaced, which resets the basis so the check does not re-fire until the data
+// drifts again. Drift is a relative-fraction test, so uniform growth does not trigger
+// it, and a re-plan on a false positive only costs a compile, never correctness.
 func (db *DB) compile(cypher string) (*plan.Entry, error) {
 	key := plan.Key{Text: plan.NormalizeText(cypher), Catalog: db.eng.CatalogVersion()}
-	if entry, ok := db.cache.Get(key); ok {
+	st := engineStats{db.eng}
+	if entry, ok := db.cache.Get(key); ok && !plan.Drifted(entry.Stats, st, db.driftFactor) {
 		return entry, nil
 	}
 	q, err := parse.Parse(cypher)
@@ -655,9 +681,8 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	st := engineStats{db.eng}
 	op := plan.SeekRewrite(plan.PlanWithStats(b, st), b, indexLookup{db.eng}, st)
-	entry := &plan.Entry{Bound: b, Op: op}
+	entry := &plan.Entry{Bound: b, Op: op, Stats: plan.Snapshot(op, st)}
 	db.cache.Put(key, entry)
 	return entry, nil
 }

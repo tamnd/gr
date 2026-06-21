@@ -104,6 +104,83 @@ func TestCreateAndDropConstraintIdempotency(t *testing.T) {
 	}
 }
 
+// makePersonAge creates a Person node carrying age=v through a write tx and commits
+// it, returning whether the commit succeeded.
+func makePersonAge(t *testing.T, e *DiskEngine, person, age Token, v value.Value) error {
+	t.Helper()
+	tx, err := e.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := tx.CreateNode([]Token{person})
+	if err != nil {
+		_ = tx.Abort()
+		t.Fatal(err)
+	}
+	if err := tx.SetNodeProperty(id, age, v); err != nil {
+		_ = tx.Abort()
+		t.Fatal(err)
+	}
+	return tx.Commit()
+}
+
+func TestTypeConstraintEnforcedAtCommit(t *testing.T) {
+	fsys := vfs.NewMem()
+	e := openDisk(t, fsys, "tc.gr")
+	defer e.Close()
+
+	person, _ := e.Intern(catalog.KindLabel, "Person")
+	age, _ := e.Intern(catalog.KindPropKey, "age")
+	if _, err := e.CreateTypeConstraint("", "Person", "age", value.TypeInt, false); err != nil {
+		t.Fatal(err)
+	}
+	// An integer value satisfies the constraint.
+	if err := makePersonAge(t, e, person, age, value.Int(30)); err != nil {
+		t.Fatalf("integer insert: %v", err)
+	}
+	// A string value violates it and aborts.
+	err := makePersonAge(t, e, person, age, value.String("old"))
+	var ce *ConstraintError
+	if !errors.As(err, &ce) {
+		t.Fatalf("wrong-typed insert error = %v, want ConstraintError", err)
+	}
+	if ce.Kind != catalog.TypedNode {
+		t.Fatalf("error kind = %v, want TypedNode", ce.Kind)
+	}
+	// A missing property is exempt: a type constraint only restricts present values.
+	tx, err := e.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.CreateNode([]Token{person}); err != nil {
+		_ = tx.Abort()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("node without the property was rejected: %v", err)
+	}
+}
+
+func TestCreateTypeConstraintRejectsExistingWrongType(t *testing.T) {
+	fsys := vfs.NewMem()
+	e := openDisk(t, fsys, "tcexist.gr")
+	defer e.Close()
+
+	person, _ := e.Intern(catalog.KindLabel, "Person")
+	age, _ := e.Intern(catalog.KindPropKey, "age")
+	if err := makePersonAge(t, e, person, age, value.String("old")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := e.CreateTypeConstraint("", "Person", "age", value.TypeInt, false)
+	var ce *ConstraintError
+	if !errors.As(err, &ce) {
+		t.Fatalf("create-over-wrong-type error = %v, want ConstraintError", err)
+	}
+	if got := len(e.cat.Constraints()); got != 0 {
+		t.Fatalf("a failed creation left %d constraints", got)
+	}
+}
+
 func TestConstraintCatalogVersionMoves(t *testing.T) {
 	fsys := vfs.NewMem()
 	e := openDisk(t, fsys, "ucver.gr")

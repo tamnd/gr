@@ -80,6 +80,53 @@ func TestConstraintRoundTrip(t *testing.T) {
 	}
 }
 
+// TestTypeConstraintRoundTrip confirms a property-type constraint carries its
+// ValueType through the encode/decode round trip and replays it after a reopen.
+func TestTypeConstraintRoundTrip(t *testing.T) {
+	fsys := vfs.NewMem()
+	p := openPager(t, fsys)
+	secs, err := store.CreateSections(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat, err := Create(p, secs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	person, _, _ := cat.Intern(KindLabel, "Person")
+	age, _, _ := cat.Intern(KindPropKey, "age")
+
+	// ValueType 2 stands for the integer value type (value.TypeInt); the catalog
+	// stores the tag opaquely and does not depend on the value package.
+	if err := cat.AddConstraint(Constraint{Name: "person_age_int", Kind: TypedNode, Label: person, Props: []uint32{age}, ValueType: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	p2 := openPager(t, fsys)
+	defer p2.Close()
+	secs2, err := store.OpenSections(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat2, err := Open(p2, secs2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, ok := cat2.ConstraintByName("person_age_int")
+	if !ok {
+		t.Fatal("type constraint vanished after reopen")
+	}
+	if c.Kind != TypedNode || c.ValueType != 2 {
+		t.Fatalf("replayed constraint = %+v, want TypedNode with ValueType 2", c)
+	}
+}
+
 // TestSchemaOpsMonotonic confirms the schema-op counter only ever grows, so the
 // engine can fold it into a monotonic catalog version even across drops.
 func TestSchemaOpsMonotonic(t *testing.T) {

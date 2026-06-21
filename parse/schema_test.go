@@ -5,6 +5,7 @@ import (
 
 	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/parse"
+	"github.com/tamnd/gr/value"
 )
 
 func TestParseCreateConstraint(t *testing.T) {
@@ -58,6 +59,53 @@ func TestParseCreateExistenceConstraint(t *testing.T) {
 	}
 	if cc.Var != "p" || cc.Label != "Person" || len(cc.Props) != 1 || cc.Props[0] != "email" {
 		t.Fatalf("var/label/props = %q/%q/%v", cc.Var, cc.Label, cc.Props)
+	}
+}
+
+func TestParseCreateTypeConstraint(t *testing.T) {
+	cases := []struct {
+		src  string
+		want value.Type
+	}{
+		{"CREATE CONSTRAINT FOR (p:Person) REQUIRE p.age IS :: INTEGER", value.TypeInt},
+		{"CREATE CONSTRAINT FOR (p:Person) REQUIRE p.name IS :: STRING", value.TypeString},
+		{"CREATE CONSTRAINT FOR (p:Person) REQUIRE p.score IS :: FLOAT", value.TypeFloat},
+		{"CREATE CONSTRAINT FOR (p:Person) REQUIRE p.active IS :: BOOLEAN", value.TypeBool},
+		// The TYPED synonym and lower-case type name are accepted.
+		{"CREATE CONSTRAINT FOR (p:Person) REQUIRE p.age IS TYPED INTEGER", value.TypeInt},
+		{"CREATE CONSTRAINT FOR (p:Person) REQUIRE p.age IS :: integer", value.TypeInt},
+	}
+	for _, c := range cases {
+		q, err := parse.Parse(c.src)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.src, err)
+		}
+		cc, ok := q.Schema.(*ast.CreateConstraint)
+		if !ok {
+			t.Fatalf("Parse(%q): Schema is %T, want *ast.CreateConstraint", c.src, q.Schema)
+		}
+		if cc.Type != ast.ConstraintPropertyType {
+			t.Fatalf("Parse(%q): type = %v, want ConstraintPropertyType", c.src, cc.Type)
+		}
+		if cc.PropType != c.want {
+			t.Fatalf("Parse(%q): proptype = %v, want %v", c.src, cc.PropType, c.want)
+		}
+	}
+}
+
+// TestParseTypeConstraintErrors confirms the type grammar rejects a missing or
+// unknown type name.
+func TestParseTypeConstraintErrors(t *testing.T) {
+	bad := []string{
+		"CREATE CONSTRAINT FOR (p:Person) REQUIRE p.age IS ::",         // missing type name
+		"CREATE CONSTRAINT FOR (p:Person) REQUIRE p.age IS : INTEGER",  // single colon
+		"CREATE CONSTRAINT FOR (p:Person) REQUIRE p.age IS :: NUMERIC", // unsupported type
+		"CREATE CONSTRAINT FOR (p:Person) REQUIRE p.age IS TYPED",      // TYPED without a type
+	}
+	for _, src := range bad {
+		if _, err := parse.Parse(src); err == nil {
+			t.Fatalf("Parse(%q): expected an error, got none", src)
+		}
 	}
 }
 

@@ -207,9 +207,9 @@ func (e *DiskEngine) TokenName(kind catalog.Kind, t Token) (string, bool) {
 func (e *DiskEngine) CatalogVersion() uint64 {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return uint64(e.cat.Count(catalog.KindLabel) +
-		e.cat.Count(catalog.KindRelType) +
-		e.cat.Count(catalog.KindPropKey))
+	return uint64(e.cat.Count(catalog.KindLabel)+
+		e.cat.Count(catalog.KindRelType)+
+		e.cat.Count(catalog.KindPropKey)) + e.cat.SchemaOps()
 }
 
 // NodeCountByLabel returns the number of live nodes carrying a label, the
@@ -896,6 +896,15 @@ func (t *diskTx) recordLabels(pos uint64, cats []uint32) {
 func (t *diskTx) Commit() error {
 	if t.done {
 		return nil
+	}
+	// Enforce constraints before the durability point: a violation aborts the
+	// whole transaction (rolling back its writes) and surfaces a typed error,
+	// rather than committing data the schema forbids (doc 13 §12, §16).
+	if t.write {
+		if err := t.validateUnique(); err != nil {
+			_ = t.Abort()
+			return err
+		}
 	}
 	t.done = true
 	t.e.oracle.End(t.snap)

@@ -70,15 +70,23 @@ func (d *dict) add(name string) uint32 {
 // persistent coordinates (the Log head and length) live in the section directory
 // under store.SecCatalog, which the catalog keeps current as names are interned,
 // so a reopen finds the exact committed extent to replay.
+//
+// The same Log also carries the schema records (doc 08 §8.1): a constraint add
+// or drop is one more tagged record appended in order, so the constraints a file
+// declares are rebuilt by the same replay that rebuilds the token dictionaries.
 type Catalog struct {
 	p     *pager.Pager
 	secs  *store.Sections
 	log   *store.Log
 	dicts [3]dict
+
+	cons    map[string]Constraint // name -> live constraint
+	conSeq  []string              // constraint names in add order, for a stable listing
+	schemaN uint64                // count of schema records ever appended (monotonic)
 }
 
 func newCatalog(p *pager.Pager, secs *store.Sections, log *store.Log) *Catalog {
-	c := &Catalog{p: p, secs: secs, log: log}
+	c := &Catalog{p: p, secs: secs, log: log, cons: make(map[string]Constraint)}
 	for i := range c.dicts {
 		c.dicts[i] = newDict()
 	}
@@ -128,13 +136,30 @@ func (c *Catalog) replay() error {
 	for len(buf) > 0 {
 		kind := Kind(buf[0])
 		buf = buf[1:]
-		name, n, err := format.String(buf)
-		if err != nil {
-			return err
-		}
-		buf = buf[n:]
-		if int(kind) < len(c.dicts) {
+		switch kind {
+		case KindLabel, KindRelType, KindPropKey:
+			name, n, err := format.String(buf)
+			if err != nil {
+				return err
+			}
+			buf = buf[n:]
 			c.dicts[kind].add(name)
+		case KindConstraintAdd:
+			con, n, err := decodeConstraint(buf)
+			if err != nil {
+				return err
+			}
+			buf = buf[n:]
+			c.applyConstraintAdd(con)
+		case KindConstraintDrop:
+			name, n, err := format.String(buf)
+			if err != nil {
+				return err
+			}
+			buf = buf[n:]
+			c.applyConstraintDrop(name)
+		default:
+			return errBadCatalogRecord
 		}
 	}
 	return nil

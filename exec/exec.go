@@ -217,6 +217,8 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 		return &argumentOp{vars: x.Vars}, nil, nil
 	case *plan.NodeScan:
 		return &nodeScanOp{spec: x}, peers, nil
+	case *plan.NodeIndexSeek:
+		return &nodeIndexSeekOp{spec: x}, peers, nil
 	case *plan.Expand:
 		input, inPeers, err := compileRel(x.Input, peers)
 		if err != nil {

@@ -118,12 +118,43 @@ func (p *parser) errAt(t lex.Token, msg string) error {
 	return &Error{Msg: msg, Line: t.Line, Col: t.Col}
 }
 
+// wordIs reports whether a token is a bare identifier matching s case-insensitively.
+// It lets the parser recognize the soft keywords of the schema grammar (CONSTRAINT,
+// FOR, REQUIRE, UNIQUE, DROP, IF, EXISTS) without reserving them, so a query can
+// still use those words as variable, label, or property names.
+func (p *parser) wordIs(t lex.Token, s string) bool {
+	return t.Kind == lex.Ident && strings.EqualFold(t.Text, s)
+}
+
+func (p *parser) atWord(s string) bool { return p.wordIs(p.cur(), s) }
+
+func (p *parser) acceptWord(s string) bool {
+	if p.atWord(s) {
+		p.i++
+		return true
+	}
+	return false
+}
+
+func (p *parser) expectWord(s string) (lex.Token, error) {
+	if !p.atWord(s) {
+		return lex.Token{}, p.errAt(p.cur(), "expected "+s+", found "+p.cur().Kind.String())
+	}
+	return p.advance(), nil
+}
+
 // pos turns a token into an AST position.
 func pos(t lex.Token) ast.Pos { return ast.Pos{Line: t.Line, Col: t.Col} }
 
 // --- query and clauses ---
 
 func (p *parser) query() (*ast.Query, error) {
+	if p.at(lex.Create) && p.wordIs(p.peek(1), "CONSTRAINT") {
+		return p.createConstraint()
+	}
+	if p.atWord("DROP") && p.wordIs(p.peek(1), "CONSTRAINT") {
+		return p.dropConstraint()
+	}
 	start := p.cur()
 	first, err := p.singleQuery()
 	if err != nil {

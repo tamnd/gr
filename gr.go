@@ -34,6 +34,11 @@ var ErrClosed = errors.New("gr: database is closed")
 // expected (a read-only Exec is allowed, but Query rejects writes outright).
 var ErrReadQuery = errors.New("gr: Query is read-only; use Exec for a write statement")
 
+// ErrSchemaCommand is returned by Query when the statement is a schema command
+// (CREATE CONSTRAINT, DROP CONSTRAINT); those run through Exec, which carries the
+// write transaction and reports the schema mutation in its summary.
+var ErrSchemaCommand = errors.New("gr: schema commands run through Exec, not Query")
+
 // DB is an open gr database. It owns the storage engine, which owns the pager
 // over the underlying file; queries run against snapshots the engine hands out.
 // It also owns the plan cache, so a repeated query shape reuses its compiled plan.
@@ -177,6 +182,9 @@ func (db *DB) Exec(cypher string, params map[string]value.Value) (Summary, error
 	if err != nil {
 		return Summary{}, err
 	}
+	if q.Schema != nil {
+		return db.execSchema(q.Schema)
+	}
 	if err := db.internWriteNames(q); err != nil {
 		return Summary{}, err
 	}
@@ -207,6 +215,36 @@ func (db *DB) Exec(cypher string, params map[string]value.Value) (Summary, error
 		return Summary{}, err
 	}
 	return summaryOf(eff), nil
+}
+
+// execSchema applies a data-definition statement (doc 08 §6). Each runs in its
+// own write transaction inside the engine, which interns the names, validates the
+// existing data, records the change durably, and commits; this layer only maps the
+// outcome onto the mutation summary. A schema change touches no graph rows, so it
+// runs outside the read/write operator pipeline.
+func (db *DB) execSchema(cmd ast.SchemaCommand) (Summary, error) {
+	switch c := cmd.(type) {
+	case *ast.CreateConstraint:
+		added, err := db.eng.CreateUniqueConstraint(c.Name, c.Label, c.Props[0], c.IfNotExists)
+		if err != nil {
+			return Summary{}, err
+		}
+		if added {
+			return Summary{ConstraintsAdded: 1}, nil
+		}
+		return Summary{}, nil
+	case *ast.DropConstraint:
+		removed, err := db.eng.DropConstraint(c.Name, c.IfExists)
+		if err != nil {
+			return Summary{}, err
+		}
+		if removed {
+			return Summary{ConstraintsRemoved: 1}, nil
+		}
+		return Summary{}, nil
+	default:
+		return Summary{}, errors.New("gr: unsupported schema command")
+	}
 }
 
 // drain compiles and runs a plan to exhaustion, discarding the rows. A write
@@ -442,6 +480,9 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 	q, err := parse.Parse(cypher)
 	if err != nil {
 		return nil, err
+	}
+	if q.Schema != nil {
+		return nil, ErrSchemaCommand
 	}
 	b, err := bind.Bind(q, bind.NewEngineCatalog(db.eng), false)
 	if err != nil {

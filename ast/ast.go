@@ -18,12 +18,48 @@ type Pos struct {
 }
 
 // Query is one statement: a single query, optionally combined with others by
-// UNION. First is the leading part; Rest holds the UNION-joined tails in order.
+// UNION, or a schema command. For a read/write query First is the leading part
+// and Rest holds the UNION-joined tails in order. For a schema command (CREATE
+// CONSTRAINT, DROP CONSTRAINT) Schema is set and First is nil: a schema command
+// is a whole statement on its own, not a clause inside a query (doc 08 §6.1).
 type Query struct {
 	Pos
-	First *SingleQuery
-	Rest  []UnionTail
+	First  *SingleQuery
+	Rest   []UnionTail
+	Schema SchemaCommand
 }
+
+// SchemaCommand is a data-definition statement that changes the catalog rather
+// than reading or writing graph data (doc 08 §6). The marker keeps the set closed.
+type SchemaCommand interface {
+	schemaNode()
+}
+
+// CreateConstraint is a CREATE CONSTRAINT statement. Name is the explicit
+// constraint name, empty when the statement omits it (the engine then derives one
+// from the label and property). IfNotExists makes a repeat creation a no-op rather
+// than an error. Var is the pattern variable, Label the node label it binds, and
+// Props the constrained property keys in order (one for a single-property
+// uniqueness constraint). This release supports node uniqueness only.
+type CreateConstraint struct {
+	Pos
+	Name        string
+	IfNotExists bool
+	Var         string
+	Label       string
+	Props       []string
+}
+
+// DropConstraint is a DROP CONSTRAINT statement, addressing a constraint by name.
+// IfExists makes dropping an absent constraint a no-op rather than an error.
+type DropConstraint struct {
+	Pos
+	Name     string
+	IfExists bool
+}
+
+func (*CreateConstraint) schemaNode() {}
+func (*DropConstraint) schemaNode()   {}
 
 // UnionTail is a UNION-joined query part. All distinguishes UNION ALL (keep
 // duplicates) from UNION (set union, deduplicated).

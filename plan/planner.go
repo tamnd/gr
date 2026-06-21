@@ -5,24 +5,29 @@ import (
 	"github.com/tamnd/gr/bind"
 )
 
-// Optimize is the rule-based planner subset (doc 11 §3, §6 simple form; doc 25
-// §5.2 deliverable 5). M2 has no cost model, so the only physical choices it
-// makes are the ones a rule, not a cost, can make: where a fresh linear pattern
-// anchors its scan, and which way each relationship is traversed. It re-roots a
-// scan/expand chain at its most structurally selective node and reverses the
-// expands so they radiate outward from that anchor.
+// Optimize re-roots each fresh linear scan/expand chain at the node it should
+// anchor on, reversing the expands so they radiate outward from that anchor
+// (doc 11 §3, §4). The choice is the join order of a linear pattern: which node
+// scans first and which direction each expand drives.
 //
-// The choice is meaning-preserving: the executor produces the same bindings
-// whatever the anchor or direction (a relationship is stored in both CSR
-// directions, doc 04 §5.2), so this only changes the plan's shape, never its
-// result. The cost-based planner that would weigh degree statistics and index
-// access paths is M4 ([11](11-query-planner.md) §2, §4); this subset is the
-// deliberately naïve stand-in M2 ships ([25](../25-roadmap.md) §5.4).
-func Optimize(o Op) Op {
+// With statistics it is a cost decision. A chain ties on final cardinality
+// whichever node it anchors at, so the planner orders the candidate anchors by
+// the sum of their intermediate row counts ([planCost]) and picks the cheapest,
+// the one that keeps every partial result smallest. With nil statistics it falls
+// back to the structural proxy M2 shipped: anchor on the most selective node by
+// label and equality predicate ([nodeScore]). The two share one chain builder,
+// so the cost path and the structural path produce the same plan shape, only
+// chosen on a different metric.
+//
+// The choice is meaning-preserving whichever metric drives it: the executor
+// produces the same bindings whatever the anchor or direction (a relationship is
+// stored in both CSR directions, doc 04 §5.2), so this only changes the plan's
+// shape, never its result.
+func Optimize(o Op, st Statistics) Op {
 	if ch, ok := extractChain(o); ok {
-		return reanchor(ch)
+		return reanchor(ch, st)
 	}
-	return mapChildren(o, Optimize)
+	return mapChildren(o, func(c Op) Op { return Optimize(c, st) })
 }
 
 // plannedNode is one node of a linearized pattern chain: its variable and the
@@ -113,15 +118,23 @@ func assemble(root Op, scan *NodeScan, exps []*Expand, filters []ast.Expr) (linC
 	return linChain{root: root, filters: filters, nodes: nodes, rels: rels}, true
 }
 
-// reanchor rebuilds the chain rooted at its most selective node, or returns the
+// reanchor rebuilds the chain rooted at its chosen anchor, or returns the
 // original tree when that node is already the anchor.
-func reanchor(ch linChain) Op {
-	k := pickAnchor(ch)
+func reanchor(ch linChain, st Statistics) Op {
+	k := pickAnchor(ch, st)
 	if k == 0 {
 		return ch.root
 	}
-	// The scan sits at the anchor; expands radiate right (in written direction)
-	// and left (reversed) from it.
+	return buildAnchored(ch, k)
+}
+
+// buildAnchored rebuilds the chain rooted at node k: the scan sits at the anchor,
+// the expands radiate right (in written direction) and left (reversed) from it,
+// and every filter is re-stacked on top. Normalize then pushes each filter to its
+// lowest valid point, so the re-anchored chain keeps the same pushdown as any
+// other. It is the one builder both the cost path and the structural path use, so
+// each candidate anchor can be costed by building it and reading its plan cost.
+func buildAnchored(ch linChain, k int) Op {
 	var cur Op = &NodeScan{Var: ch.nodes[k].name, Labels: ch.nodes[k].labels}
 	for i := k; i < len(ch.rels); i++ {
 		cur = &Expand{
@@ -145,28 +158,52 @@ func reanchor(ch linChain) Op {
 			Dir:      reverseDir(ch.rels[i].dir),
 		}
 	}
-	// Re-stack every filter on top; Normalize then pushes each to its lowest
-	// valid point, so the re-anchored chain keeps the same pushdown as any other.
 	for i := len(ch.filters) - 1; i >= 0; i-- {
 		cur = &Filter{Input: cur, Pred: ch.filters[i]}
 	}
 	return cur
 }
 
-// pickAnchor scores each node and returns the index of the most selective, ties
+// pickAnchor returns the index of the node the chain should anchor on, ties
 // broken toward the leftmost (the lowest pattern index, for a deterministic
-// plan). The score is the M2 structural proxy for selectivity (doc 11 §3.1): a
+// plan).
+//
+// With statistics it is a cost choice: each candidate anchor is built and costed
+// by the sum of its intermediate row counts ([planCost]), and the cheapest wins.
+// Two anchors of one chain tie on final cardinality, so this metric, not the
+// final count, is what separates them: anchoring at the rarest node keeps every
+// partial result small (doc 11 §3, §4).
+//
+// With nil statistics it falls back to the M2 structural proxy (doc 11 §3.1): a
 // labeled scan reads fewer nodes than an all-nodes scan, and a node pinned by an
-// equality predicate yields fewer rows downstream. The degree-aware and
-// index-aware refinements (doc 11 §3.4, §6.2) need live statistics and index
-// access paths, so they are the cost planner's, not this subset's.
-func pickAnchor(ch linChain) int {
+// equality predicate yields fewer rows downstream ([nodeScore]).
+func pickAnchor(ch linChain, st Statistics) int {
+	if st != nil {
+		return costAnchor(ch, st)
+	}
 	pinned := pinnedVars(ch.filters)
 	best, bestScore := 0, -1
 	for i, n := range ch.nodes {
 		s := nodeScore(len(n.labels) > 0, pinned[n.name])
 		if s > bestScore {
 			best, bestScore = i, s
+		}
+	}
+	return best
+}
+
+// costAnchor picks the anchor whose rebuilt chain has the lowest plan cost, ties
+// broken toward the leftmost. It builds each candidate, normalizes it so filter
+// pushdown is reflected in the cost, and keeps the cheapest. Normalizing here
+// matters: an equality pushed down to its node turns a scan into a far smaller
+// estimate, so the candidate that puts a pinned node early is costed with that
+// gain rather than against the un-pushed shape.
+func costAnchor(ch linChain, st Statistics) int {
+	best, bestCost := 0, -1.0
+	for k := range ch.nodes {
+		cost := planCost(Normalize(buildAnchored(ch, k)), st)
+		if bestCost < 0 || cost < bestCost {
+			best, bestCost = k, cost
 		}
 	}
 	return best

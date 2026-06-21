@@ -241,6 +241,26 @@ func (e *DiskEngine) RelCountByType(relType Token) (uint64, error) {
 	return e.st.RelTypeCount(toCat(relType))
 }
 
+// NodeCount returns the total number of node records, the all-nodes cardinality the
+// cost model uses for an unlabeled scan and as the denominator for average degree
+// (doc 11 §2.2). It is the record high-water mark, so it counts a deleted node's
+// slot until it is reused; that makes it an upper bound, which keeps a cardinality
+// estimate conservative rather than too low.
+func (e *DiskEngine) NodeCount() uint64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return uint64(e.nodes.Count())
+}
+
+// RelCount returns the total number of relationship records, the denominator-side
+// total the cost model uses for typeless average degree (doc 11 §2.2). Like
+// NodeCount it is the record high-water mark, an upper bound.
+func (e *DiskEngine) RelCount() uint64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return uint64(e.rels.Count())
+}
+
 // Begin opens a transaction. A write transaction takes the engine's write lock
 // for its whole duration (single-writer-first) and reads its own writes through
 // the live base. A read transaction takes a snapshot of the commit sequence and

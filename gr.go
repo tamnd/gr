@@ -244,7 +244,7 @@ func (db *DB) Run(cypher string, params map[string]value.Value) (*Result, error)
 		return nil, err
 	}
 	if q.Explain {
-		return db.explain(q, db.eng, indexLookup{db.eng})
+		return db.explain(q, db.eng, indexLookup{db.eng}, engineStats{db.eng})
 	}
 	if q.Schema != nil {
 		s, err := db.execSchema(q.Schema)
@@ -668,13 +668,15 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 // so EXPLAIN CREATE shows the plan and creates nothing. A schema command has no
 // operator plan, so EXPLAIN of one is rejected.
 //
-// cat is the catalog the bind resolves names against and ix the index oracle the
-// seek rewrite consults. The auto-commit path passes the engine and its index
-// lookup; a write transaction, which already holds the engine lock, passes its own
-// catalog view and a nil ix to skip the seek rewrite, exactly as its execution path
-// does, so EXPLAIN inside a write transaction cannot deadlock against the lock the
-// transaction holds.
-func (db *DB) explain(q *ast.Query, cat bind.TokenResolver, ix plan.IndexLookup) (*Result, error) {
+// cat is the catalog the bind resolves names against, ix the index oracle the seek
+// rewrite consults, and st the statistics the cost model estimates cardinalities
+// from. The auto-commit path passes the engine, its index lookup, and its
+// statistics; a write transaction, which already holds the engine lock, passes its
+// own catalog view and a nil ix and nil st, to skip the seek rewrite and the
+// estimates, exactly as its execution path skips the index oracle, so EXPLAIN inside
+// a write transaction cannot deadlock against the lock the transaction holds. When
+// st is nil the listing shows the plan without per-operator row estimates.
+func (db *DB) explain(q *ast.Query, cat bind.TokenResolver, ix plan.IndexLookup, st plan.Statistics) (*Result, error) {
 	if q.Schema != nil {
 		return nil, ErrExplainSchema
 	}
@@ -686,15 +688,22 @@ func (db *DB) explain(q *ast.Query, cat bind.TokenResolver, ix plan.IndexLookup)
 	if ix != nil {
 		op = plan.SeekRewrite(op, b, ix)
 	}
-	return explainResult(op), nil
+	return explainResult(op, st), nil
 }
 
 // explainResult renders an operator tree into a streaming result: one column named
 // "plan" and one row per line of the tree, so a caller iterates the listing the way
-// it iterates any other result. The trailing newline is trimmed so the listing has
-// no blank final row.
-func explainResult(op plan.Op) *Result {
-	text := strings.TrimRight(plan.String(op), "\n")
+// it iterates any other result. With statistics it annotates each operator with the
+// rows the cost model estimates; without them it renders the bare tree. The trailing
+// newline is trimmed so the listing has no blank final row.
+func explainResult(op plan.Op, st plan.Statistics) *Result {
+	var text string
+	if st != nil {
+		text = plan.StringWithRows(op, st)
+	} else {
+		text = plan.String(op)
+	}
+	text = strings.TrimRight(text, "\n")
 	lines := strings.Split(text, "\n")
 	buf := make([]eval.Row, len(lines))
 	for i, ln := range lines {

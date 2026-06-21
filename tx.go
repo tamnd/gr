@@ -152,13 +152,14 @@ func (tx *Tx) Run(cypher string, params map[string]value.Value) (*Result, error)
 	}
 	if q.Explain {
 		// A write transaction holds the engine lock, so it must plan against its own
-		// catalog view and skip the seek rewrite (a nil index oracle), exactly as its
-		// execution path does; a read transaction has no such lock and plans against
-		// the engine with its index oracle.
+		// catalog view and skip the seek rewrite (a nil index oracle) and the cost
+		// estimates (nil statistics), exactly as its execution path does; a read
+		// transaction has no such lock and plans against the engine with its index
+		// oracle and statistics.
 		if tx.write {
-			return tx.db.explain(q, tx.etx, nil)
+			return tx.db.explain(q, tx.etx, nil, nil)
 		}
-		return tx.db.explain(q, tx.db.eng, indexLookup{tx.db.eng})
+		return tx.db.explain(q, tx.db.eng, indexLookup{tx.db.eng}, engineStats{tx.db.eng})
 	}
 	if q.Schema != nil {
 		return nil, ErrSchemaCommand

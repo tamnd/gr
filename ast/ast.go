@@ -47,6 +47,10 @@ const (
 	// ConstraintExists requires the property to be present and non-null on every
 	// node of a label (REQUIRE v.p IS NOT NULL).
 	ConstraintExists
+	// ConstraintPropertyType requires the property, where present, to hold a value
+	// of a declared type on every node of a label (REQUIRE v.p IS :: TYPE, or the
+	// IS TYPED TYPE synonym). PropType carries the declared type.
+	ConstraintPropertyType
 )
 
 // CreateConstraint is a CREATE CONSTRAINT statement. Name is the explicit
@@ -54,8 +58,9 @@ const (
 // from the kind, label, and property). IfNotExists makes a repeat creation a no-op
 // rather than an error. Var is the pattern variable, Label the node label it binds,
 // Props the constrained property keys in order (one for a single-property
-// constraint), and Type the constraint kind. This release supports single-property
-// node uniqueness and node existence.
+// constraint), and Type the constraint kind. PropType carries the declared type
+// when Type is ConstraintPropertyType, and is unused otherwise. This release
+// supports single-property node uniqueness, existence, and property type.
 type CreateConstraint struct {
 	Pos
 	Name        string
@@ -64,6 +69,7 @@ type CreateConstraint struct {
 	Label       string
 	Props       []string
 	Type        ConstraintType
+	PropType    value.Type
 }
 
 // DropConstraint is a DROP CONSTRAINT statement, addressing a constraint by name.

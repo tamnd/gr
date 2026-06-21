@@ -54,6 +54,10 @@ const (
 	// ExistsNode is a node existence constraint: every node carrying the label
 	// must hold a present, non-null value for the property (doc 08 §4.1).
 	ExistsNode ConstraintKind = 1
+	// TypedNode is a node property-type constraint: every node carrying the label
+	// must, where the property is present and non-null, hold a value of the declared
+	// type (doc 08 §4.1). The declared type is the constraint's ValueType.
+	TypedNode ConstraintKind = 2
 )
 
 // Constraint is one schema constraint, recorded against a label and a property
@@ -61,10 +65,11 @@ const (
 // it has one entry for a single-property constraint and several for a composite
 // one (doc 07 §5). Label and Props are catalog tokens, not names.
 type Constraint struct {
-	Name  string
-	Kind  ConstraintKind
-	Label uint32
-	Props []uint32
+	Name      string
+	Kind      ConstraintKind
+	Label     uint32
+	Props     []uint32
+	ValueType uint8
 }
 
 // encodeConstraint appends a constraint's body (everything after the kind tag).
@@ -76,6 +81,10 @@ func encodeConstraint(dst []byte, c Constraint) []byte {
 	for _, p := range c.Props {
 		dst = format.AppendUvarint(dst, uint64(p))
 	}
+	// ValueType trails the property tuple. It is always written, zero for the
+	// uniqueness and existence kinds that do not use it, so the record stays
+	// self-describing without a separate format version (doc 08 §8.1).
+	dst = format.AppendUvarint(dst, uint64(c.ValueType))
 	return dst
 }
 
@@ -114,6 +123,12 @@ func decodeConstraint(b []byte) (Constraint, int, error) {
 		c.Props[i] = uint32(p)
 		off += n
 	}
+	vt, n, err := format.Uvarint(b[off:])
+	if err != nil {
+		return c, 0, err
+	}
+	c.ValueType = uint8(vt)
+	off += n
 	return c, off, nil
 }
 

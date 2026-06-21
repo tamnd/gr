@@ -305,6 +305,46 @@ func TestJoinSwapKeepsResults(t *testing.T) {
 	}
 }
 
+// TestThreeWayJoinKeepsResults confirms reordering a three-pattern cartesian chain
+// does not change the rows it returns: the product of three disjoint patterns is the
+// same multiset whatever order the chain joins them, so the cost-ordered plan returns
+// exactly the structural one's rows.
+func TestThreeWayJoinKeepsResults(t *testing.T) {
+	db := openMem(t, "threewayjoin.gr")
+	defer func() { _ = db.Close() }()
+
+	mustExec(t, db, "CREATE (:Tag {n: 1})", nil)
+	mustExec(t, db, "CREATE (:Doc {n: 10}), (:Doc {n: 20})", nil)
+	mustExec(t, db, "CREATE (:Topic {n: 100}), (:Topic {n: 200}), (:Topic {n: 300})", nil)
+
+	res, err := db.Query("MATCH (a:Tag), (b:Doc), (c:Topic) RETURN a.n + b.n + c.n AS s", nil)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer func() { _ = res.Close() }()
+	got := map[int64]bool{}
+	for {
+		row, ok, err := res.Next()
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if !ok {
+			break
+		}
+		n, _ := row[0].AsInt()
+		got[n] = true
+	}
+	want := []int64{111, 211, 311, 121, 221, 321}
+	for _, w := range want {
+		if !got[w] {
+			t.Fatalf("missing join row %d, got %v", w, got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("join returned %d distinct rows, want %d: %v", len(got), len(want), got)
+	}
+}
+
 // TestExplainRejectsSchemaCommand confirms EXPLAIN of a schema command is an error:
 // a schema command changes the catalog outside the operator pipeline, so it has no
 // plan to render.

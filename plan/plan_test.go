@@ -15,7 +15,7 @@ type fakeCatalog struct {
 
 func newCatalog() *fakeCatalog {
 	return &fakeCatalog{
-		labels:   map[string]engine.Token{"Person": 1, "Movie": 2},
+		labels:   map[string]engine.Token{"Person": 1, "Movie": 2, "Genre": 3},
 		relTypes: map[string]engine.Token{"KNOWS": 1, "ACTED_IN": 2},
 		propKeys: map[string]engine.Token{"name": 1, "age": 2, "title": 3},
 	}
@@ -237,6 +237,30 @@ func TestJoinOrderKeepsSmallerRight(t *testing.T) {
     NodeScan a:#1
     NodeScan b:#2
 `)
+}
+
+func TestJoinOrderReordersCartesianChain(t *testing.T) {
+	// Three disjoint patterns join as a left-deep cartesian chain in pattern order.
+	// With Genre rarest, Movie middling, and Person abundant, JoinOrder reorders the
+	// chain smallest first: the rare Genre is the innermost build side, its small
+	// product with Movie is the next build side, and the abundant Person probes from
+	// the outside.
+	b := bound(t, "MATCH (a:Person), (b:Movie), (c:Genre) RETURN a, b, c")
+	st := fakeStats{nodes: 1105, label: map[uint32]float64{1: 1000, 2: 100, 3: 5}}
+	eq(t, "join", String(PlanWithStats(b, st)), `Project a, b, c
+  Join on[]
+    NodeScan a:#1
+    Join on[]
+      NodeScan b:#2
+      NodeScan c:#3
+`)
+}
+
+func TestJoinOrderReorderStructuralUnchanged(t *testing.T) {
+	// With no statistics the cartesian chain keeps the builder's pattern order, so the
+	// plan matches the structural Plan and the goldens do not move.
+	b := bound(t, "MATCH (a:Person), (b:Movie), (c:Genre) RETURN a, b, c")
+	eq(t, "join", String(PlanWithStats(b, nil)), String(Plan(b)))
 }
 
 func TestJoinOrderStructuralKeepsBuildOrder(t *testing.T) {

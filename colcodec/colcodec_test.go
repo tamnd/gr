@@ -50,7 +50,7 @@ func TestRoundTripShapes(t *testing.T) {
 // and proves it round-trips, independent of what the cascade would have chosen.
 func TestEncodeWithRoundTripsEveryCodec(t *testing.T) {
 	vals := []int64{3, 3, 3, 3}
-	for _, c := range []Codec{RAW, CONSTANT, RLE, FOR, DELTA} {
+	for _, c := range []Codec{RAW, CONSTANT, RLE, FOR, DELTA, DELTAFOR} {
 		seg := EncodeWith(c, vals)
 		if got, err := PeekCodec(seg); err != nil || got != c {
 			t.Fatalf("EncodeWith(%v) wrote codec %v (err %v)", c, got, err)
@@ -88,11 +88,19 @@ func TestCascadePicksExpectedCodec(t *testing.T) {
 		want Codec
 	}{
 		{"constant", repeat(9, 64), CONSTANT},
-		{"long-runs", runs(8, 32), RLE},
-		// A long uniform ramp favors DELTA: its per-element cost is one varint byte
-		// for the constant step, while FOR pays bits(range) per element, which grows
-		// with the length.
-		{"long-monotone", ramp(0, 1, 2000), DELTA},
+		// Long runs of widely separated, non-monotone values favor RLE: a handful of
+		// (value, run-length) pairs cover the column, while every delta scheme must
+		// pick a width wide enough for the big up-and-down jumps and pay it per value.
+		{"long-runs", spreadRuns(100, 8), RLE},
+		// A uniform ramp favors DELTAFOR: the successive differences are all the same,
+		// so frame-of-reference packs them at zero width, far below the one varint byte
+		// per element plain DELTA spends.
+		{"uniform-ramp", ramp(0, 1, 2000), DELTAFOR},
+		// A near-monotone run with one large jump favors plain DELTA: the varint per
+		// difference stays one byte for the small steps and grows only for the jump,
+		// while DELTAFOR must pick a fixed width wide enough for the jump and pay it on
+		// every difference.
+		{"monotone-with-jump", jumpy(100, 1_000_000_000), DELTA},
 		{"clustered-narrow", clustered(1_000_000, 8, 64), FOR},
 		{"high-entropy", spread(64), RAW},
 	}
@@ -102,6 +110,18 @@ func TestCascadePicksExpectedCodec(t *testing.T) {
 		}
 		roundTrip(t, tc.name, tc.vals)
 	}
+}
+
+// TestDeltaForShrinksUniformRamp proves the composite actually compresses a
+// monotone uniform run far below plain DELTA, the offset-array shape it targets.
+func TestDeltaForShrinksUniformRamp(t *testing.T) {
+	vals := ramp(0, 2, 4000) // an offset array with a constant degree of 2
+	deltafor := len(EncodeWith(DELTAFOR, vals))
+	delta := len(EncodeWith(DELTA, vals))
+	if deltafor*4 > delta {
+		t.Fatalf("DELTAFOR %d not much smaller than DELTA %d", deltafor, delta)
+	}
+	roundTrip(t, "deltafor-ramp", vals)
 }
 
 // TestCascadeNeverLosesToRaw proves the chosen encoding is never larger than RAW,
@@ -157,11 +177,35 @@ func repeat(v int64, n int) []int64 {
 	return out
 }
 
-func runs(runLen, runCount int) []int64 {
-	var out []int64
+// jumpy builds a +1 run of half-length, one large jump, then another +1 run, the
+// shape where plain DELTA's per-value varint beats DELTAFOR's fixed width.
+func jumpy(half int, jump int64) []int64 {
+	out := make([]int64, 0, 2*half)
+	v := int64(0)
+	for range half {
+		out = append(out, v)
+		v++
+	}
+	v += jump
+	for range half {
+		out = append(out, v)
+		v++
+	}
+	return out
+}
+
+// spreadRuns builds runCount runs of length runLen, each holding a single value far
+// from its neighbors and alternating up and down, the shape RLE packs tightest and
+// every delta scheme handles worst (a wide width spent on every value).
+func spreadRuns(runLen, runCount int) []int64 {
+	out := make([]int64, 0, runLen*runCount)
 	for r := range runCount {
+		v := int64(r) * 1_000_000_000
+		if r%2 == 1 {
+			v = -v
+		}
 		for range runLen {
-			out = append(out, int64(r))
+			out = append(out, v)
 		}
 	}
 	return out

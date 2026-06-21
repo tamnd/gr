@@ -59,6 +59,16 @@ const (
 	// run), because it packs each difference in a fixed few bits instead of a whole
 	// varint byte.
 	DELTAFOR Codec = 6
+	// BLOCK is the second-stage wrapper of doc 03 §15.5 and doc 15 §17: a
+	// general-purpose byte compressor run over an already-lightweight-encoded segment
+	// body, for the residual a body is still large despite its lightweight form (a
+	// high-cardinality string heap, a RAW float column with byte-level redundancy).
+	// Its body is a block-algorithm id, the uncompressed and compressed lengths, then
+	// the compressed bytes, which inflate back to a complete inner segment the decoder
+	// then decodes. It is never chosen by the default cascade, only offered to the
+	// checkpoint encoder as a wrapper it applies when it measures a real win (doc 15
+	// §12.7); the byte form lives in block.go.
+	BLOCK Codec = 7
 )
 
 // ErrBadSegment means a segment's bytes are malformed: an unknown codec id, a
@@ -83,6 +93,8 @@ func (c Codec) String() string {
 		return "DICTIONARY"
 	case DELTAFOR:
 		return "DELTAFOR"
+	case BLOCK:
+		return "BLOCK"
 	default:
 		return "UNKNOWN"
 	}
@@ -139,7 +151,7 @@ func PeekCodec(b []byte) (Codec, error) {
 		return 0, ErrBadSegment
 	}
 	switch Codec(b[0]) {
-	case RAW, CONSTANT, RLE, FOR, DELTA, DICTIONARY, DELTAFOR:
+	case RAW, CONSTANT, RLE, FOR, DELTA, DICTIONARY, DELTAFOR, BLOCK:
 		return Codec(b[0]), nil
 	default:
 		return 0, ErrBadSegment
@@ -300,6 +312,12 @@ func Decode(b []byte) ([]int64, error) {
 		return decodeDelta(body)
 	case DELTAFOR:
 		return decodeDeltaFOR(body)
+	case BLOCK:
+		inner, err := unwrapBlock(body)
+		if err != nil {
+			return nil, err
+		}
+		return Decode(inner)
 	default:
 		return nil, ErrBadSegment
 	}

@@ -119,6 +119,12 @@ func DecodeStrings(b []byte) ([]string, error) {
 		return decodeRawStrings(body)
 	case DICTIONARY:
 		return decodeDictStrings(body)
+	case BLOCK:
+		inner, err := unwrapBlock(body)
+		if err != nil {
+			return nil, err
+		}
+		return DecodeStrings(inner)
 	default:
 		return nil, ErrBadSegment
 	}

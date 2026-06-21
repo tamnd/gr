@@ -3,9 +3,11 @@ package gr
 import (
 	"errors"
 
+	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/bind"
 	"github.com/tamnd/gr/catalog"
 	"github.com/tamnd/gr/engine"
+	"github.com/tamnd/gr/eval"
 	"github.com/tamnd/gr/exec"
 	"github.com/tamnd/gr/parse"
 	"github.com/tamnd/gr/plan"
@@ -124,30 +126,116 @@ func (db *DB) Update(fn func(tx *Tx) error) error {
 	return tx.Commit()
 }
 
-// Run executes a Cypher read statement against the transaction's snapshot and
-// returns a streaming result (doc 16 §7.1). The result borrows the transaction, so
-// it does not commit or abort anything on Close, and it is valid only within the
-// transaction (doc 16 §8.5): close it before the transaction finishes.
+// Run executes a Cypher statement against the transaction and returns a streaming
+// result (doc 16 §7.1). It is the single entry point for both reads and writes: a
+// read streams lazily from the transaction's snapshot, and a write executes and
+// reports its mutations through the result's Summary (doc 13 §3). The result
+// borrows the transaction, so it does not commit or abort anything on Close, and it
+// is valid only within the transaction (doc 16 §8.5): close it before the
+// transaction finishes.
 //
-// A read inside a write transaction sees the transaction's own uncommitted writes
-// (read-your-writes, doc 06 §2.3) and binds against the transaction's catalog view,
-// so it resolves names the transaction has interned but not yet committed.
-//
-// A write statement is rejected with ErrReadQuery, the same split Query and Exec
-// make at the database level: this Run streams read rows, and Exec applies a write.
+// A statement run inside a write transaction sees the transaction's own uncommitted
+// writes (read-your-writes, doc 06 §2.3) and binds against the transaction's
+// catalog view, so it resolves names the transaction has interned but not yet
+// committed. A write in a read transaction is rejected with ErrReadOnly.
 func (tx *Tx) Run(cypher string, params map[string]value.Value) (*Result, error) {
 	if tx.done {
 		return nil, ErrTxnDone
 	}
-	b, op, err := tx.compileRead(cypher)
+	q, err := parse.Parse(cypher)
 	if err != nil {
 		return nil, err
+	}
+	if q.Schema != nil {
+		return nil, ErrSchemaCommand
+	}
+	if queryHasWrites(q) {
+		if !tx.write {
+			return nil, ErrReadOnly
+		}
+		return tx.runWrite(q, params)
+	}
+	return tx.runRead(cypher, q, params)
+}
+
+// runRead opens a read statement over the transaction's snapshot and returns a
+// result that streams lazily from the cursor. A read transaction reuses the
+// database plan cache (which binds against the engine catalog, safe because a read
+// transaction holds no write lock); a write transaction binds against its own
+// catalog view, since it holds the engine lock (an engine lookup would deadlock)
+// and must see its own uncommitted interned names.
+func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value) (*Result, error) {
+	var b *bind.Bound
+	var op plan.Op
+	if tx.write {
+		bound, err := bind.Bind(q, bind.NewEngineCatalog(tx.etx), false)
+		if err != nil {
+			return nil, err
+		}
+		b, op = bound, plan.Plan(bound)
+	} else {
+		entry, err := tx.db.compile(cypher)
+		if err != nil {
+			return nil, err
+		}
+		b, op = entry.Bound, entry.Op
 	}
 	cur, err := exec.Open(op, tx.readCtx(b, params))
 	if err != nil {
 		return nil, err
 	}
 	return &Result{cols: cur.Cols(), cursor: cur, tx: tx.etx, ownTx: false}, nil
+}
+
+// runWrite executes a write statement eagerly and returns a result over its
+// materialized RETURN rows. The statement runs to exhaustion before Run returns, so
+// every mutation lands and the summary is complete; a lazily streamed write would
+// leave the statement half-applied if the caller stopped iterating before commit.
+// Names are interned inside the transaction and the bind resolves against its
+// catalog view (doc 13 §9), so the write takes no lock it does not already hold and
+// leaves no orphan token on rollback (doc 13 §16).
+func (tx *Tx) runWrite(q *ast.Query, params map[string]value.Value) (*Result, error) {
+	if err := internWriteNames(tx.etx, q); err != nil {
+		return nil, err
+	}
+	b, err := bind.Bind(q, bind.NewEngineCatalog(tx.etx), false)
+	if err != nil {
+		return nil, err
+	}
+	eff := &exec.SideEffects{}
+	ctx := tx.readCtx(b, params)
+	ctx.Effects = eff
+	cur, err := exec.Open(plan.Plan(b), ctx)
+	if err != nil {
+		return nil, err
+	}
+	cols := cur.Cols()
+	var buf []eval.Row
+	for {
+		row, ok, err := cur.Next()
+		if err != nil {
+			_ = cur.Close()
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		buf = append(buf, cloneRow(row))
+	}
+	if err := cur.Close(); err != nil {
+		return nil, err
+	}
+	return &Result{cols: cols, buf: buf, eff: eff, tx: tx.etx, ownTx: false}, nil
+}
+
+// cloneRow copies a row map so a buffered write result does not alias a row the
+// executor may reuse for the next Next call.
+func cloneRow(row eval.Row) eval.Row {
+	out := make(eval.Row, len(row))
+	for k, v := range row {
+		out[k] = v
+	}
+	return out
 }
 
 // Exec runs a Cypher write statement against the transaction and returns a summary
@@ -192,41 +280,6 @@ func (tx *Tx) Exec(cypher string, params map[string]value.Value) (Summary, error
 		return Summary{}, err
 	}
 	return summaryOf(eff), nil
-}
-
-// compileRead parses, binds, and plans a read statement for this transaction,
-// rejecting a write with ErrReadQuery and a schema command with ErrSchemaCommand.
-// A read transaction reuses the database plan cache, which binds against the engine
-// catalog (safe, since a read transaction holds no write lock). A write transaction
-// cannot: it holds the engine lock, so an engine catalog lookup would deadlock, and
-// it must see its own uncommitted interned names, so it binds against its own
-// catalog view and skips the cache.
-func (tx *Tx) compileRead(cypher string) (*bind.Bound, plan.Op, error) {
-	if !tx.write {
-		entry, err := tx.db.compile(cypher)
-		if err != nil {
-			return nil, nil, err
-		}
-		if queryHasWrites(entry.Bound.Query) {
-			return nil, nil, ErrReadQuery
-		}
-		return entry.Bound, entry.Op, nil
-	}
-	q, err := parse.Parse(cypher)
-	if err != nil {
-		return nil, nil, err
-	}
-	if q.Schema != nil {
-		return nil, nil, ErrSchemaCommand
-	}
-	if queryHasWrites(q) {
-		return nil, nil, ErrReadQuery
-	}
-	b, err := bind.Bind(q, bind.NewEngineCatalog(tx.etx), false)
-	if err != nil {
-		return nil, nil, err
-	}
-	return b, plan.Plan(b), nil
 }
 
 // readCtx builds the execution context for a statement run against this

@@ -312,9 +312,11 @@ func (e *DiskEngine) Checkpoint() error {
 	}
 	// Merge the naive delta over the current base into a fresh segmented base, then
 	// drain the delta to empty so the next checkpoint window starts clean. The
-	// merge reads the old base, so compute both fresh stores before swapping them
-	// in, then repoint the naive columns at fresh empty stores (their old pages,
-	// like the old segmented stores, fall to later reclamation).
+	// merge reads the old base and the old delta, so hold on to both, compute the
+	// fresh stores, swap them in, and only then free the old pages once nothing
+	// reads them.
+	oldNseg, oldRseg := e.nseg, e.rseg
+	oldNcols, oldRcols := e.ncols, e.rcols
 	var err error
 	newNseg, err := e.foldSegmented(e.ncols, e.nseg, uint64(e.nodes.Count()), store.SecNodeColSeg, nodeColID)
 	if err != nil {
@@ -330,6 +332,23 @@ func (e *DiskEngine) Checkpoint() error {
 	// §4.7). The folds above ran against the old base at the old epoch, so their
 	// cached segments are correctly invalidated here too.
 	e.epoch++
+	// Return the old base and old delta pages to the free list before creating the
+	// fresh empty delta columns, so the fresh columns reuse those pages instead of
+	// growing the file. The folds above already read both, the new base is swapped
+	// in, and no live read reaches a delta or base by stored pointer, so the pages
+	// are unreferenced (doc 60 §6; doc 64 §6).
+	if err := oldNseg.Free(); err != nil {
+		return err
+	}
+	if err := oldRseg.Free(); err != nil {
+		return err
+	}
+	if err := oldNcols.Free(); err != nil {
+		return err
+	}
+	if err := oldRcols.Free(); err != nil {
+		return err
+	}
 	if e.ncols, err = column.Create(e.p, e.secs, store.SecNodeCols); err != nil {
 		return err
 	}

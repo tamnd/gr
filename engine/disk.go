@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/tamnd/gr/adj"
+	"github.com/tamnd/gr/blockcache"
 	"github.com/tamnd/gr/catalog"
 	"github.com/tamnd/gr/colsegstore"
 	"github.com/tamnd/gr/column"
@@ -64,6 +65,16 @@ type DiskEngine struct {
 	ov     *mvcc.Overlay
 	idx    *propIndexSet
 	closed bool
+
+	// bc fronts the segmented-base read with decoded segments, so a repeated point
+	// read in a segment does not re-decode it (doc 14 §4). It is an in-memory cache,
+	// never a source of truth: every cached segment carries the checkpoint epoch it
+	// was built at, and epoch invalidates them all when a fold rebuilds the base.
+	bc *blockcache.Cache
+	// epoch is the checkpoint generation of the segmented base. A fold rebuilds the
+	// base with a new segment layout and bumps it, so a read at the new epoch misses
+	// every entry cached against the old base.
+	epoch uint64
 }
 
 // Open opens or creates a graph database at path. A fresh file gets empty stores,
@@ -77,7 +88,7 @@ func Open(fsys vfs.VFS, path string, opt pager.Options) (*DiskEngine, error) {
 	if err != nil {
 		return nil, err
 	}
-	e := &DiskEngine{p: p, ov: mvcc.NewOverlay()}
+	e := &DiskEngine{p: p, ov: mvcc.NewOverlay(), bc: blockcache.New(defaultBlockCacheBytes)}
 	fresh := p.SectionDir() == 0
 	if err := e.load(fresh); err != nil {
 		_ = p.Close()
@@ -305,15 +316,20 @@ func (e *DiskEngine) Checkpoint() error {
 	// in, then repoint the naive columns at fresh empty stores (their old pages,
 	// like the old segmented stores, fall to later reclamation).
 	var err error
-	newNseg, err := e.foldSegmented(e.ncols, e.nseg, uint64(e.nodes.Count()), store.SecNodeColSeg)
+	newNseg, err := e.foldSegmented(e.ncols, e.nseg, uint64(e.nodes.Count()), store.SecNodeColSeg, nodeColID)
 	if err != nil {
 		return err
 	}
-	newRseg, err := e.foldSegmented(e.rcols, e.rseg, uint64(e.rels.Count()), store.SecRelColSeg)
+	newRseg, err := e.foldSegmented(e.rcols, e.rseg, uint64(e.rels.Count()), store.SecRelColSeg, relColID)
 	if err != nil {
 		return err
 	}
 	e.nseg, e.rseg = newNseg, newRseg
+	// The new base has a fresh segment layout, so every entry cached against the old
+	// base is now stale; bumping the epoch makes a read at it miss them all (doc 14
+	// §4.7). The folds above ran against the old base at the old epoch, so their
+	// cached segments are correctly invalidated here too.
+	e.epoch++
 	if e.ncols, err = column.Create(e.p, e.secs, store.SecNodeCols); err != nil {
 		return err
 	}

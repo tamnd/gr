@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"github.com/tamnd/gr/blockcache"
 	"github.com/tamnd/gr/colseg"
 	"github.com/tamnd/gr/colsegstore"
 	"github.com/tamnd/gr/column"
@@ -16,6 +17,25 @@ import (
 // starting point the segmentation policy tunes once the read path is wired
 // (doc 58 §7).
 const segPositions = 1024
+
+// defaultBlockCacheBytes is the byte budget of the decoded-segment cache. It bounds
+// the decoded value vectors held resident; a hot working set above it cools by the
+// cache's CLOCK sweep (doc 14 §4.5). The fixed value is a starting point a
+// configurable budget replaces later.
+const defaultBlockCacheBytes = 64 << 20
+
+// segCellBytes is the per-cell footprint charged to the cache budget for a decoded
+// segment. It is a rough fixed estimate of a decoded value's memory, not an exact
+// measure; the budget only needs to be in the right order of magnitude to bound the
+// resident set (doc 14 §4.3).
+const segCellBytes = 32
+
+// nodeColID and relColID map a property-key token to the decoded-segment cache's
+// column id. Node and relationship columns share the key-token space, so the low bit
+// separates the two element kinds and keeps every column's cache key distinct (doc 14
+// §4.2).
+func nodeColID(key uint32) uint32 { return key << 1 }
+func relColID(key uint32) uint32  { return key<<1 | 1 }
 
 // createSegStore makes a fresh empty segmented column store for one element kind
 // and records its directory anchors in the given section, so a later open finds
@@ -54,18 +74,18 @@ func openSegStore(p *pager.Pager, secs *store.Sections, sec store.Section) (*col
 // base. This is the latest-committed-state read, not a snapshot read; the MVCC
 // overlay sits above it in the snapshot resolvers.
 func (e *DiskEngine) baseNodeProp(key uint32, pos uint64) (value.Value, bool, error) {
-	return baseProp(e.ncols, e.nseg, key, pos)
+	return e.baseProp(e.ncols, e.nseg, nodeColID(key), key, pos)
 }
 
 // baseRelProp is baseNodeProp for relationship properties.
 func (e *DiskEngine) baseRelProp(key uint32, pos uint64) (value.Value, bool, error) {
-	return baseProp(e.rcols, e.rseg, key, pos)
+	return e.baseProp(e.rcols, e.rseg, relColID(key), key, pos)
 }
 
 // baseProp layers a naive delta column over a segmented base: a present delta
 // entry wins, a tombstone resolves absent, and a missing entry falls through to
-// the base.
-func baseProp(delta *column.Columns, base *colsegstore.Store, key uint32, pos uint64) (value.Value, bool, error) {
+// the segmented base through the decoded-segment cache.
+func (e *DiskEngine) baseProp(delta *column.Columns, base *colsegstore.Store, colID, key uint32, pos uint64) (value.Value, bool, error) {
 	v, pres, err := delta.GetDelta(key, pos)
 	if err != nil {
 		return value.Null, false, err
@@ -76,8 +96,44 @@ func baseProp(delta *column.Columns, base *colsegstore.Store, key uint32, pos ui
 	case column.Deleted:
 		return value.Null, false, nil
 	default:
-		return base.Get(key, pos)
+		return e.segGet(base, colID, key, pos)
 	}
+}
+
+// segGet reads a position from the segmented base through the decoded-segment cache.
+// It locates the covering segment without decoding a blob, serves the decoded cells
+// from the cache when they are resident at the current epoch, and decodes then caches
+// them on a miss, so a repeated read in the same segment does not re-decode it (doc 14
+// §4). The cache is never authoritative: a version miss or an empty cache just falls
+// back to a decode, returning the same value.
+func (e *DiskEngine) segGet(base *colsegstore.Store, colID, key uint32, pos uint64) (value.Value, bool, error) {
+	ord, firstPos, ok, err := base.Locate(key, pos)
+	if err != nil || !ok {
+		return value.Null, false, err
+	}
+	ck := blockcache.Key{Column: colID, Segment: uint32(ord)}
+	if v, hit := e.bc.GetDecoded(ck, e.epoch); hit {
+		return cellAt(v.([]colseg.Cell), pos-firstPos)
+	}
+	cells, err := base.DecodeSegment(key, ord)
+	if err != nil {
+		return value.Null, false, err
+	}
+	e.bc.PutDecoded(ck, e.epoch, cells, len(cells)*segCellBytes, nil, nil, nil)
+	return cellAt(cells, pos-firstPos)
+}
+
+// cellAt reads the cell at a within-segment offset, resolving an out-of-range or
+// absent cell to (Null, false), the same convention as colsegstore.Get.
+func cellAt(cells []colseg.Cell, i uint64) (value.Value, bool, error) {
+	if i >= uint64(len(cells)) {
+		return value.Null, false, nil
+	}
+	c := cells[i]
+	if !c.Present {
+		return value.Null, false, nil
+	}
+	return c.Value, true, nil
 }
 
 // basePropKeys returns the property-key tokens that may carry a value across the
@@ -106,13 +162,13 @@ func basePropKeys(delta *column.Columns, base *colsegstore.Store) []uint32 {
 // Building a fresh store and repointing the section leaves the old store's pages
 // to later reclamation, the same trade the adjacency checkpoint makes. The caller
 // drains the naive delta after the merge so the next window starts empty.
-func (e *DiskEngine) foldSegmented(delta *column.Columns, base *colsegstore.Store, count uint64, sec store.Section) (*colsegstore.Store, error) {
+func (e *DiskEngine) foldSegmented(delta *column.Columns, base *colsegstore.Store, count uint64, sec store.Section, colID func(uint32) uint32) (*colsegstore.Store, error) {
 	seg, err := colsegstore.CreateStore(e.p)
 	if err != nil {
 		return nil, err
 	}
 	for _, key := range basePropKeys(delta, base) {
-		cells, vt, any, err := readMergedColumn(delta, base, key, count)
+		cells, vt, any, err := e.readMergedColumn(delta, base, colID(key), key, count)
 		if err != nil {
 			return nil, err
 		}
@@ -139,12 +195,12 @@ func (e *DiskEngine) foldSegmented(delta *column.Columns, base *colsegstore.Stor
 // the column's value type (the type of its first present value) and whether any
 // value is present, so the caller can skip an all-absent column and pick the typed
 // encoding plane.
-func readMergedColumn(delta *column.Columns, base *colsegstore.Store, key uint32, count uint64) ([]colseg.Cell, value.Type, bool, error) {
+func (e *DiskEngine) readMergedColumn(delta *column.Columns, base *colsegstore.Store, colID, key uint32, count uint64) ([]colseg.Cell, value.Type, bool, error) {
 	cells := make([]colseg.Cell, count)
 	vt := value.TypeNull
 	any := false
 	for pos := range count {
-		v, ok, err := baseProp(delta, base, key, pos)
+		v, ok, err := e.baseProp(delta, base, colID, key, pos)
 		if err != nil {
 			return nil, value.TypeNull, false, err
 		}

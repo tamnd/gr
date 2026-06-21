@@ -192,12 +192,20 @@ func (c *Column) Get(pos uint64) (value.Value, bool, error) {
 }
 
 // find returns the segment covering pos, or ok false when pos is past the covered
-// range. It binary-searches the directory for the last segment whose first
-// position is at or below pos, then checks pos falls within that segment.
+// range.
 func (c *Column) find(pos uint64) (seg, bool, error) {
+	_, s, ok, err := c.findIdx(pos)
+	return s, ok, err
+}
+
+// findIdx returns the ordinal and record of the segment covering pos, or ok false
+// when pos is past the covered range. It binary-searches the directory for the last
+// segment whose first position is at or below pos, then checks pos falls within that
+// segment.
+func (c *Column) findIdx(pos uint64) (int, seg, bool, error) {
 	n := c.dir.Count()
 	if n == 0 {
-		return seg{}, false, nil
+		return 0, seg{}, false, nil
 	}
 	// sort.Search finds the first segment whose first position is > pos; the one
 	// before it is the candidate covering segment.
@@ -214,19 +222,47 @@ func (c *Column) find(pos uint64) (seg, bool, error) {
 		return s.firstPos > pos
 	})
 	if searchErr != nil {
-		return seg{}, false, searchErr
+		return 0, seg{}, false, searchErr
 	}
 	if idx == 0 {
-		return seg{}, false, nil // pos is before the first segment's start
+		return 0, seg{}, false, nil // pos is before the first segment's start
 	}
 	s, err := c.readSeg(idx - 1)
 	if err != nil {
-		return seg{}, false, err
+		return 0, seg{}, false, err
 	}
 	if pos >= s.firstPos+uint64(s.elemCnt) {
-		return seg{}, false, nil // pos is past this segment and there is no next one covering it
+		return 0, seg{}, false, nil // pos is past this segment and there is no next one covering it
 	}
-	return s, true, nil
+	return idx - 1, s, true, nil
+}
+
+// Locate returns the ordinal of the segment covering pos and that segment's first
+// position, or ok false when pos is past the covered range. It binary-searches the
+// directory like Get but decodes no blob, so a caller can key a decoded-segment
+// cache by the ordinal and decode only on a miss (doc 14 §4).
+func (c *Column) Locate(pos uint64) (ord int, firstPos uint64, ok bool, err error) {
+	idx, s, ok, err := c.findIdx(pos)
+	if err != nil || !ok {
+		return 0, 0, false, err
+	}
+	return idx, s.firstPos, true, nil
+}
+
+// DecodeSegment reads and decodes the whole segment at ordinal ord into its cells.
+// The caller pairs it with Locate: Locate finds the ordinal cheaply, this decodes it
+// only when the decoded cells are not already cached.
+func (c *Column) DecodeSegment(ord int) ([]colseg.Cell, error) {
+	s, err := c.readSeg(ord)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, s.blobLen)
+	if err := c.blob.Read(int(s.blobOff), int(s.blobLen), buf); err != nil {
+		return nil, err
+	}
+	_, cells, err := colseg.Decode(buf)
+	return cells, err
 }
 
 // readSeg decodes the directory record at index i.

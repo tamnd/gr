@@ -21,6 +21,10 @@ const DefaultCacheSize = 256
 type Entry struct {
 	Bound *bind.Bound
 	Op    Op
+	// Stats is the cardinality basis the plan was costed against, so a cache hit can
+	// tell whether the data has drifted far enough to re-plan (doc 11 §7). It is the
+	// zero snapshot for a structurally planned query, which never drifts.
+	Stats StatsSnapshot
 }
 
 // Key identifies a compiled query in the cache: the (normalized) query text and

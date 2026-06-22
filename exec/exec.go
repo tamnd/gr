@@ -29,6 +29,7 @@ import (
 	"github.com/tamnd/gr/eval"
 	"github.com/tamnd/gr/plan"
 	"github.com/tamnd/gr/value"
+	"github.com/tamnd/gr/vfs"
 )
 
 // Ctx is the execution-wide context shared by every operator: the snapshot the
@@ -50,7 +51,25 @@ type Ctx struct {
 	// write operators increment it as they run; the library write path reads it
 	// after draining the cursor. It is nil for a read query, which never writes.
 	Effects *SideEffects
+	// MemBudget bounds the bytes a single stateful operator (a hash join build) may
+	// hold in memory before it spills to disk (doc 12 §9). Zero (the default) means
+	// unbounded: the operator stays in memory and behaves exactly as before, so a
+	// query that does not set a budget gets the in-memory fast path and identical
+	// answers. A positive budget arms spilling, which needs TempFile set too.
+	MemBudget int64
+	// TempFile opens a fresh, empty temporary file for an over-budget operator to
+	// spill into (doc 12 §9.2): it returns the open file and a discard function that
+	// closes and removes it. The operator owns the lifecycle, discarding each file
+	// as it finishes with it and any survivors when it closes. It is nil when no
+	// spill area is configured, in which case an over-budget operator stays in
+	// memory (best effort) rather than failing.
+	TempFile func() (vfs.File, func() error, error)
 }
+
+// spillEnabled reports whether an over-budget operator may spill: a positive
+// memory budget and a configured temp area. With either unset, stateful operators
+// run entirely in memory, the M2 behavior.
+func (c *Ctx) spillEnabled() bool { return c.MemBudget > 0 && c.TempFile != nil }
 
 // env builds the per-row evaluation environment from the context and a row.
 func (c *Ctx) env(row eval.Row) *eval.Env {

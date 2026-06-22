@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/tamnd/gr"
 )
@@ -60,12 +59,11 @@ func (s *server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
-	if req.MaxExecutionTime > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(req.MaxExecutionTime)*time.Millisecond)
-		defer cancel()
-	}
+	// Apply the effective deadline: the request's maxExecutionTime capped by the
+	// server-wide query time limit (doc 18 §8.6). withTimeout takes the smaller of the
+	// two, so a server cap bounds even a request that asks for longer or for none.
+	ctx, cancel := s.withTimeout(r.Context(), req.MaxExecutionTime)
+	defer cancel()
 
 	res, release, err := s.run(ctx, req)
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/tamnd/gr/bolt"
 	"github.com/tamnd/gr/engine"
@@ -52,6 +53,17 @@ func WithBoltAdmission(a *Admission) BoltOption {
 	return func(h *boltHandler) { h.admission = a }
 }
 
+// WithBoltQueryMaxTime caps the wall-clock time a single statement may run (doc 18 §8.6,
+// §8.8). A statement that runs longer has its context cancelled and is reported as a timed
+// out transaction, so one runaway query cannot pin an engine slot indefinitely. The cap
+// spans the cursor's whole life, not just submission, so a query that streams for too long
+// is cut off too. A zero or negative duration, or no option, leaves the Bolt path
+// uncapped, the embedded-friendly default. Pass the same value to the HTTP surface so both
+// transports enforce one cap.
+func WithBoltQueryMaxTime(d time.Duration) BoltOption {
+	return func(h *boltHandler) { h.queryMaxTime = d }
+}
+
 // BoltHandler returns a bolt.Handler that runs Cypher over the database for a Bolt
 // server (doc 18 §5). Pass it to a bolt.Server, which a bolt.Listener serves over
 // TCP:
@@ -74,11 +86,22 @@ func (db *DB) BoltHandler(opts ...BoltOption) bolt.Handler {
 // read already sees every prior commit, so the bookmark is a monotonic token a
 // driver can round-trip, not a cross-member coordination value.
 type boltHandler struct {
-	db          *DB
-	requireAuth bool
-	authFunc    func(scheme, principal, credentials string) (roles []string, err error)
-	admission   *Admission
-	bookmark    atomic.Uint64
+	db           *DB
+	requireAuth  bool
+	authFunc     func(scheme, principal, credentials string) (roles []string, err error)
+	admission    *Admission
+	queryMaxTime time.Duration
+	bookmark     atomic.Uint64
+}
+
+// queryContext builds the context a statement runs under, applying the wall-clock cap when
+// one is configured (doc 18 §8.6). The returned cancel must be called when the cursor
+// closes, both to release the timer and to stop a still-running query at the deadline.
+func (h *boltHandler) queryContext() (context.Context, context.CancelFunc) {
+	if h.queryMaxTime > 0 {
+		return context.WithTimeout(context.Background(), h.queryMaxTime)
+	}
+	return context.WithCancel(context.Background())
 }
 
 // Authenticate verifies a connection's credentials (doc 18 §10). With auth off it
@@ -180,17 +203,24 @@ func (t *boltTx) Run(query string, params map[string]value.Value) (bolt.Cursor, 
 		return nil, boltAdmitErr(err)
 	}
 
+	// Run the statement under the wall-clock cap when one is configured (doc 18 §8.6).
+	// The cancel lives for the cursor's life and runs on Close, alongside the slot
+	// release, so a query that streams past the deadline is cut off too. An uncapped
+	// handler returns a plain cancellable context.
+	ctx, cancel := t.h.queryContext()
+
 	// Schema, administrative, and pragma statements auto-commit and cannot run
 	// inside the held transaction (doc 18 §5.6); route them through the
 	// database-level Run, which dispatches and commits them itself.
 	if kind == SchemaStatement || kind == AdminStatement || kind == PragmaStatement {
-		res, err := t.db.Run(context.Background(), query, p)
+		res, err := t.db.Run(ctx, query, p)
 		if err != nil {
+			cancel()
 			release()
 			return nil, boltErr(err)
 		}
 		t.standalone = true
-		return &boltCursor{res: res, kind: kind, release: release}, nil
+		return &boltCursor{res: res, kind: kind, release: release, cancel: cancel}, nil
 	}
 
 	// Open the engine transaction on the first read/write statement, choosing the
@@ -200,19 +230,21 @@ func (t *boltTx) Run(query string, params map[string]value.Value) (bolt.Cursor, 
 		if !t.modeHinted && kind == ReadStatement {
 			mode = Read
 		}
-		tx, err := t.db.Begin(context.Background(), mode)
+		tx, err := t.db.Begin(ctx, mode)
 		if err != nil {
+			cancel()
 			release()
 			return nil, boltErr(err)
 		}
 		t.tx = tx
 	}
-	res, err := t.tx.Run(context.Background(), query, p)
+	res, err := t.tx.Run(ctx, query, p)
 	if err != nil {
+		cancel()
 		release()
 		return nil, boltErr(err)
 	}
-	return &boltCursor{res: res, kind: kind, release: release}, nil
+	return &boltCursor{res: res, kind: kind, release: release, cancel: cancel}, nil
 }
 
 // boltAdmitErr maps an admission-gate failure to a Bolt status (doc 18 §8.9). A full gate
@@ -271,17 +303,29 @@ func (h *boltHandler) nextBookmark() string {
 }
 
 // boltCursor adapts a streaming Result to bolt.Cursor (doc 18 §5.7). It holds the
-// admission slot the query was admitted on and releases it on Close, so the in-flight
-// bound covers a query for as long as it streams (doc 18 §8.9).
+// admission slot the query was admitted on and the cancel for the query's wall-clock
+// cap, releasing the slot and cancelling the context on Close, so the in-flight bound and
+// the time cap both cover a query for as long as it streams (doc 18 §8.6, §8.9).
 type boltCursor struct {
 	res     *Result
 	kind    Kind
 	release func()
+	cancel  context.CancelFunc
 }
 
 func (c *boltCursor) Fields() []string { return c.res.Columns() }
 
-func (c *boltCursor) Next() ([]value.Value, bool, error) { return c.res.Row() }
+// Next returns the next row, mapping a streaming fault to a Bolt status (doc 18 §12). The
+// wall-clock cap can fire while a query streams, so the deadline surfaces here rather than
+// at Run; routing the error through boltErr reports it as a timed out transaction instead
+// of a generic database error.
+func (c *boltCursor) Next() ([]value.Value, bool, error) {
+	row, ok, err := c.res.Row()
+	if err != nil {
+		return nil, false, boltErr(err)
+	}
+	return row, ok, nil
+}
 
 func (c *boltCursor) Summary() bolt.Summary {
 	return bolt.Summary{Type: boltQueryType(c.kind), Stats: boltStats(c.res.Summary())}
@@ -289,6 +333,10 @@ func (c *boltCursor) Summary() bolt.Summary {
 
 func (c *boltCursor) Close() error {
 	err := c.res.Close()
+	if c.cancel != nil {
+		c.cancel()
+		c.cancel = nil
+	}
 	if c.release != nil {
 		c.release()
 		c.release = nil
@@ -486,6 +534,10 @@ func boltErr(err error) error {
 		return err
 	}
 	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		// The wall-clock cap fired (doc 18 §8.6). A timed out transaction is a client
+		// error so a driver does not treat it as a server fault to retry blindly.
+		return &bolt.StatusError{Code: "Neo.ClientError.Transaction.TransactionTimedOut", Message: "query exceeded the server time limit"}
 	case errors.Is(err, ErrReadOnly):
 		return &bolt.StatusError{Code: "Neo.ClientError.Statement.AccessMode", Message: err.Error()}
 	case errors.Is(err, ErrSchemaCommand), errors.Is(err, ErrAdminCommand), errors.Is(err, ErrPragmaCommand):

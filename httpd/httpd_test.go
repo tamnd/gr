@@ -377,3 +377,32 @@ func TestQueryAdmissionAdmits(t *testing.T) {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestQueryMaxTime confirms the server-wide wall-clock cap times a query out. A
+// sub-nanosecond cap means the deadline has already passed when the engine checks its
+// context at entry, so the query reports a timed out transaction with a 504.
+func TestQueryMaxTime(t *testing.T) {
+	h := Handler(newTestDB(t), Options{QueryMaxTime: time.Nanosecond})
+	rec := post(t, h, `{"statement":"RETURN 1 AS n"}`)
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504: %s", rec.Code, rec.Body.String())
+	}
+	body := decode(t, rec.Body.Bytes())
+	errsAny, ok := body["errors"].([]any)
+	if !ok || len(errsAny) == 0 {
+		t.Fatalf("no errors in response: %v", body)
+	}
+	first := errsAny[0].(map[string]any)
+	if first["code"] != "Neo.ClientError.Transaction.TransactionTimedOut" {
+		t.Errorf("code = %v, want TransactionTimedOut", first["code"])
+	}
+}
+
+// TestQueryMaxTimeAdmits confirms a generous cap does not interfere with a normal query.
+func TestQueryMaxTimeAdmits(t *testing.T) {
+	h := Handler(newTestDB(t), Options{QueryMaxTime: time.Minute})
+	rec := post(t, h, `{"statement":"RETURN 1 AS n"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+}

@@ -860,10 +860,70 @@ type Result struct {
 	summary Summary
 	tx      engine.Tx
 	ownTx   bool
+	// curRow holds the row the most recent Next advanced to, the row Record wraps;
+	// err holds the first error that stopped streaming, surfaced through Err. Both are
+	// the database/sql.Rows-style streaming state (doc 16 §8.2).
+	curRow eval.Row
+	err    error
 }
 
-// Columns returns the result's output column names in order.
+// Columns returns the result's output column names in order. It is the same column
+// list as Keys; Columns is the lower-level spelling, Keys the doc 16 §8.1 name.
 func (r *Result) Columns() []string { return r.cols }
+
+// Keys returns the result's column names in the order the RETURN or WITH clause
+// produced them (doc 16 §8.1).
+func (r *Result) Keys() []string { return r.cols }
+
+// Next advances to the next record and reports whether there is one (doc 16 §8.2).
+// It returns false at the end of the stream or on a runtime error; the caller then
+// checks Err to tell a normal end (Err is nil) from an error that stopped the stream.
+// This is the database/sql.Rows iteration shape: for res.Next() { ... }; res.Err().
+func (r *Result) Next() bool {
+	row, ok, err := r.next()
+	if err != nil {
+		r.err = err
+		r.curRow = nil
+		return false
+	}
+	if !ok {
+		r.curRow = nil
+		return false
+	}
+	r.curRow = row
+	return true
+}
+
+// Record returns the record the most recent Next advanced to (doc 16 §8.3). It is
+// valid only until the next Next call, and nil before the first Next or after a Next
+// that returned false.
+func (r *Result) Record() *Record {
+	if r.curRow == nil {
+		return nil
+	}
+	return newRecord(r.cols, r.curRow)
+}
+
+// Err returns the first error that stopped streaming, or nil if the stream ended
+// normally (doc 16 §8.2, §8.4). It is checked once after the iteration loop, the
+// database/sql.Rows.Err idiom.
+func (r *Result) Err() error { return r.err }
+
+// Row pulls the next result row as a slice of column values aligned to Columns,
+// returning ok false at the end of the stream (the positional, lower-level form of
+// the Next/Record streaming API). A column absent from the row binds to the null
+// value, the schema-optional reading rule (doc 08 §5.3).
+func (r *Result) Row() ([]value.Value, bool, error) {
+	row, ok, err := r.next()
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	out := make([]value.Value, len(r.cols))
+	for i, c := range r.cols {
+		out[i] = row[c]
+	}
+	return out, true, nil
+}
 
 // next pulls the next row from whichever backing the result has: the live cursor
 // for a read, or the materialized buffer for an eagerly executed write.
@@ -877,21 +937,6 @@ func (r *Result) next() (eval.Row, bool, error) {
 	row := r.buf[r.bufIdx]
 	r.bufIdx++
 	return row, true, nil
-}
-
-// Next pulls the next result row as a slice of column values aligned to Columns,
-// returning ok false at the end of the stream. A column absent from the row binds
-// to the null value, the schema-optional reading rule (doc 08 §5.3).
-func (r *Result) Next() ([]value.Value, bool, error) {
-	row, ok, err := r.next()
-	if err != nil || !ok {
-		return nil, ok, err
-	}
-	out := make([]value.Value, len(r.cols))
-	for i, c := range r.cols {
-		out[i] = row[c]
-	}
-	return out, true, nil
 }
 
 // NextRow pulls the next result row as a name-keyed map, for callers that prefer

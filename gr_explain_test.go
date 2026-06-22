@@ -24,7 +24,7 @@ func planText(t *testing.T, db *DB, q string) string {
 	}
 	var lines []string
 	for {
-		row, ok, err := res.Next()
+		row, ok, err := res.Row()
 		if err != nil {
 			t.Fatalf("next: %v", err)
 		}
@@ -139,7 +139,7 @@ func TestExplainWriteTxOmitsEstimates(t *testing.T) {
 	defer func() { _ = res.Close() }()
 	var sawScan, sawEstimate bool
 	for {
-		row, ok, err := res.Next()
+		row, ok, err := res.Row()
 		if err != nil {
 			t.Fatalf("next: %v", err)
 		}
@@ -285,7 +285,7 @@ func TestJoinSwapKeepsResults(t *testing.T) {
 	defer func() { _ = res.Close() }()
 	got := map[int64]bool{}
 	for {
-		row, ok, err := res.Next()
+		row, ok, err := res.Row()
 		if err != nil {
 			t.Fatalf("next: %v", err)
 		}
@@ -324,7 +324,7 @@ func TestThreeWayJoinKeepsResults(t *testing.T) {
 	defer func() { _ = res.Close() }()
 	got := map[int64]bool{}
 	for {
-		row, ok, err := res.Next()
+		row, ok, err := res.Row()
 		if err != nil {
 			t.Fatalf("next: %v", err)
 		}
@@ -401,7 +401,7 @@ func TestExplainInReadTransaction(t *testing.T) {
 	if cols := res.Columns(); len(cols) != 1 || cols[0] != "plan" {
 		t.Fatalf("columns = %v, want [plan]", cols)
 	}
-	row, ok, err := res.Next()
+	row, ok, err := res.Row()
 	if err != nil || !ok {
 		t.Fatalf("first plan row: ok=%v err=%v", ok, err)
 	}
@@ -429,7 +429,7 @@ func TestExplainInWriteTransaction(t *testing.T) {
 	}
 	var planted bool
 	for {
-		row, ok, err := res.Next()
+		row, ok, err := res.Row()
 		if err != nil {
 			t.Fatalf("next: %v", err)
 		}

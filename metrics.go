@@ -55,6 +55,7 @@ func (db *DB) Metrics() MetricsSnapshot {
 	db.syncBufferPoolMetrics()
 	db.syncCacheMemoryMetrics()
 	db.syncCheckpointMetrics()
+	db.syncMvccGCMetrics()
 	return db.metrics.reg.Snapshot()
 }
 
@@ -201,6 +202,36 @@ func (db *DB) syncCheckpointMetrics() {
 	if c := m.checkpointSegments["rel"]; c != nil && rel > m.lastCkptRelSeg {
 		c.Add(rel - m.lastCkptRelSeg)
 		m.lastCkptRelSeg = rel
+	}
+}
+
+// syncMvccGCMetrics mirrors the engine's cumulative version-GC totals into the registry at snapshot
+// time (doc 20 §5.1): it advances gr_mvcc_gc_runs_total by the GC passes run since the last sync and
+// gr_mvcc_gc_reclaimed_total{element} by the pre-images each pass dropped, split by element. The
+// engine owns the authoritative counts, bumped under its lock when GC runs at checkpoint, so the GC
+// path never touches the registry; the bridge runs only on a scrape. The delta add keeps the
+// counters monotonic, and gcMu serializes two concurrent scrapes so neither double-counts. Reading
+// the totals is a lock-free atomic load, never the engine lock, so a long-held write transaction
+// cannot deadlock a snapshot.
+func (db *DB) syncMvccGCMetrics() {
+	if db.eng == nil {
+		return
+	}
+	runs, node, rel := db.eng.GCStats()
+	m := db.metrics
+	m.gcMu.Lock()
+	defer m.gcMu.Unlock()
+	if m.gcRuns != nil && runs > m.lastGCRuns {
+		m.gcRuns.Add(runs - m.lastGCRuns)
+		m.lastGCRuns = runs
+	}
+	if c := m.gcReclaimed["node"]; c != nil && node > m.lastGCNode {
+		c.Add(node - m.lastGCNode)
+		m.lastGCNode = node
+	}
+	if c := m.gcReclaimed["rel"]; c != nil && rel > m.lastGCRel {
+		c.Add(rel - m.lastGCRel)
+		m.lastGCRel = rel
 	}
 }
 
@@ -379,6 +410,11 @@ var metricCheckpointTriggers = []string{"wal_threshold", "timer", "manual", "clo
 // operator sees which store dominates the fold's write amplification.
 var metricCheckpointStores = []string{"node", "rel"}
 
+// metricMvccElements is the bounded domain of the element label on the MVCC metrics (doc 20 §5.1):
+// the two graph element kinds versions are kept for, node and rel. It labels
+// gr_mvcc_gc_reclaimed_total so the version-reclaim throughput is readable per element.
+var metricMvccElements = []string{"node", "rel"}
+
 // metricCacheNames is the bounded domain of the cache label on gr_cache_memory_bytes (doc 20
 // §4.5): the caches that account their resident bytes today, the buffer pool of raw pages and the
 // column cache of decoded property blocks. The full §4.5 domain also names the adjacency, plan,
@@ -490,6 +526,18 @@ type queryMetrics struct {
 	checkpointSegMu    sync.Mutex
 	lastCkptNodeSeg    uint64
 	lastCkptRelSeg     uint64
+
+	// gcRuns holds gr_mvcc_gc_runs_total and gcReclaimed gr_mvcc_gc_reclaimed_total keyed by element
+	// (doc 20 §5.1). The engine owns the authoritative cumulative totals, bumped under its lock when
+	// GC runs at checkpoint; the sync step mirrors them here delta-style, the same bridge the
+	// checkpoint counters use. gcMu serializes two concurrent scrapes so neither double-counts, and
+	// lastGCRuns, lastGCNode, and lastGCRel hold the last mirrored cumulative values.
+	gcRuns      *metric.Counter
+	gcReclaimed map[string]*metric.Counter
+	gcMu        sync.Mutex
+	lastGCRuns  uint64
+	lastGCNode  uint64
+	lastGCRel   uint64
 
 	// indexEntryGauges records which index names already have a gr_index_entries computed gauge, so
 	// the sync registers each at most once. The value is unused, only the key (the index name)
@@ -644,6 +692,13 @@ func newQueryMetrics() *queryMetrics {
 	for _, store := range metricCheckpointStores {
 		m.checkpointSegments[store] = reg.Counter("gr_checkpoint_segments_rewritten_total",
 			"Column segments rewritten by a fold, by store", "segments", metric.Labels{"store": store})
+	}
+	m.gcRuns = reg.Counter("gr_mvcc_gc_runs_total",
+		"Version-GC passes executed", "runs", nil)
+	m.gcReclaimed = make(map[string]*metric.Counter, len(metricMvccElements))
+	for _, element := range metricMvccElements {
+		m.gcReclaimed[element] = reg.Counter("gr_mvcc_gc_reclaimed_total",
+			"Versions reclaimed by GC, by element", "versions", metric.Labels{"element": element})
 	}
 	for _, r := range metricAuthResults {
 		m.authAttempts[r] = reg.Counter("gr_auth_attempts_total",

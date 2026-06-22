@@ -56,6 +56,10 @@ const (
 	RelProp
 )
 
+// isRel reports whether a kind versions a relationship datum rather than a node datum, so GC can
+// split its reclaim count by element (doc 20 §5.1).
+func (k Kind) isRel() bool { return k == RelExist || k == RelProp }
+
 // Key identifies a versioned datum: its kind, the dense position of the element
 // it belongs to, and a sub-key (a property token for the property kinds, zero
 // otherwise).
@@ -227,17 +231,32 @@ func (ov *Overlay) NodeCandidates(propKey uint32, r Seq) []uint64 {
 	return out
 }
 
+// GCStats reports what one GC pass reclaimed (doc 20 §5.1): the pre-images dropped, split by
+// element so the version-reclaim throughput is readable per node and rel.
+type GCStats struct {
+	Node uint64
+	Rel  uint64
+}
+
 // GC drops pre-images no live snapshot can need: an entry tagged seq serves
 // snapshots whose read sequence is below seq, so once the watermark reaches seq
-// it is reclaimable (doc 06 §4.3).
-func (ov *Overlay) GC(watermark Seq) {
+// it is reclaimable (doc 06 §4.3). It returns what it reclaimed, split by element.
+func (ov *Overlay) GC(watermark Seq) GCStats {
 	ov.mu.Lock()
 	defer ov.mu.Unlock()
+	var st GCStats
 	for k, ch := range ov.chains {
 		kept := ch[:0]
 		for _, e := range ch {
 			if e.seq > watermark {
 				kept = append(kept, e)
+			}
+		}
+		if dropped := uint64(len(ch) - len(kept)); dropped > 0 {
+			if k.Kind.isRel() {
+				st.Rel += dropped
+			} else {
+				st.Node += dropped
 			}
 		}
 		if len(kept) == 0 {
@@ -246,6 +265,7 @@ func (ov *Overlay) GC(watermark Seq) {
 			ov.chains[k] = kept
 		}
 	}
+	return st
 }
 
 // Len reports the number of retained pre-images, for tests and observability.

@@ -105,6 +105,14 @@ type DiskEngine struct {
 	ckptNodeSegmentsTotal atomic.Uint64
 	ckptRelSegmentsTotal  atomic.Uint64
 
+	// gcRunsTotal counts version-GC passes, and gcReclaimedNode and gcReclaimedRel the pre-images
+	// each pass dropped, split by element, all bumped under the engine lock when GC runs at
+	// checkpoint (doc 20 §5.1). They are the authoritative cumulative counts the metrics path mirrors
+	// into gr_mvcc_gc_runs_total and gr_mvcc_gc_reclaimed_total{element} delta-style, read lock-free.
+	gcRunsTotal     atomic.Uint64
+	gcReclaimedNode atomic.Uint64
+	gcReclaimedRel  atomic.Uint64
+
 	// bc fronts the segmented-base read with decoded segments, so a repeated point
 	// read in a segment does not re-decode it (doc 14 §4). It is an in-memory cache,
 	// never a source of truth: every cached segment carries the checkpoint epoch it
@@ -189,6 +197,14 @@ func (e *DiskEngine) CheckpointSegmentsTotal() (node, rel uint64) {
 // a write transaction holds the engine lock; the write path takes the engine lock then the overlay
 // lock, so there is no inversion.
 func (e *DiskEngine) VersionsResident() int64 { return int64(e.ov.Len()) }
+
+// GCStats returns the cumulative version-GC totals (doc 20 §5.1): the GC passes run and the
+// pre-images reclaimed split by element, read lock-free from the atomics each checkpoint's GC bumps.
+// The metrics path mirrors these into gr_mvcc_gc_runs_total and gr_mvcc_gc_reclaimed_total{element}
+// delta-style, so this never takes the engine lock and is safe off the snapshot path.
+func (e *DiskEngine) GCStats() (runs, reclaimedNode, reclaimedRel uint64) {
+	return e.gcRunsTotal.Load(), e.gcReclaimedNode.Load(), e.gcReclaimedRel.Load()
+}
 
 // load (re)builds the store handles over the current pager state, creating the
 // stores when fresh and opening them otherwise. It is also used to rebuild state
@@ -584,7 +600,12 @@ func (e *DiskEngine) Checkpoint() error {
 	if _, err := e.commitPager(); err != nil {
 		return err
 	}
-	e.ov.GC(e.oracle.Watermark())
+	gc := e.ov.GC(e.oracle.Watermark())
+	// Record the GC pass and what it reclaimed for the MVCC metrics (doc 20 §5.1), under the
+	// engine lock the checkpoint holds; the metrics path mirrors these cumulative totals.
+	e.gcRunsTotal.Add(1)
+	e.gcReclaimedNode.Add(gc.Node)
+	e.gcReclaimedRel.Add(gc.Rel)
 	return nil
 }
 

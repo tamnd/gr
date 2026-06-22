@@ -1,6 +1,8 @@
 package colsegstore
 
 import (
+	"sync"
+
 	"github.com/tamnd/gr/colseg"
 	"github.com/tamnd/gr/format"
 	"github.com/tamnd/gr/pager"
@@ -23,9 +25,16 @@ import (
 // the owner persists; the per-column anchors live inside the directory cells, so
 // the whole store reopens from that one pair.
 type Store struct {
-	p    *pager.Pager
-	dir  *store.Vector
-	cols map[uint32]*Column
+	p   *pager.Pager
+	dir *store.Vector
+	// colsMu guards the cols cache against concurrent readers. A property read
+	// (Get, Locate, DecodeSegment) opens the key's column on a cache miss and
+	// installs it here, so morsel-parallel readers sharing one snapshot race on the
+	// map without a lock. Only the read leaf column() takes it; ensureColumn's own
+	// install runs write-path-only under the engine's exclusive lock where no reader
+	// is present, so it needs no lock, the same split as the adjacency cache.
+	colsMu sync.Mutex
+	cols   map[uint32]*Column
 }
 
 // colCellStride is one directory cell: a column's directory head and blob head
@@ -118,7 +127,10 @@ func (s *Store) growDir(key uint32) error {
 // column opens the cached or stored column for a key, or returns ok false when the
 // key has no column yet (out of directory range or a zero cell).
 func (s *Store) column(key uint32) (*Column, bool, error) {
-	if col, ok := s.cols[key]; ok {
+	s.colsMu.Lock()
+	col, ok := s.cols[key]
+	s.colsMu.Unlock()
+	if ok {
 		return col, true, nil
 	}
 	if int(key) >= s.dir.Count() {
@@ -131,9 +143,17 @@ func (s *Store) column(key uint32) (*Column, bool, error) {
 	if dirHead == 0 {
 		return nil, false, nil
 	}
-	col, err := Open(s.p, dirHead, dirCount, blobHead, blobLen)
+	col, err = Open(s.p, dirHead, dirCount, blobHead, blobLen)
 	if err != nil {
 		return nil, false, err
+	}
+	// Drop the lock across Open above (it does its own IO through the safe pager),
+	// then install under the lock with a double-check so a peer that opened the
+	// same column first wins and this caller drops its duplicate.
+	s.colsMu.Lock()
+	defer s.colsMu.Unlock()
+	if existing, ok := s.cols[key]; ok {
+		return existing, true, nil
 	}
 	s.cols[key] = col
 	return col, true, nil

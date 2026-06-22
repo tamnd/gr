@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -17,6 +18,7 @@ import (
 var (
 	errUnexpectedNeighbor = errors.New("expand returned a neighbor not in the graph")
 	errWrongDegree        = errors.New("expand returned the wrong neighbor count")
+	errWrongProperty      = errors.New("read returned the wrong property value")
 )
 
 func openDisk(t *testing.T, fsys vfs.VFS, path string) *DiskEngine {
@@ -221,6 +223,96 @@ func TestDiskConcurrentExpand(t *testing.T) {
 				}
 			}
 		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
+// TestDiskConcurrentNodeProperty drives the property-read stack the way
+// morsel-parallel execution will: many goroutines reading node properties at
+// once against one snapshot, over keys whose columns are still cold so the
+// readers are the ones that open them. It reaches both lazily-filled column
+// caches: keys written before the checkpoint fold into the segmented base
+// (colsegstore opens them on first read), and a key written after stays in the
+// naive delta (column opens it on first read). Before those caches were guarded
+// a concurrent first read of a cold key was a fatal concurrent map write; here
+// every goroutine must read the value it wrote and the race detector must stay
+// clean.
+func TestDiskConcurrentNodeProperty(t *testing.T) {
+	fsys := vfs.NewMem()
+	e := openDisk(t, fsys, "concprop.gr")
+	defer e.Close()
+
+	const nkeys = 5    // k0..k3 fold into the base, k4 stays in the delta
+	const nnodes = 32
+	keys := make([]Token, nkeys)
+	for j := range keys {
+		keys[j], _ = e.Intern(catalog.KindPropKey, "p"+strconv.Itoa(j))
+	}
+
+	// val is the value node i carries for key j, distinct per pair so a wrong
+	// cache lookup is detectable.
+	val := func(i, j int) int64 { return int64(i*100 + j) }
+
+	tx, _ := e.Begin(true)
+	nodes := make([]NodeID, nnodes)
+	for i := range nodes {
+		n, _ := tx.CreateNode(nil)
+		nodes[i] = n
+		for j := 0; j < nkeys-1; j++ { // all but the last key, pre-checkpoint
+			if err := tx.SetNodeProperty(n, keys[j], value.Int(val(i, j))); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Checkpoint(); err != nil { // folds k0..k3 into the segmented base
+		t.Fatal(err)
+	}
+
+	// The last key is written after the checkpoint, so it lives in the naive delta
+	// and its reads exercise the other lazy cache.
+	tx2, _ := e.Begin(true)
+	for i, n := range nodes {
+		if err := tx2.SetNodeProperty(n, keys[nkeys-1], value.Int(val(i, nkeys-1))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx2.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	rx, _ := e.Begin(false)
+	defer rx.Abort()
+
+	const workers = 16
+	const iters = 200
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for it := 0; it < iters; it++ {
+				i := (w*iters + it) % nnodes
+				j := it % nkeys
+				v, err := rx.NodeProperty(nodes[i], keys[j])
+				if err != nil {
+					errs <- err
+					return
+				}
+				iv, ok := v.AsInt()
+				if !ok || iv != val(i, j) {
+					errs <- errWrongProperty
+					return
+				}
+			}
+		}(w)
 	}
 	wg.Wait()
 	close(errs)

@@ -2,10 +2,36 @@ package mvcc_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/tamnd/gr/mvcc"
 	"github.com/tamnd/gr/value"
 )
+
+func TestOracleOldestSnapshotAge(t *testing.T) {
+	o := mvcc.NewOracle(0)
+	// No live snapshot: nothing to age.
+	if age := o.OldestSnapshotAge(); age != 0 {
+		t.Fatalf("oldest age with none live = %v, want 0", age)
+	}
+	id1, _ := o.Begin()
+	time.Sleep(5 * time.Millisecond)
+	// A second, younger snapshot must not lower the reported age below the first's.
+	id2, _ := o.Begin()
+	if age := o.OldestSnapshotAge(); age < 5*time.Millisecond {
+		t.Fatalf("oldest age = %v, want >= 5ms (the older snapshot)", age)
+	}
+	// Releasing the younger one leaves the older as the oldest, so the age does not drop.
+	o.End(id2)
+	if age := o.OldestSnapshotAge(); age < 5*time.Millisecond {
+		t.Fatalf("oldest age after releasing the younger = %v, want >= 5ms", age)
+	}
+	// Releasing the last live snapshot returns to zero.
+	o.End(id1)
+	if age := o.OldestSnapshotAge(); age != 0 {
+		t.Fatalf("oldest age after all released = %v, want 0", age)
+	}
+}
 
 func TestOracleSeqAndSnapshots(t *testing.T) {
 	o := mvcc.NewOracle(10)

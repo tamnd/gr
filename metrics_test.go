@@ -1160,6 +1160,37 @@ func TestMetricsWatermarkLag(t *testing.T) {
 	}
 }
 
+func TestMetricsOldestSnapshotAge(t *testing.T) {
+	db := openMem(t, "oldsnap.gr")
+	defer db.Close()
+
+	mustExec(t, db, "CREATE (:Person {n: 0})", nil)
+
+	// With no live reader there is no snapshot to age, so the gauge reads zero.
+	if g := db.Metrics().Gauge("gr_mvcc_oldest_snapshot_age_seconds", nil); g != 0 {
+		t.Fatalf("oldest snapshot age with no live reader = %d, want 0", g)
+	}
+
+	// Hold a read snapshot open across a second so its age crosses the whole-second boundary the
+	// gauge truncates to, then assert the gauge sees the live reader's age.
+	rtx, err := db.Begin(context.Background(), Read)
+	if err != nil {
+		t.Fatalf("begin read: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if g := db.Metrics().Gauge("gr_mvcc_oldest_snapshot_age_seconds", nil); g < 1 {
+		t.Fatalf("oldest snapshot age with a reader held over a second = %d, want >= 1", g)
+	}
+
+	// Releasing the reader leaves no live snapshot, so the gauge falls back to zero.
+	if err := rtx.Rollback(); err != nil {
+		t.Fatalf("rollback read: %v", err)
+	}
+	if g := db.Metrics().Gauge("gr_mvcc_oldest_snapshot_age_seconds", nil); g != 0 {
+		t.Fatalf("oldest snapshot age after the reader released = %d, want 0", g)
+	}
+}
+
 func TestMetricsConstraintChecks(t *testing.T) {
 	db := openMem(t, "mxcons.gr")
 	defer db.Close()

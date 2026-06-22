@@ -249,6 +249,12 @@ func Open(path string, opt Options) (*DB, error) {
 	db.metrics.reg.ComputedGauge("gr_mvcc_watermark_lag_versions",
 		"Commit versions between the newest commit and the GC watermark, the reclaimable backlog", "versions", nil,
 		func() int64 { return db.eng.WatermarkLag() })
+	// The oldest snapshot's age is the same long-reader signal in time: a reader pinning the watermark
+	// shows here as an age that climbs while it stays open (doc 20 §5.1). It reads the oracle's lock, so
+	// the metrics path is free to read it during a write, and it is truncated to whole seconds.
+	db.metrics.reg.ComputedGauge("gr_mvcc_oldest_snapshot_age_seconds",
+		"Wall-clock age of the oldest live snapshot, the long-reader signal in time", "seconds", nil,
+		func() int64 { return db.eng.OldestSnapshotAgeSeconds() })
 	// The open event reports the file's real geometry and whether this open recovered a
 	// committed WAL prefix after a crash (doc 20 §11.3). StorageInfo reads the header the
 	// engine just mounted, so the format version and page size are the file's own.

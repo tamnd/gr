@@ -86,6 +86,14 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			"queries shed because the in-flight gate was full", "", float64(s.admission.Shed()))
 	}
 
+	// The throttle counter comes from the shared rate limiter (doc 18 §8.8, §13.5), and
+	// like the gate metrics it is emitted only when a limiter is configured so an
+	// unlimited server does not report a misleading constant zero.
+	if s.limiter != nil {
+		writeMetric(&b, "gr_server_queries_throttled_total", "counter",
+			"queries refused because a principal exceeded its rate limit", "", float64(s.limiter.Throttled()))
+	}
+
 	s.metrics.mu.Lock()
 	codes := make([]string, 0, len(s.metrics.errors))
 	for code := range s.metrics.errors {

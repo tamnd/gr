@@ -168,6 +168,30 @@ func TestMetricsNoAdmission(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "gr_server_in_flight_queries") {
 		t.Error("ungated server emitted the in-flight gauge")
 	}
+	if strings.Contains(rec.Body.String(), "gr_server_queries_throttled_total") {
+		t.Error("unlimited server emitted the throttle counter")
+	}
+}
+
+// TestMetricsRateLimit confirms the throttle counter appears when a limiter is configured
+// and counts a refused query. A tiny limit with a burst of one throttles the second query,
+// lifting the counter to one.
+func TestMetricsRateLimit(t *testing.T) {
+	h := Handler(newTestDB(t), Options{RateLimiter: gr.NewRateLimiter(0.001, 1)})
+	for i := 0; i < 2; i++ {
+		post(t, h, `{"statement":"RETURN 1 AS n"}`)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		"# TYPE gr_server_queries_throttled_total counter",
+		"gr_server_queries_throttled_total 1",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q\nbody:\n%s", want, body)
+		}
+	}
 }
 
 // TestMetricsAuthOutcomes confirms the auth counters split success from failure and that

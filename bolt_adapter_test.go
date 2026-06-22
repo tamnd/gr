@@ -448,6 +448,51 @@ func TestBoltAdapterQueryMaxTime(t *testing.T) {
 	}
 }
 
+// TestBoltAdapterRateLimit confirms the per-principal rate limit throttles a Bolt query
+// once the connection's principal has spent its burst. With a tiny rate and a burst of
+// one, the first query runs and the second is refused as a retryable transient.
+func TestBoltAdapterRateLimit(t *testing.T) {
+	db := boltDB(t)
+	h := db.BoltHandler(WithBoltRateLimiter(NewRateLimiter(0.001, 1)))
+
+	tx1, err := h.Begin(map[string]any{}, bolt.Auth{Principal: "alice"})
+	if err != nil {
+		t.Fatalf("begin 1: %v", err)
+	}
+	cur1, err := tx1.Run("RETURN 1 AS n", nil)
+	if err != nil {
+		t.Fatalf("run 1: %v", err)
+	}
+	cur1.Close()
+	tx1.Commit()
+
+	// The same principal's next query is throttled.
+	tx2, err := h.Begin(map[string]any{}, bolt.Auth{Principal: "alice"})
+	if err != nil {
+		t.Fatalf("begin 2: %v", err)
+	}
+	_, err = tx2.Run("RETURN 2 AS n", nil)
+	var se *bolt.StatusError
+	if !errors.As(err, &se) {
+		t.Fatalf("throttled run err = %v, want StatusError", err)
+	}
+	if se.Code != "Neo.TransientError.General.TransientError" {
+		t.Errorf("throttled code = %q, want transient", se.Code)
+	}
+
+	// A different principal has its own bucket and is not throttled.
+	tx3, err := h.Begin(map[string]any{}, bolt.Auth{Principal: "bob"})
+	if err != nil {
+		t.Fatalf("begin 3: %v", err)
+	}
+	cur3, err := tx3.Run("RETURN 3 AS n", nil)
+	if err != nil {
+		t.Fatalf("bob's run throttled by alice's spend: %v", err)
+	}
+	cur3.Close()
+	tx3.Commit()
+}
+
 // TestBoltAdapterQueryMaxTimeAdmits confirms a generous cap does not interfere with a
 // normal query, and that the cursor closes cleanly with the cap's cancel wired in.
 func TestBoltAdapterQueryMaxTimeAdmits(t *testing.T) {

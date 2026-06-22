@@ -64,6 +64,16 @@ func WithBoltQueryMaxTime(d time.Duration) BoltOption {
 	return func(h *boltHandler) { h.queryMaxTime = d }
 }
 
+// WithBoltRateLimiter gives the handler a shared per-principal query rate limiter (doc 18
+// §8.8). Every statement charges one token against the connection's principal before it
+// executes, so a single client cannot monopolize the engine with a flood of cheap
+// queries. Passing the same limiter to the HTTP surface makes the bound hold across the
+// whole process. A nil limiter, or no option, leaves the Bolt path unlimited, the
+// embedded-friendly default.
+func WithBoltRateLimiter(r *RateLimiter) BoltOption {
+	return func(h *boltHandler) { h.limiter = r }
+}
+
 // BoltHandler returns a bolt.Handler that runs Cypher over the database for a Bolt
 // server (doc 18 §5). Pass it to a bolt.Server, which a bolt.Listener serves over
 // TCP:
@@ -90,6 +100,7 @@ type boltHandler struct {
 	requireAuth  bool
 	authFunc     func(scheme, principal, credentials string) (roles []string, err error)
 	admission    *Admission
+	limiter      *RateLimiter
 	queryMaxTime time.Duration
 	bookmark     atomic.Uint64
 }
@@ -140,7 +151,19 @@ func (h *boltHandler) Authenticate(scheme, principal, credentials string) (bolt.
 // than always taking the write path.
 func (h *boltHandler) Begin(extra map[string]any, auth bolt.Auth) (bolt.Tx, error) {
 	mode, hinted := boltModeHint(extra)
-	return &boltTx{h: h, db: h.db, mode: mode, modeHinted: hinted, roles: auth.Roles}, nil
+	return &boltTx{h: h, db: h.db, mode: mode, modeHinted: hinted, roles: auth.Roles, principal: auth.Principal}, nil
+}
+
+// boltRateKey is the rate-limit bucket key for a connection's principal (doc 18 §8.8).
+// An authenticated connection keys by its principal, prefixed to share the namespace with
+// the HTTP surface's per-token keys; an anonymous connection (auth off) keys to one shared
+// bucket, so an auth-off Bolt server rate-limits as a single tenant, which is the
+// localhost, single-application posture that runs without auth.
+func boltRateKey(principal string) string {
+	if principal == "" {
+		return "bolt:anon"
+	}
+	return "user:" + principal
 }
 
 // boltModeHint reads the access-mode hint from a BEGIN or RUN extra map (doc 18
@@ -169,6 +192,7 @@ type boltTx struct {
 	mode       AccessMode
 	modeHinted bool
 	roles      []string // the connection's roles, for per-statement authorization
+	principal  string   // the connection's principal, for the rate-limit key
 
 	tx         *Tx
 	standalone bool // last statement auto-committed itself (schema/admin/pragma)
@@ -188,6 +212,17 @@ func (t *boltTx) Run(query string, params map[string]value.Value) (bolt.Cursor, 
 				Code:    "Neo.ClientError.Security.Forbidden",
 				Message: "this account is not allowed to run " + kind.String() + " statements",
 			}
+		}
+	}
+
+	// Charge the per-principal rate limit before taking an engine slot, so a throttled
+	// query sheds at once rather than waiting at the gate (doc 18 §8.8). A spent budget is
+	// a retryable transient, the same call the HTTP surface makes. A nil limiter allows
+	// every query.
+	if ok, _ := t.h.limiter.Allow(boltRateKey(t.principal)); !ok {
+		return nil, &bolt.StatusError{
+			Code:    "Neo.TransientError.General.TransientError",
+			Message: "query rate limit exceeded, retry shortly",
 		}
 	}
 

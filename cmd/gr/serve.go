@@ -139,7 +139,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 			fmt.Fprintln(stderr, "gr:", err)
 			return exitUsage
 		}
-		bh := db.BoltHandler(append(boltAuthOptions(auth), gr.WithBoltAdmission(admission), gr.WithBoltQueryMaxTime(*queryMaxTime))...)
+		bh := db.BoltHandler(append(boltAuthOptions(auth), gr.WithBoltAdmission(admission), gr.WithBoltQueryMaxTime(*queryMaxTime), gr.WithBoltRateLimiter(limiter))...)
 		ln := &bolt.Listener{
 			Server:    &bolt.Server{Handler: bh},
 			Addr:      *boltAddr,

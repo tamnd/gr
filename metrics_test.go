@@ -992,6 +992,42 @@ func TestMetricsUnifiedCacheMemory(t *testing.T) {
 	}
 }
 
+func TestMetricsCheckpoint(t *testing.T) {
+	db := openMem(t, "mxcheckpoint.gr")
+	defer db.Close()
+
+	// No checkpoint has run yet, so the manual trigger sits at zero and the timestamp is unset.
+	base := db.Metrics()
+	if c := base.Counter("gr_checkpoint_total", Labels{"trigger": "manual"}); c != 0 {
+		t.Fatalf("manual checkpoints before any run = %d, want 0", c)
+	}
+	if g := base.Gauge("gr_checkpoint_last_timestamp_seconds", nil); g != 0 {
+		t.Fatalf("last-checkpoint timestamp before any run = %d, want 0", g)
+	}
+
+	for i := 0; i < 50; i++ {
+		mustExec(t, db, "CREATE (:Person {note: 'value'})", nil)
+	}
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+
+	snap := db.Metrics()
+	if c := snap.Counter("gr_checkpoint_total", Labels{"trigger": "manual"}); c != 1 {
+		t.Fatalf("manual checkpoints after one run = %d, want 1", c)
+	}
+	// The last-checkpoint timestamp moved off zero, the staleness clock an operator watches.
+	if g := snap.Gauge("gr_checkpoint_last_timestamp_seconds", nil); g <= 0 {
+		t.Fatalf("last-checkpoint timestamp = %d, want > 0 after a checkpoint", g)
+	}
+	// The duration histogram observed exactly the one checkpoint.
+	if h := snap.Histogram("gr_checkpoint_duration_seconds", nil); h.Count != 1 {
+		t.Fatalf("checkpoint duration observations = %d, want 1", h.Count)
+	}
+	// The triggers that have no scheduler yet are present and still zero.
+	if c := snap.Counter("gr_checkpoint_total", Labels{"trigger": "timer"}); c != 0 {
+		t.Fatalf("timer checkpoints = %d, want 0", c)
+	}
+}
+
 func TestMetricsConstraintChecks(t *testing.T) {
 	db := openMem(t, "mxcons.gr")
 	defer db.Close()

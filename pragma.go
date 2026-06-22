@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/eval"
@@ -222,9 +223,14 @@ func (db *DB) walCheckpoint(arg value.Value) (*Result, error) {
 	default:
 		return nil, fmt.Errorf("%w: unknown wal_checkpoint mode %q", ErrConfigRange, mode)
 	}
+	start := time.Now()
 	if err := db.eng.Checkpoint(); err != nil {
 		return nil, err
 	}
+	done := time.Now()
+	// This PRAGMA is the manual trigger (doc 20 §5.4); the timer and wal_threshold triggers
+	// record their own when the automatic checkpoint scheduler lands.
+	db.metrics.recordCheckpoint("manual", done.Sub(start), done.Unix())
 	return &Result{cols: []string{"wal_checkpoint"}, buf: []eval.Row{{"wal_checkpoint": value.String(strings.ToLower(mode))}}}, nil
 }
 

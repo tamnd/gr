@@ -317,4 +317,111 @@ func TestPragmaUnknownEnumWordRejected(t *testing.T) {
 	}
 }
 
+// TestPragmaActionCheckpoint runs the wal_checkpoint action in its call form after a write
+// and confirms it reports the mode that ran (doc 24 §3.7).
+func TestPragmaActionCheckpoint(t *testing.T) {
+	db := pragmaDB(t)
+	if _, err := db.Run(context.Background(), "CREATE (:Person {name:'Ada'})", nil); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	res := runPragma(t, db, "PRAGMA wal_checkpoint(TRUNCATE)")
+	defer func() { _ = res.Close() }()
+	if got := res.Keys(); len(got) != 1 || got[0] != "wal_checkpoint" {
+		t.Fatalf("columns = %v, want [wal_checkpoint]", got)
+	}
+	if !res.Next() {
+		t.Fatal("no row")
+	}
+	if s, _ := res.Record().GetString("wal_checkpoint"); s != "truncate" {
+		t.Errorf("mode = %q, want truncate", s)
+	}
+}
+
+// TestPragmaActionCheckpointBareForm confirms the bare query form invokes the action with
+// its default mode, so PRAGMA wal_checkpoint runs a checkpoint without parentheses.
+func TestPragmaActionCheckpointBareForm(t *testing.T) {
+	db := pragmaDB(t)
+	res := runPragma(t, db, "PRAGMA wal_checkpoint")
+	defer func() { _ = res.Close() }()
+	if !res.Next() {
+		t.Fatal("no row")
+	}
+	if s, _ := res.Record().GetString("wal_checkpoint"); s != "truncate" {
+		t.Errorf("mode = %q, want truncate (the default)", s)
+	}
+}
+
+// TestPragmaActionCheckpointFullMode confirms FULL runs, since gr's checkpoint satisfies it.
+func TestPragmaActionCheckpointFullMode(t *testing.T) {
+	db := pragmaDB(t)
+	res := runPragma(t, db, "PRAGMA wal_checkpoint(FULL)")
+	defer func() { _ = res.Close() }()
+	if !res.Next() {
+		t.Fatal("no row")
+	}
+	if s, _ := res.Record().GetString("wal_checkpoint"); s != "full" {
+		t.Errorf("mode = %q, want full", s)
+	}
+}
+
+// TestPragmaActionCheckpointUnsupportedMode confirms a mode gr does not implement is a loud
+// range error rather than a silent fallback to the truncating checkpoint it is not.
+func TestPragmaActionCheckpointUnsupportedMode(t *testing.T) {
+	db := pragmaDB(t)
+	for _, mode := range []string{"PASSIVE", "RESTART", "BOGUS"} {
+		_, err := db.Run(context.Background(), "PRAGMA wal_checkpoint("+mode+")", nil)
+		if !errors.Is(err, ErrConfigRange) {
+			t.Errorf("mode %s: err = %v, want ErrConfigRange", mode, err)
+		}
+	}
+}
+
+// TestPragmaActionNotSettable confirms the set form is rejected on an action pragma: an
+// action is invoked, not assigned.
+func TestPragmaActionNotSettable(t *testing.T) {
+	db := pragmaDB(t)
+	_, err := db.Run(context.Background(), "PRAGMA wal_checkpoint = 1", nil)
+	if !errors.Is(err, ErrNotSettable) {
+		t.Fatalf("err = %v, want ErrNotSettable", err)
+	}
+}
+
+// TestPragmaValueNotCallable confirms the call form is rejected on a value pragma: a knob
+// that reports or sets a value has no action to invoke.
+func TestPragmaValueNotCallable(t *testing.T) {
+	db := pragmaDB(t)
+	_, err := db.Run(context.Background(), "PRAGMA page_count(1)", nil)
+	if !errors.Is(err, ErrNotSettable) {
+		t.Fatalf("err = %v, want ErrNotSettable", err)
+	}
+}
+
+// TestPragmaActionCheckpointReadOnly confirms a checkpoint on a read-only handle is refused:
+// it would write the main file, which a read-only open forbids.
+func TestPragmaActionCheckpointReadOnly(t *testing.T) {
+	db := pragmaDB(t)
+	db.readOnly = true
+	_, err := db.Run(context.Background(), "PRAGMA wal_checkpoint", nil)
+	if !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("err = %v, want ErrReadOnly", err)
+	}
+}
+
+// TestPragmaListIncludesAction confirms the discovery surface lists an action pragma with
+// the action tier, so wal_checkpoint is discoverable like any other knob (doc 24 §23.2).
+func TestPragmaListIncludesAction(t *testing.T) {
+	db := pragmaDB(t)
+	res := runPragma(t, db, "PRAGMA pragma_list")
+	defer func() { _ = res.Close() }()
+	var tier string
+	for res.Next() {
+		if name, _ := res.Record().GetString("name"); name == "wal_checkpoint" {
+			tier, _ = res.Record().GetString("tier")
+		}
+	}
+	if tier != "action" {
+		t.Errorf("wal_checkpoint tier = %q, want action", tier)
+	}
+}
+
 var _ = value.Null

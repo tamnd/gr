@@ -13,12 +13,15 @@ import (
 // of a statement (through wordIs), so it stays usable as an ordinary identifier in a
 // normal query. A pragma is one of:
 //
-//	PRAGMA name            the query form, read the knob's effective value (doc 24 §3.3)
-//	PRAGMA name = value     the set form, change the knob (doc 24 §3.4)
+//	PRAGMA name             the query form, read the knob's effective value (doc 24 §3.3)
+//	PRAGMA name = value      the set form, change the knob (doc 24 §3.4)
 //	PRAGMA name = value TEMP the set form, forced session-only (doc 24 §3.5)
+//	PRAGMA name(value)       the call form, invoke an action pragma (doc 24 §3.7)
+//	PRAGMA name()            the call form with no argument
 //
-// The call form `PRAGMA name(value)` for action pragmas (doc 24 §3.7) is a later slice;
-// this grammar covers the query and set forms.
+// The call form is distinguished from the set form by the parenthesis; an action pragma
+// with no argument is also reachable through the bare query form (PRAGMA name), and the
+// configuration subsystem routes by whether the named pragma is an action.
 
 // pragma parses a PRAGMA statement.
 func (p *parser) pragma() (*ast.Query, error) {
@@ -28,7 +31,8 @@ func (p *parser) pragma() (*ast.Query, error) {
 		return nil, err
 	}
 	cmd := &ast.PragmaCommand{Pos: pos(start), Name: name}
-	if p.accept(lex.Eq) {
+	switch {
+	case p.accept(lex.Eq):
 		cmd.Set = true
 		v, err := p.pragmaValue()
 		if err != nil {
@@ -39,6 +43,21 @@ func (p *parser) pragma() (*ast.Query, error) {
 		// (doc 24 §3.5), so it stays usable as an identifier elsewhere.
 		if p.acceptWord("TEMP") {
 			cmd.Temp = true
+		}
+	case p.accept(lex.Lparen):
+		// The call form for action pragmas (doc 24 §3.7). The argument is optional, so
+		// PRAGMA name() invokes the action with no argument, carried as a null Value.
+		cmd.Call = true
+		cmd.Value = value.Null
+		if !p.accept(lex.Rparen) {
+			v, err := p.pragmaValue()
+			if err != nil {
+				return nil, err
+			}
+			cmd.Value = v
+			if _, err := p.expect(lex.Rparen); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return &ast.Query{Pos: pos(start), Pragma: cmd}, nil

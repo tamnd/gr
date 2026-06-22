@@ -126,6 +126,61 @@ func TestParsePragmaSetString(t *testing.T) {
 	}
 }
 
+// TestParsePragmaCallForm parses the call form PRAGMA name(value) into a call-form command
+// carrying the argument (doc 24 §3.7).
+func TestParsePragmaCallForm(t *testing.T) {
+	q, err := Parse("PRAGMA wal_checkpoint(TRUNCATE)")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if q.Pragma == nil || !q.Pragma.Call {
+		t.Fatalf("call form not marked Call (pragma=%v)", q.Pragma)
+	}
+	if q.Pragma.Set {
+		t.Error("call form marked as Set")
+	}
+	if s, _ := q.Pragma.Value.AsString(); s != "TRUNCATE" {
+		t.Errorf("argument = %v, want TRUNCATE", q.Pragma.Value)
+	}
+}
+
+// TestParsePragmaCallFormInt parses a call form with an integer argument, the shape of
+// incremental_vacuum(N) (doc 24 §3.7).
+func TestParsePragmaCallFormInt(t *testing.T) {
+	q, err := Parse("PRAGMA incremental_vacuum(64)")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !q.Pragma.Call {
+		t.Fatal("not marked Call")
+	}
+	if n, _ := q.Pragma.Value.AsInt(); n != 64 {
+		t.Errorf("argument = %v, want 64", q.Pragma.Value)
+	}
+}
+
+// TestParsePragmaCallFormEmpty parses the no-argument call form PRAGMA name(), which leaves
+// the argument null.
+func TestParsePragmaCallFormEmpty(t *testing.T) {
+	q, err := Parse("PRAGMA optimize()")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !q.Pragma.Call {
+		t.Fatal("not marked Call")
+	}
+	if !q.Pragma.Value.IsNull() {
+		t.Errorf("argument = %v, want null", q.Pragma.Value)
+	}
+}
+
+// TestParsePragmaCallFormUnclosed rejects a call form missing its closing parenthesis.
+func TestParsePragmaCallFormUnclosed(t *testing.T) {
+	if _, err := Parse("PRAGMA wal_checkpoint(TRUNCATE"); err == nil {
+		t.Fatal("expected an error for an unclosed call form")
+	}
+}
+
 // TestParsePragmaTemp records the TEMP modifier that forces a persistent knob's set to
 // apply session-only (doc 24 §3.5).
 func TestParsePragmaTemp(t *testing.T) {

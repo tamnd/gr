@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -75,6 +76,10 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	fs.StringVar(&jwt.rolesClaim, "jwt-roles-claim", "", "token claim to read roles from (default roles)")
 	tokenCacheTTL := fs.Duration("auth-token-cache-ttl", 0, "how long a validated bearer token is cached before revalidation (0 uses the default)")
 	impersonation := fs.Bool("auth-impersonation", false, "allow an admin to run a query as another user via the impersonatedUser request field")
+	queryLog := fs.String("query-log", "none", "structured query log level: none (off), off (slow queries only), errors, slow (failures and slow queries), or all")
+	queryLogFormat := fs.String("query-log-format", "json", "query log format: json or logfmt")
+	queryLogRedact := fs.String("query-log-redact", "all", "query parameter redaction: all (keys and types only), hashed (stable value hashes), or none (verbatim values)")
+	queryLogSlow := fs.Duration("query-log-slow", 0, "slow-query threshold; a query slower than this is logged regardless of level (0 uses the default of one second)")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: gr serve [flags] [database]")
 		fmt.Fprintln(stderr)
@@ -122,7 +127,15 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 		burst = int(math.Ceil(*maxQPS))
 	}
 	limiter := gr.NewRateLimiter(*maxQPS, burst)
-	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL, Impersonation: *impersonation, Admission: admission, QueryMaxTime: *queryMaxTime, RateLimiter: limiter})
+	// One query log is shared by both transports, so a query reads the same whether it
+	// arrived over HTTP or Bolt (doc 20 §10). A level of none returns a nil log, which
+	// records nothing. The log writes to stderr through slog, alongside the startup banner.
+	qlog, err := buildQueryLog(stderr, *queryLog, *queryLogFormat, *queryLogRedact, *queryLogSlow)
+	if err != nil {
+		fmt.Fprintln(stderr, "gr:", err)
+		return exitUsage
+	}
+	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL, Impersonation: *impersonation, Admission: admission, QueryMaxTime: *queryMaxTime, RateLimiter: limiter, QueryLog: qlog})
 	defer srv.Close()
 	fmt.Fprintf(stderr, "gr serving %s on %s (database %q, TLS %s)\n", describeDB(path), *addr, *name, *httpTLS)
 	if auth == nil {
@@ -309,6 +322,51 @@ func parseUser(u string) (name, pass string, roles []string, err error) {
 		roles = []string{"admin"}
 	}
 	return name, pass, roles, nil
+}
+
+// buildQueryLog turns the --query-log flags into a shared query log, or nil when the level
+// is none so no log is constructed (doc 20 §10). The level off still constructs a log, since
+// the slow-query subset fires even at off; only none means truly nothing. The format selects
+// the slog handler (JSON or logfmt), the redaction selects the parameter policy, and the
+// slow threshold marks the always-on slow tail.
+func buildQueryLog(w io.Writer, level, format, redact string, slow time.Duration) (*gr.QueryLog, error) {
+	if level == "none" || level == "" {
+		return nil, nil
+	}
+	var lvl gr.QueryLogLevel
+	switch level {
+	case "off":
+		lvl = gr.QueryLogOff
+	case "errors":
+		lvl = gr.QueryLogErrors
+	case "slow":
+		lvl = gr.QueryLogSlow
+	case "all":
+		lvl = gr.QueryLogAll
+	default:
+		return nil, fmt.Errorf("invalid --query-log %q, want none, off, errors, slow, or all", level)
+	}
+	var pol gr.RedactPolicy
+	switch redact {
+	case "all", "":
+		pol = gr.RedactAll
+	case "hashed":
+		pol = gr.RedactHashed
+	case "none":
+		pol = gr.RedactNone
+	default:
+		return nil, fmt.Errorf("invalid --query-log-redact %q, want all, hashed, or none", redact)
+	}
+	var handler slog.Handler
+	switch format {
+	case "json", "":
+		handler = slog.NewJSONHandler(w, nil)
+	case "logfmt":
+		handler = slog.NewTextHandler(w, nil)
+	default:
+		return nil, fmt.Errorf("invalid --query-log-format %q, want json or logfmt", format)
+	}
+	return gr.NewQueryLog(slog.New(handler), lvl, pol, slow), nil
 }
 
 // boltAuthOptions builds the Bolt handler options that match the HTTP auth posture. With

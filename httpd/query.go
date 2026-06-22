@@ -68,20 +68,25 @@ func (s *server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.withTimeout(r.Context(), req.MaxExecutionTime)
 	defer cancel()
 
+	started := s.now()
 	res, release, err := s.run(ctx, req)
 	if err != nil {
 		status, ae := mapError(err)
 		s.writeError(w, status, ae)
+		s.recordQuery(r, req, started, queryStatus(err), err, 0, "")
 		return
 	}
 	defer release()
 
 	intAsString := wantStringInts(r)
+	var rows int
+	var rerr error
 	if wantStream(r) {
-		s.streamNDJSON(w, res, intAsString)
-		return
+		rows, rerr = s.streamNDJSON(w, res, intAsString)
+	} else {
+		rows, rerr = s.bufferedResponse(w, res, req.IncludeCounters, intAsString)
 	}
-	s.bufferedResponse(w, res, req.IncludeCounters, intAsString)
+	s.recordQuery(r, req, started, queryStatus(rerr), rerr, rows, "")
 }
 
 // run executes the request's statement under the requested access mode (doc 18 §9.2).
@@ -124,7 +129,7 @@ func (s *server) run(ctx context.Context, req queryRequest) (*gr.Result, func(),
 // drains the result into a values matrix, then writes the response; a streaming error
 // after the first byte cannot change the status code, so the buffered form is used
 // unless the client explicitly asks to stream.
-func (s *server) bufferedResponse(w http.ResponseWriter, res *gr.Result, includeCounters, intAsString bool) {
+func (s *server) bufferedResponse(w http.ResponseWriter, res *gr.Result, includeCounters, intAsString bool) (int, error) {
 	fields := res.Keys()
 	values := [][]any{}
 	for res.Next() {
@@ -138,7 +143,7 @@ func (s *server) bufferedResponse(w http.ResponseWriter, res *gr.Result, include
 	if err := res.Err(); err != nil {
 		status, ae := mapError(err)
 		s.writeError(w, status, ae)
-		return
+		return len(values), err
 	}
 	sum := res.Summary()
 	out := map[string]any{
@@ -153,6 +158,7 @@ func (s *server) bufferedResponse(w http.ResponseWriter, res *gr.Result, include
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
+	return len(values), nil
 }
 
 // streamNDJSON streams the result as newline-delimited JSON (doc 18 §9.6): a header
@@ -160,12 +166,13 @@ func (s *server) bufferedResponse(w http.ResponseWriter, res *gr.Result, include
 // result surfaces incrementally without buffering. Because the 200 status and the
 // header line are already written, a mid-stream error is reported as a final error
 // object rather than an HTTP status.
-func (s *server) streamNDJSON(w http.ResponseWriter, res *gr.Result, intAsString bool) {
+func (s *server) streamNDJSON(w http.ResponseWriter, res *gr.Result, intAsString bool) (int, error) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	enc := json.NewEncoder(w)
 	flusher, _ := w.(http.Flusher)
 	fields := res.Keys()
 	_ = enc.Encode(map[string]any{"header": map[string]any{"fields": fields}})
+	rows := 0
 	for res.Next() {
 		rec := res.Record().Values()
 		row := make([]any, len(rec))
@@ -173,6 +180,7 @@ func (s *server) streamNDJSON(w http.ResponseWriter, res *gr.Result, intAsString
 			row[i] = toJSON(v, intAsString)
 		}
 		_ = enc.Encode(map[string]any{"row": row})
+		rows++
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -180,7 +188,7 @@ func (s *server) streamNDJSON(w http.ResponseWriter, res *gr.Result, intAsString
 	if err := res.Err(); err != nil {
 		_, ae := mapError(err)
 		_ = enc.Encode(map[string]any{"error": ae})
-		return
+		return rows, err
 	}
 	sum := res.Summary()
 	_ = enc.Encode(map[string]any{"summary": map[string]any{
@@ -191,6 +199,7 @@ func (s *server) streamNDJSON(w http.ResponseWriter, res *gr.Result, intAsString
 	if flusher != nil {
 		flusher.Flush()
 	}
+	return rows, nil
 }
 
 // wantStream reports whether the client asked for NDJSON streaming (doc 18 §9.6),

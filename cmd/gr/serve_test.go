@@ -624,3 +624,53 @@ func TestServeHTTPTLSInvalidMode(t *testing.T) {
 		t.Errorf("code = %d, want exitUsage", code)
 	}
 }
+
+// TestBuildQueryLog confirms the level flag maps to a log or to nil, that an invalid value
+// is rejected, and that a constructed log writes a redacted entry in the chosen format.
+func TestBuildQueryLog(t *testing.T) {
+	// none yields a nil log.
+	ql, err := buildQueryLog(io.Discard, "none", "json", "all", 0)
+	if err != nil {
+		t.Fatalf("none: %v", err)
+	}
+	if ql != nil {
+		t.Errorf("none should yield a nil log, got %v", ql)
+	}
+
+	// An invalid level, format, and redaction are each rejected.
+	for _, bad := range []struct{ level, format, redact string }{
+		{"loud", "json", "all"},
+		{"all", "xml", "all"},
+		{"all", "json", "scramble"},
+	} {
+		if _, err := buildQueryLog(io.Discard, bad.level, bad.format, bad.redact, 0); err == nil {
+			t.Errorf("buildQueryLog(%+v) accepted an invalid flag", bad)
+		}
+	}
+
+	// A constructed log writes a JSON entry with the parameter value redacted.
+	var buf bytes.Buffer
+	ql, err = buildQueryLog(&buf, "all", "json", "all", time.Second)
+	if err != nil {
+		t.Fatalf("all: %v", err)
+	}
+	ql.Record(gr.QueryRecord{Cypher: "RETURN $x", Status: "ok", Params: map[string]any{"x": "secret"}})
+	out := buf.String()
+	if !strings.Contains(out, `"kind"`) && !strings.Contains(out, "RETURN $x") {
+		t.Errorf("log entry missing expected fields: %s", out)
+	}
+	if strings.Contains(out, "secret") {
+		t.Errorf("log leaked a parameter value: %s", out)
+	}
+
+	// logfmt format produces a non-JSON line.
+	buf.Reset()
+	ql, err = buildQueryLog(&buf, "all", "logfmt", "all", 0)
+	if err != nil {
+		t.Fatalf("logfmt: %v", err)
+	}
+	ql.Record(gr.QueryRecord{Cypher: "RETURN 1", Status: "ok"})
+	if line := buf.String(); !strings.Contains(line, "event=query") {
+		t.Errorf("logfmt entry missing event=query: %s", line)
+	}
+}

@@ -35,6 +35,8 @@ type server struct {
 	// limiter is the shared per-principal query rate limiter (doc 18 §8.8); nil leaves
 	// queries unlimited.
 	limiter *gr.RateLimiter
+	// qlog is the shared structured query log (doc 20 §10); nil records nothing.
+	qlog *gr.QueryLog
 	// impersonation enables the imp_user/impersonatedUser request field (doc 18 §10.5).
 	// It is off by default, so a deployment opts into impersonation explicitly.
 	impersonation bool
@@ -77,6 +79,11 @@ type Options struct {
 	// Retry-After hint. Pass the same limiter to the Bolt handler so the bound holds across
 	// both surfaces. Nil leaves the HTTP path unlimited.
 	RateLimiter *gr.RateLimiter
+	// QueryLog is the shared structured query log (doc 20 §10). When set, each executed
+	// query is recorded through it according to its level, slow threshold, and redaction
+	// policy. Pass the same log to the Bolt handler so both surfaces feed one stream. Nil
+	// records nothing.
+	QueryLog *gr.QueryLog
 	// now overrides the clock for tests; nil uses time.Now.
 	now func() time.Time
 }
@@ -107,7 +114,7 @@ func New(db *gr.DB, opts Options) *Server {
 	if clock == nil {
 		clock = time.Now
 	}
-	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics(), admission: opts.Admission, queryMaxTime: opts.QueryMaxTime, limiter: opts.RateLimiter, impersonation: opts.Impersonation}
+	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics(), admission: opts.Admission, queryMaxTime: opts.QueryMaxTime, limiter: opts.RateLimiter, qlog: opts.QueryLog, impersonation: opts.Impersonation}
 	if opts.Auth != nil {
 		ttl := opts.TokenCacheTTL
 		if ttl == 0 {

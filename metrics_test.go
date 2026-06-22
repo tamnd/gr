@@ -1088,6 +1088,45 @@ func TestMetricsVersionsResident(t *testing.T) {
 	}
 }
 
+func TestMetricsMvccGC(t *testing.T) {
+	db := openMem(t, "mxgc.gr")
+	defer db.Close()
+
+	// No GC has run yet, so the run counter and both reclaim series sit at zero.
+	base := db.Metrics()
+	if c := base.Counter("gr_mvcc_gc_runs_total", nil); c != 0 {
+		t.Fatalf("gc runs before any checkpoint = %d, want 0", c)
+	}
+	if c := base.Counter("gr_mvcc_gc_reclaimed_total", Labels{"element": "node"}); c != 0 {
+		t.Fatalf("node versions reclaimed before any GC = %d, want 0", c)
+	}
+
+	mustExec(t, db, "CREATE (:Counter {n: 0})", nil)
+	for i := 0; i < 15; i++ {
+		mustExec(t, db, "MATCH (c:Counter) SET c.n = c.n + 1", nil)
+	}
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+
+	snap := db.Metrics()
+	if c := snap.Counter("gr_mvcc_gc_runs_total", nil); c != 1 {
+		t.Fatalf("gc runs after one checkpoint = %d, want 1", c)
+	}
+	// The overwrites left node pre-images, which GC reclaimed once the watermark advanced.
+	if c := snap.Counter("gr_mvcc_gc_reclaimed_total", Labels{"element": "node"}); c == 0 {
+		t.Fatalf("node versions reclaimed = %d, want > 0", c)
+	}
+	// No relationship versions were created, so that series is present and zero.
+	if c := snap.Counter("gr_mvcc_gc_reclaimed_total", Labels{"element": "rel"}); c != 0 {
+		t.Fatalf("rel versions reclaimed = %d, want 0", c)
+	}
+
+	// A second checkpoint runs GC again, so the cumulative run counter advances.
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+	if c := db.Metrics().Counter("gr_mvcc_gc_runs_total", nil); c != 2 {
+		t.Fatalf("gc runs after a second checkpoint = %d, want 2", c)
+	}
+}
+
 func TestMetricsConstraintChecks(t *testing.T) {
 	db := openMem(t, "mxcons.gr")
 	defer db.Close()

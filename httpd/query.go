@@ -3,6 +3,7 @@ package httpd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -101,6 +102,12 @@ func (s *server) run(ctx context.Context, req queryRequest) (*gr.Result, func(),
 	// the query while it streams, not only at submission. A nil gate admits at once.
 	slot, err := s.admission.Acquire(ctx)
 	if err != nil {
+		// A shed query is an overload event an operator watches to decide whether to raise
+		// the in-flight bound (doc 20 §11.3). The queue depth is not tracked, so the event
+		// reports the in-flight count and the action; a nil event log makes this a no-op.
+		if errors.Is(err, gr.ErrOverloaded) {
+			s.elog.Overload(s.admission.InFlight(), 0, "shed")
+		}
 		return nil, nil, err
 	}
 	if strings.EqualFold(req.AccessMode, "READ") {

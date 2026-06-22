@@ -37,6 +37,10 @@ type server struct {
 	limiter *gr.RateLimiter
 	// qlog is the shared structured query log (doc 20 §10); nil records nothing.
 	qlog *gr.QueryLog
+	// elog is the shared structured event log (doc 20 §11); nil records nothing. The
+	// server emits auth_failure and overload through it; the rest of the taxonomy comes
+	// from the engine and the database.
+	elog *gr.EventLog
 	// impersonation enables the imp_user/impersonatedUser request field (doc 18 §10.5).
 	// It is off by default, so a deployment opts into impersonation explicitly.
 	impersonation bool
@@ -84,6 +88,11 @@ type Options struct {
 	// policy. Pass the same log to the Bolt handler so both surfaces feed one stream. Nil
 	// records nothing.
 	QueryLog *gr.QueryLog
+	// EventLog is the shared structured event log (doc 20 §11). When set, the server emits
+	// an auth_failure event for each rejected credential and an overload event when the
+	// admission gate sheds a query. Pass the same log used at Open so the lifecycle and the
+	// server events feed one stream. Nil records nothing.
+	EventLog *gr.EventLog
 	// now overrides the clock for tests; nil uses time.Now.
 	now func() time.Time
 }
@@ -114,7 +123,7 @@ func New(db *gr.DB, opts Options) *Server {
 	if clock == nil {
 		clock = time.Now
 	}
-	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics(), admission: opts.Admission, queryMaxTime: opts.QueryMaxTime, limiter: opts.RateLimiter, qlog: opts.QueryLog, impersonation: opts.Impersonation}
+	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics(), admission: opts.Admission, queryMaxTime: opts.QueryMaxTime, limiter: opts.RateLimiter, qlog: opts.QueryLog, elog: opts.EventLog, impersonation: opts.Impersonation}
 	if opts.Auth != nil {
 		ttl := opts.TokenCacheTTL
 		if ttl == 0 {
@@ -175,6 +184,16 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 			s.metrics.countAuth(authLocked)
 		default:
 			s.metrics.countAuth(authFailure)
+		}
+		// A rejected credential is an operational event an operator watches for a rising
+		// failure rate (doc 20 §11.3); the event names the claimed user, the client, and a
+		// non-disclosing reason. A nil event log makes this a no-op.
+		if fail != nil {
+			user := fail.user
+			if user == "" {
+				user = "anonymous"
+			}
+			s.elog.AuthFailure(user, clientAddr(r), fail.reason)
 		}
 	}
 	if fail != nil {

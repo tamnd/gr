@@ -46,6 +46,11 @@ type Tx struct {
 	etx   engine.Tx
 	write bool
 	done  bool
+	// session is set when the transaction was opened through Session.Begin, so that
+	// finishing the transaction (Commit or Rollback) clears the session's active flag
+	// and lets the session host its next transaction. It is nil for a transaction
+	// begun on the database directly or run inside a managed closure.
+	session *Session
 }
 
 // Begin opens an explicit transaction in the given access mode (doc 16 §6.3). The
@@ -73,6 +78,7 @@ func (tx *Tx) Commit() error {
 		return ErrTxnDone
 	}
 	tx.done = true
+	tx.releaseSession()
 	return tx.etx.Commit()
 }
 
@@ -85,7 +91,19 @@ func (tx *Tx) Rollback() error {
 		return nil
 	}
 	tx.done = true
+	tx.releaseSession()
 	return tx.etx.Abort()
+}
+
+// releaseSession clears the active flag of the session that opened this transaction
+// through Session.Begin, so the session can host its next transaction once this one
+// finishes. It is a no-op for a transaction begun on the database directly or inside
+// a managed closure, where the session has no flag to clear.
+func (tx *Tx) releaseSession() {
+	if tx.session != nil {
+		tx.session.active = false
+		tx.session = nil
+	}
 }
 
 // View runs fn inside a read transaction (doc 16 §6.2). It takes a snapshot at

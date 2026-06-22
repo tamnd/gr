@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/tamnd/gr"
@@ -56,6 +57,14 @@ func (s *shell) runDot(line string) {
 		s.dotCommit()
 	case ".rollback":
 		s.dotRollback()
+	case ".labels":
+		s.dotLabels()
+	case ".types":
+		s.dotTypes()
+	case ".indexes", ".index":
+		s.dotIndexes()
+	case ".schema":
+		s.dotSchema()
 	case ".databases":
 		s.dotDatabases()
 	case ".print":
@@ -81,6 +90,10 @@ func (s *shell) dotHelp() {
 .commit               Commit the open transaction
 .rollback             Discard the open transaction
 .open FILE            Close the current database and open FILE
+.labels               List the node labels
+.types                List the relationship types
+.indexes              List the schema indexes
+.schema               Show the labels, types, keys, and indexes
 .databases            Show the open database and its path
 .timer on|off         Show wall-clock timing after each statement
 .echo on|off          Echo each statement before running it
@@ -249,6 +262,104 @@ func (s *shell) dotRollback() {
 	}
 }
 
+// dotLabels prints the node labels the catalog holds, one per line in sorted order
+// (doc 17 §6.5). The listing goes to the data sink, so it can be piped.
+func (s *shell) dotLabels() {
+	names, err := s.db.Labels()
+	if err != nil {
+		s.reportListErr(err)
+		return
+	}
+	s.printNames(names)
+}
+
+// dotTypes prints the relationship types the catalog holds (doc 17 §6.5).
+func (s *shell) dotTypes() {
+	names, err := s.db.RelationshipTypes()
+	if err != nil {
+		s.reportListErr(err)
+		return
+	}
+	s.printNames(names)
+}
+
+// dotIndexes prints the schema indexes, one per line as name on label(props) (doc 17
+// §6.5).
+func (s *shell) dotIndexes() {
+	ixs, err := s.db.Indexes()
+	if err != nil {
+		s.reportListErr(err)
+		return
+	}
+	lines := make([]string, len(ixs))
+	for i, ix := range ixs {
+		lines[i] = fmt.Sprintf("%s on :%s(%s)", ix.Name, ix.Label, strings.Join(ix.Props, ", "))
+	}
+	sort.Strings(lines)
+	for _, l := range lines {
+		fmt.Fprintln(s.sink(), l)
+	}
+}
+
+// dotSchema prints a summary of the database schema: its labels, relationship types,
+// property keys, and indexes, each section labelled (doc 17 §6.5). It is the at-a-
+// glance view a session opens with, so it goes to the chatter channel like the other
+// descriptive commands.
+func (s *shell) dotSchema() {
+	labels, err := s.db.Labels()
+	if err != nil {
+		s.reportListErr(err)
+		return
+	}
+	types, err := s.db.RelationshipTypes()
+	if err != nil {
+		s.reportListErr(err)
+		return
+	}
+	keys, err := s.db.PropertyKeys()
+	if err != nil {
+		s.reportListErr(err)
+		return
+	}
+	ixs, err := s.db.Indexes()
+	if err != nil {
+		s.reportListErr(err)
+		return
+	}
+	section := func(title string, items []string) {
+		sorted := append([]string(nil), items...)
+		sort.Strings(sorted)
+		if len(sorted) == 0 {
+			fmt.Fprintf(s.errw, "%s: (none)\n", title)
+			return
+		}
+		fmt.Fprintf(s.errw, "%s: %s\n", title, strings.Join(sorted, ", "))
+	}
+	section("Labels", labels)
+	section("Relationship types", types)
+	section("Property keys", keys)
+	ixLines := make([]string, len(ixs))
+	for i, ix := range ixs {
+		ixLines[i] = fmt.Sprintf("%s on :%s(%s)", ix.Name, ix.Label, strings.Join(ix.Props, ", "))
+	}
+	section("Indexes", ixLines)
+}
+
+// printNames writes a sorted list of names to the data sink, one per line.
+func (s *shell) printNames(names []string) {
+	sorted := append([]string(nil), names...)
+	sort.Strings(sorted)
+	for _, n := range sorted {
+		fmt.Fprintln(s.sink(), n)
+	}
+}
+
+// reportListErr reports a schema-listing error and folds its code into the exit code.
+func (s *shell) reportListErr(err error) {
+	fmt.Fprintln(s.errw, "Error:", err)
+	s.code = worst(s.code, classify(err))
+}
+
 // dotDatabases prints the open database and its path (doc 17 §6.3).
 func (s *shell) dotDatabases() {
 	path := s.db.Path()
@@ -263,7 +374,8 @@ func suggestDot(cmd string) string {
 	known := []string{
 		".help", ".quit", ".exit", ".version", ".mode", ".headers", ".timer",
 		".echo", ".nullvalue", ".separator", ".output", ".once", ".read",
-		".begin", ".commit", ".rollback", ".open", ".databases", ".print",
+		".begin", ".commit", ".rollback", ".open", ".labels", ".types",
+		".indexes", ".schema", ".databases", ".print",
 	}
 	for _, k := range known {
 		if near(cmd, k) {

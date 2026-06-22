@@ -230,6 +230,63 @@ func (e *DiskEngine) TokenName(kind catalog.Kind, t Token) (string, bool) {
 	return e.cat.Name(kind, uint32(t-1))
 }
 
+// IndexInfo describes a schema index with its label and property names resolved from
+// the catalog dictionaries, so a caller listing the schema does not need the raw
+// tokens (doc 07; doc 17 §6.5).
+type IndexInfo struct {
+	Name  string
+	Label string
+	Props []string
+}
+
+// tokenNames returns every interned name in a dictionary, in token order. The catalog
+// is append-only, so this is the full set of labels, relationship types, or property
+// keys the database has ever seen. The caller holds no lock; this takes the read lock.
+func (e *DiskEngine) tokenNames(kind catalog.Kind) []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	n := e.cat.Count(kind)
+	out := make([]string, 0, n)
+	for t := range n {
+		if name, ok := e.cat.Name(kind, uint32(t)); ok {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// Labels returns every node label the catalog holds (doc 17 §6.5).
+func (e *DiskEngine) Labels() []string { return e.tokenNames(catalog.KindLabel) }
+
+// RelationshipTypes returns every relationship type the catalog holds (doc 17 §6.5).
+func (e *DiskEngine) RelationshipTypes() []string { return e.tokenNames(catalog.KindRelType) }
+
+// PropertyKeys returns every property key the catalog holds (doc 17 §6.5).
+func (e *DiskEngine) PropertyKeys() []string { return e.tokenNames(catalog.KindPropKey) }
+
+// IndexInfos returns the schema indexes with their label and property names resolved
+// (doc 17 §6.5). An index whose label or property token is missing from the catalog
+// (which should not happen) is reported with an empty name in that position rather
+// than dropped.
+func (e *DiskEngine) IndexInfos() []IndexInfo {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	ixs := e.cat.Indexes()
+	out := make([]IndexInfo, 0, len(ixs))
+	for _, ix := range ixs {
+		info := IndexInfo{Name: ix.Name}
+		if name, ok := e.cat.Name(catalog.KindLabel, ix.Label); ok {
+			info.Label = name
+		}
+		for _, p := range ix.Props {
+			name, _ := e.cat.Name(catalog.KindPropKey, p)
+			info.Props = append(info.Props, name)
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
 // CatalogVersion returns a monotonic version of the catalog: the total number of
 // interned names across the label, type, and property-key dictionaries. The
 // catalog is append-only (names are interned, never removed), so any schema

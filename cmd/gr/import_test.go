@@ -156,6 +156,80 @@ func TestDotImport(t *testing.T) {
 	}
 }
 
+// TestImportRelationships confirms gr import loads a CSV as relationships between nodes
+// matched on their id property (doc 17 §6.10, doc 19 §7.3). A row whose endpoint is not
+// found is counted as dangling and skipped, not an error.
+func TestImportRelationships(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "g.gr")
+	nodes := writeCSV(t, dir, "nodes.csv", "id,name\n1,Ada\n2,Lin\n")
+	rels := writeCSV(t, dir, "rels.csv", "from,to,since\n1,2,2019\n1,9,2020\n")
+
+	if _, _, code := runCLI(t, []string{"import", db, nodes, "--as", "Person", "--id-col", "id"}, ""); code != exitOK {
+		t.Fatalf("node import: code=%d", code)
+	}
+	_, errb, code := runCLI(t, []string{"import", db, rels, "--as-rel", "KNOWS",
+		"--from", "Person:from", "--to", "Person:to", "--id-col", "id", "--type", "since:INTEGER"}, "")
+	if code != exitOK {
+		t.Fatalf("rel import: code=%d stderr=%q", code, errb)
+	}
+	if !strings.Contains(errb, "imported 1 relationships") || !strings.Contains(errb, "1 rows skipped") {
+		t.Errorf("summary = %q", errb)
+	}
+	out, _, _ := runCLI(t, []string{db, "--mode", "jsonl", "-c",
+		"MATCH (:Person {name:'Ada'})-[r:KNOWS]->(:Person {name:'Lin'}) RETURN r.since AS since"}, "")
+	if !strings.Contains(out, `"since":2019`) {
+		t.Errorf("relationship or its property not imported: %s", out)
+	}
+}
+
+// TestImportRelMerge confirms --merge on a relationship import does not duplicate an
+// edge that already exists between the same endpoints.
+func TestImportRelMerge(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "g.gr")
+	nodes := writeCSV(t, dir, "nodes.csv", "id\n1\n2\n")
+	rels := writeCSV(t, dir, "rels.csv", "from,to\n1,2\n1,2\n")
+
+	if _, _, code := runCLI(t, []string{"import", db, nodes, "--as", "Person", "--id-col", "id"}, ""); code != exitOK {
+		t.Fatalf("node import: code=%d", code)
+	}
+	if _, _, code := runCLI(t, []string{"import", db, rels, "--as-rel", "KNOWS",
+		"--from", "Person:from", "--to", "Person:to", "--id-col", "id", "--merge"}, ""); code != exitOK {
+		t.Fatalf("rel import: code=%d", code)
+	}
+	out, _, _ := runCLI(t, []string{db, "--mode", "jsonl", "-c", "MATCH ()-[r:KNOWS]->() RETURN count(r) AS c"}, "")
+	if !strings.Contains(out, `"c":1`) {
+		t.Errorf("merge duplicated the relationship: %s", out)
+	}
+}
+
+// TestImportRelDistinctKeys confirms --from-key and --to-key match endpoints in
+// different node sets keyed on different properties (doc 19 §7.3, the multi-space case).
+func TestImportRelDistinctKeys(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "g.gr")
+	people := writeCSV(t, dir, "people.csv", "pid,name\n1,Ada\n")
+	movies := writeCSV(t, dir, "movies.csv", "mid,title\n1,Solaris\n")
+	rels := writeCSV(t, dir, "rated.csv", "person,movie,stars\n1,1,5\n")
+
+	if _, _, code := runCLI(t, []string{"import", db, people, "--as", "Person", "--id-col", "pid"}, ""); code != exitOK {
+		t.Fatalf("people: code=%d", code)
+	}
+	if _, _, code := runCLI(t, []string{"import", db, movies, "--as", "Movie", "--id-col", "mid"}, ""); code != exitOK {
+		t.Fatalf("movies: code=%d", code)
+	}
+	if _, _, code := runCLI(t, []string{"import", db, rels, "--as-rel", "RATED",
+		"--from", "Person:person", "--to", "Movie:movie", "--from-key", "pid", "--to-key", "mid", "--type", "stars:INTEGER"}, ""); code != exitOK {
+		t.Fatalf("rel import: code=%d", code)
+	}
+	out, _, _ := runCLI(t, []string{db, "--mode", "jsonl", "-c",
+		"MATCH (:Person {name:'Ada'})-[r:RATED]->(:Movie {title:'Solaris'}) RETURN r.stars AS stars"}, "")
+	if !strings.Contains(out, `"stars":5`) {
+		t.Errorf("cross-label relationship not imported: %s", out)
+	}
+}
+
 // TestImportArgs confirms the import argument checks.
 func TestImportArgs(t *testing.T) {
 	dir := t.TempDir()
@@ -164,12 +238,15 @@ func TestImportArgs(t *testing.T) {
 	pq := writeCSV(t, dir, "data.parquet", "x")
 
 	cases := [][]string{
-		{"import", db, csv},                                  // no --as
-		{"import", db, "--as", "Person"},                     // no file
-		{"import", db, csv, "--as", "Person", "--merge"},     // --merge without --id-col
-		{"import", db, csv, "--as-rel", "KNOWS", "--from", "p:a", "--to", "p:b"}, // rel not supported
-		{"import", db, pq, "--as", "Movie"},                  // parquet not supported
-		{"import", db, csv, "--as", "Person", "--bogus"},     // unknown flag
+		{"import", db, csv},                                                       // no --as
+		{"import", db, "--as", "Person"},                                         // no file
+		{"import", db, csv, "--as", "Person", "--merge"},                         // --merge without --id-col
+		{"import", db, pq, "--as", "Movie"},                                      // parquet not supported
+		{"import", db, csv, "--as", "Person", "--bogus"},                         // unknown flag
+		{"import", db, csv, "--as-rel", "KNOWS"},                                 // rel without --from/--to
+		{"import", db, csv, "--from", "P:a", "--to", "P:b"},                      // endpoints without --as-rel
+		{"import", db, csv, "--as", "P", "--as-rel", "KNOWS", "--from", "P:a", "--to", "P:b"}, // both node and rel
+		{"import", db, csv, "--as-rel", "KNOWS", "--from", "bad", "--to", "P:b"}, // --from missing LABEL:COL
 	}
 	for i, args := range cases {
 		if _, _, code := runCLI(t, args, ""); code != exitUsage {

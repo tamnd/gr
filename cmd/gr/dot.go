@@ -115,8 +115,9 @@ func (s *shell) dotHelp() {
 .dump [FILE]          Write a Cypher dump of the database (--schema-only,
                       --data-only); no FILE writes to the output sink
 .load FILE            Replay a Cypher dump into the database
-.import FILE OPTS     Import CSV/TSV rows as nodes (--as LABEL, --id-col,
-                      --type COL:TYPE, --merge, --no-header)
+.import FILE OPTS     Import CSV/TSV rows as nodes (--as LABEL) or as
+                      relationships (--as-rel TYPE --from L:COL --to L:COL);
+                      --id-col, --type COL:TYPE, --merge, --no-header
 .export OPTS          Export nodes, relationships, or a query to CSV/TSV
                       (--nodes L | --rels T | --query Q) --to FILE
 .backup FILE          Write a consistent physical backup to FILE

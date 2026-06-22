@@ -6,11 +6,21 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/tamnd/gr"
 	"github.com/tamnd/gr/httpd"
 	"github.com/tamnd/gr/vfs"
 )
+
+// userList collects repeated --user name:password flags.
+type userList []string
+
+func (u *userList) String() string { return strings.Join(*u, ",") }
+func (u *userList) Set(v string) error {
+	*u = append(*u, v)
+	return nil
+}
 
 // defaultServeAddr is the address gr serve binds when none is given (doc 18 §9.7).
 // 7474 is the Neo4j HTTP port, so a tool pointed at the usual port finds the server.
@@ -29,6 +39,8 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	addr := fs.String("addr", defaultServeAddr, "address to listen on")
 	name := fs.String("name", "neo4j", "database name in the URL path")
 	readonly := fs.Bool("readonly", false, "open the database read-only")
+	var users userList
+	fs.Var(&users, "user", "name:password for HTTP auth (repeatable); none means auth is off")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: gr serve [flags] [database]")
 		fmt.Fprintln(stderr)
@@ -49,8 +61,16 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	}
 	defer func() { _ = db.Close() }()
 
-	h := httpd.Handler(db, httpd.Options{Name: *name})
+	auth, err := buildAuth(users)
+	if err != nil {
+		fmt.Fprintln(stderr, "gr:", err)
+		return exitUsage
+	}
+	h := httpd.Handler(db, httpd.Options{Name: *name, Auth: auth})
 	fmt.Fprintf(stderr, "gr serving %s on %s (database %q)\n", describeDB(path), *addr, *name)
+	if auth == nil {
+		fmt.Fprintln(stderr, "gr: WARNING authentication is off, every request is anonymous; pass --user to require auth")
+	}
 	if err := listen(*addr, h); err != nil {
 		fmt.Fprintln(stderr, "gr:", err)
 		return exitIO
@@ -68,6 +88,27 @@ func openServeDB(path string, readonly bool) (*gr.DB, error) {
 		return nil, fmt.Errorf("cannot open a read-only database that does not exist: %s", path)
 	}
 	return gr.Open(path, gr.Options{ReadOnly: readonly})
+}
+
+// buildAuth turns the --user flags into a credential provider, or returns nil when no
+// users were given so authentication is off. Each user gets the admin role, since the
+// fine-grained role model is enforced in a later slice; a name:password without a colon
+// is a usage error.
+func buildAuth(users userList) (httpd.AuthProvider, error) {
+	if len(users) == 0 {
+		return nil, nil
+	}
+	p := httpd.NewStaticProvider()
+	for _, u := range users {
+		name, pass, ok := strings.Cut(u, ":")
+		if !ok || name == "" {
+			return nil, fmt.Errorf("invalid --user %q, want name:password", u)
+		}
+		if err := p.AddUser(name, pass, "admin"); err != nil {
+			return nil, err
+		}
+	}
+	return p, nil
 }
 
 // describeDB names the database for the startup banner.

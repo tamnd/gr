@@ -23,6 +23,7 @@ type server struct {
 	txns      *txStore
 	now       func() time.Time
 	txTimeout time.Duration
+	auth      AuthProvider
 }
 
 // Options configures the handler.
@@ -33,6 +34,9 @@ type Options struct {
 	// TxTimeout bounds how long a server-side HTTP transaction may sit idle between
 	// requests before it is reaped. Zero uses defaultTxTimeout.
 	TxTimeout time.Duration
+	// Auth verifies credentials per request. Nil disables authentication, so every
+	// request is anonymous; set it (for example to a StaticProvider) to require auth.
+	Auth AuthProvider
 	// now overrides the clock for tests; nil uses time.Now.
 	now func() time.Time
 }
@@ -55,7 +59,7 @@ func Handler(db *gr.DB, opts Options) http.Handler {
 	if clock == nil {
 		clock = time.Now
 	}
-	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout}
+	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
@@ -76,6 +80,14 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// The data endpoints are authenticated; discovery and the health probes above are
+	// not, so a load balancer or an operator can probe liveness without a credential.
+	princ, fail := s.authenticate(r)
+	if fail != nil {
+		s.writeAuthError(w, fail)
+		return
+	}
+	r = r.WithContext(withPrincipal(r.Context(), princ))
 	if name != s.name && name != "data" {
 		s.writeError(w, http.StatusNotFound, apiError{
 			Code:    "Neo.ClientError.Database.DatabaseNotFound",

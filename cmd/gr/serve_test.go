@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -50,6 +51,48 @@ func TestServeDefaultAddr(t *testing.T) {
 	}
 	if gotAddr != defaultServeAddr {
 		t.Errorf("addr = %q, want %q", gotAddr, defaultServeAddr)
+	}
+}
+
+// TestServeWithAuth confirms --user wires a credential provider into the handler, so a
+// request without credentials is rejected and one with them succeeds.
+func TestServeWithAuth(t *testing.T) {
+	var h http.Handler
+	listen := func(addr string, handler http.Handler) error {
+		h = handler
+		req := httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2",
+			strings.NewReader(`{"statement":"RETURN 1 AS n"}`))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("no-credential query = %d, want 401", rec.Code)
+		}
+
+		req = httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2",
+			strings.NewReader(`{"statement":"RETURN 1 AS n"}`))
+		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("alice:secret")))
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("credentialed query = %d, want 200, body = %s", rec.Code, rec.Body.String())
+		}
+		return nil
+	}
+	var out, errw bytes.Buffer
+	if code := runServe([]string{"--user", "alice:secret"}, &out, &errw, listen); code != exitOK {
+		t.Fatalf("code = %d, stderr = %s", code, errw.String())
+	}
+	if h == nil {
+		t.Fatal("handler not built")
+	}
+}
+
+// TestServeBadUser rejects a malformed --user as a usage error.
+func TestServeBadUser(t *testing.T) {
+	listen := func(addr string, h http.Handler) error { return nil }
+	var out, errw bytes.Buffer
+	if code := runServe([]string{"--user", "nopassword"}, &out, &errw, listen); code != exitUsage {
+		t.Errorf("code = %d, want exitUsage", code)
 	}
 }
 

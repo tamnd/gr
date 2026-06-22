@@ -377,10 +377,11 @@ func decodeBody(r *http.Request, v any) error {
 	return nil
 }
 
-// principal returns the authenticated principal for a request (doc 18 §9.9). Auth is a
-// later slice, so every request maps to the empty principal for now; the ownership
-// check is in place and becomes meaningful once auth lands.
-func principal(r *http.Request) string { return "" }
+// principal returns the authenticated principal's name for a request (doc 18 §9.9),
+// which scopes transaction ownership. With authentication off every request is the
+// anonymous principal (the empty name), so the ownership check is a no-op; with auth on
+// it is the authenticated user, so one user cannot touch another's transaction.
+func principal(r *http.Request) string { return principalFrom(r.Context()).Name }
 
 // formatExpiry formats a transaction expiry for the response (doc 18 §9.5).
 func formatExpiry(t time.Time) string { return t.UTC().Format(time.RFC3339) }

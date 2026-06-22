@@ -63,6 +63,63 @@ func TestExportRelsCSV(t *testing.T) {
 	}
 }
 
+// TestExportRelsRelink confirms --from-property/--to-property emit endpoint properties
+// in the _start/_end columns instead of opaque element ids (doc 19 §7.3).
+func TestExportRelsRelink(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.gr")
+	out := filepath.Join(dir, "knows.csv")
+	seedDB(t, src)
+
+	if _, errb, code := runCLI(t, []string{"export", src, "--rels", "KNOWS",
+		"--from-property", "name", "--to-property", "name", "--to", out}, ""); code != exitOK {
+		t.Fatalf("export: code=%d stderr=%q", code, errb)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if lines[0] != "_start,_end,since" {
+		t.Errorf("header = %q", lines[0])
+	}
+	if lines[1] != "Ada,Lin,2019" {
+		t.Errorf("relink row = %q, want Ada,Lin,2019", lines[1])
+	}
+}
+
+// TestExportImportRelinkRoundTrip confirms a node export plus a relink relationship
+// export re-import to an equivalent graph through the CLI (doc 19 §7.3): the full
+// node-and-relationship round trip these commands are meant to support.
+func TestExportImportRelinkRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.gr")
+	dst := filepath.Join(dir, "dst.gr")
+	nodes := filepath.Join(dir, "nodes.csv")
+	rels := filepath.Join(dir, "rels.csv")
+	seedDB(t, src)
+
+	if _, _, code := runCLI(t, []string{"export", src, "--nodes", "Person", "--to", nodes}, ""); code != exitOK {
+		t.Fatalf("export nodes: code=%d", code)
+	}
+	if _, _, code := runCLI(t, []string{"export", src, "--rels", "KNOWS",
+		"--from-property", "name", "--to-property", "name", "--to", rels}, ""); code != exitOK {
+		t.Fatalf("export rels: code=%d", code)
+	}
+	if _, _, code := runCLI(t, []string{"import", dst, nodes, "--as", "Person", "--id-col", "name"}, ""); code != exitOK {
+		t.Fatalf("import nodes: code=%d", code)
+	}
+	if _, _, code := runCLI(t, []string{"import", dst, rels, "--as-rel", "KNOWS",
+		"--from", "Person:_start", "--to", "Person:_end", "--id-col", "name", "--type", "since:INTEGER"}, ""); code != exitOK {
+		t.Fatalf("import rels: code=%d", code)
+	}
+	out, _, _ := runCLI(t, []string{dst, "--mode", "jsonl", "-c",
+		"MATCH (:Person {name:'Ada'})-[r:KNOWS]->(:Person {name:'Lin'}) RETURN r.since AS since"}, "")
+	if !strings.Contains(out, `"since":2019`) {
+		t.Errorf("round trip lost the KNOWS edge: %s", out)
+	}
+}
+
 // TestExportQueryCSV confirms gr export --query writes the query result with the query's
 // own column names (doc 17 §6.11).
 func TestExportQueryCSV(t *testing.T) {
@@ -177,10 +234,11 @@ func TestExportArgs(t *testing.T) {
 	seedDB(t, src)
 
 	cases := [][]string{
-		{"export", src, "--to", out},                                  // no selector
-		{"export", src, "--nodes", "Person"},                          // no --to
+		{"export", src, "--to", out},         // no selector
+		{"export", src, "--nodes", "Person"}, // no --to
 		{"export", src, "--nodes", "Person", "--query", "MATCH (n) RETURN n", "--to", out}, // both
-		{"export", src, "--nodes", "Person", "--to", out, "--bogus"},  // unknown flag
+		{"export", src, "--nodes", "Person", "--to", out, "--bogus"},                       // unknown flag
+		{"export", src, "--nodes", "Person", "--to", out, "--from-property", "name"},       // relink on nodes
 	}
 	for i, args := range cases {
 		if _, _, code := runCLI(t, args, ""); code != exitUsage {

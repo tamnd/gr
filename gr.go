@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/bind"
@@ -101,6 +102,11 @@ type DB struct {
 	// rest of the taxonomy. A nil log is disabled, the embedded default, so every emit
 	// site calls it without a guard. It is set at Open and read for the close event.
 	events *EventLog
+
+	// metrics is the database's metric registry and the pre-resolved query-metric handles
+	// (doc 20 §3.1). It is always built at Open, so db.Metrics never returns nil and the
+	// always-on collection runs whether or not a query log or event log is configured.
+	metrics *queryMetrics
 
 	// lazyProps is the open-time default for property materialization (doc 16 §10.6):
 	// false (the default) materializes a graph object's properties eagerly when its
@@ -198,6 +204,7 @@ func Open(path string, opt Options) (*DB, error) {
 		lazyProps:   opt.LazyProperties,
 		readOnly:    opt.ReadOnly,
 		events:      opt.EventLog,
+		metrics:     newQueryMetrics(),
 	}
 	// The open event reports the file's real geometry and whether this open recovered a
 	// committed WAL prefix after a crash (doc 20 §11.3). StorageInfo reads the header the
@@ -457,7 +464,13 @@ func countRows(tx *Tx, cypher string) (int, error) {
 // the read path treats as the schema-optional empty result rather than an error
 // (doc 08 §5.3).
 func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, error) {
-	return db.query(cypher, params, db.lazyDefault())
+	// Query is the read-only entry, so its kind is always read (a write fails with
+	// ErrReadQuery and counts as a read error). It does not route through Run, so it
+	// records its own query metrics here (doc 20 §3.1).
+	start := time.Now()
+	db.metrics.begin("read")
+	res, err := db.query(cypher, params, db.lazyDefault())
+	return db.measureQuery("read", start, res, err)
 }
 
 // query is the body of Query with the resolved property-materialization mode threaded
@@ -593,6 +606,20 @@ func (db *DB) Run(ctx context.Context, cypher string, params Params, opts ...Run
 	if err != nil {
 		return nil, err
 	}
+	// The query metrics (doc 20 §3.1) wrap the dispatch: begin raises the in-flight gauge,
+	// runDispatch executes, and measureQuery records the outcome and latency, recording an
+	// eager result now and deferring a streaming read to its Close.
+	kind := metricQueryKind(q)
+	start := time.Now()
+	db.metrics.begin(kind)
+	res, err := db.runDispatch(q, cypher, vals, cfg)
+	return db.measureQuery(kind, start, res, err)
+}
+
+// runDispatch routes a parsed statement to its execution path, the body of Run with the
+// metric instrumentation lifted out so the throughput, latency, and in-flight metrics record
+// once around the whole dispatch (doc 20 §3.1).
+func (db *DB) runDispatch(q *ast.Query, cypher string, vals map[string]value.Value, cfg runConfig) (*Result, error) {
 	if q.Explain {
 		return db.explain(q, db.eng, indexLookup{db.eng}, engineStats{db.eng})
 	}
@@ -1269,6 +1296,16 @@ type Result struct {
 	// the database/sql.Rows-style streaming state (doc 16 §8.2).
 	curRow eval.Row
 	err    error
+
+	// mdb, mkind, and mstart carry the deferred query-metric recording for a streaming
+	// read (doc 20 §3.1): a read's end-to-end latency ends when the caller drains and
+	// closes the result, so measureQuery stamps these and Close records the outcome and
+	// the duration since mstart. mdb is nil for an eager result, which records at dispatch.
+	// mdone guards the one-shot recording so a second Close does not double-count.
+	mdb    *DB
+	mkind  string
+	mstart time.Time
+	mdone  bool
 }
 
 // Columns returns the result's output column names in order. It is the same column
@@ -1368,6 +1405,13 @@ func (r *Result) Close() error {
 		terr = r.tx.Abort()
 	}
 	r.cursor, r.tx = nil, nil
+	// A streaming read records its query metrics here, where its parse-through-last-row
+	// latency actually ends (doc 20 §3.1). The status follows whether the stream errored.
+	// mdone makes this fire once, so Close is still safe to call more than once.
+	if r.mdb != nil && !r.mdone {
+		r.mdone = true
+		r.mdb.metrics.finish(r.mkind, metricStatusOf(r.err), time.Since(r.mstart))
+	}
 	if cerr != nil {
 		return cerr
 	}

@@ -1,0 +1,192 @@
+package gr
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/tamnd/gr/ast"
+	"github.com/tamnd/gr/metric"
+)
+
+// Labels is a metric's bounded label set (doc 20 §7.2), re-exported from the metric package
+// so an embedder names a series without importing the low-level package: db.Metrics().Counter(
+// "gr_queries_total", gr.Labels{"status": "ok", "kind": "read"}).
+type Labels = metric.Labels
+
+// MetricsSnapshot is an immutable, point-in-time copy of the whole metric registry (doc 20
+// §7.3), what db.Metrics returns. Its Counter, Gauge, and Histogram lookups and its HitRate,
+// Quantile, and Rate derivations read the same numbers the Prometheus and expvar surfaces
+// render, so a test asserts on the value an operator will see.
+type MetricsSnapshot = metric.Snapshot
+
+// MetricSnapshot is one series in a snapshot: its name, type, help, unit, labels, and value.
+type MetricSnapshot = metric.MetricSnapshot
+
+// HistogramValue is an immutable view of a histogram (doc 20 §7.3), with Quantile and Mean
+// derived off its buckets.
+type HistogramValue = metric.HistogramValue
+
+// MetricType is a metric's kind: counter, gauge, or histogram (doc 20 §2.2).
+type MetricType = metric.Type
+
+// The three metric types (doc 20 §2.2), re-exported so a caller switches on a snapshot's
+// MetricSnapshot.Type without importing the metric package.
+const (
+	MetricCounter   = metric.TypeCounter
+	MetricGauge     = metric.TypeGauge
+	MetricHistogram = metric.TypeHistogram
+)
+
+// Metrics returns a snapshot of the database's metric registry (doc 20 §7.3): every counter,
+// gauge, and histogram a subsystem has registered, read at this instant. It is the
+// programmatic exposition surface, the one the CLI's .metrics command and a test read; the
+// server renders the same registry as Prometheus text and expvar JSON.
+func (db *DB) Metrics() MetricsSnapshot {
+	return db.metrics.reg.Snapshot()
+}
+
+// queryLatencyBuckets is the bucket layout for gr_query_duration_seconds and the other query
+// latency histograms (doc 20 §2.5): exponential from a hundred microseconds to ten seconds,
+// several buckets per decade, so the p99 and p999 in the millisecond-to-second range an
+// operator watches are well resolved. The +Inf catch-all is added by the histogram itself.
+var queryLatencyBuckets = []float64{
+	0.0001, 0.00025, 0.0005,
+	0.001, 0.0025, 0.005,
+	0.01, 0.025, 0.05,
+	0.1, 0.25, 0.5,
+	1, 2.5, 5, 10,
+}
+
+// metricQueryKinds is the bounded domain of the kind label on the query metrics (doc 20 §3.1,
+// §7.2): the statement classes a query falls into. The handles for every kind are pre-resolved
+// at open so recording one is a map read and an atomic add, never a registry lock.
+var metricQueryKinds = []string{"read", "write", "schema", "admin", "pragma", "explain"}
+
+// metricQueryStatuses is the bounded domain of the status label on gr_queries_total (doc 20
+// §3.1): the outcomes a query ends in.
+var metricQueryStatuses = []string{"ok", "error", "timeout", "killed"}
+
+// queryMetrics holds the pre-resolved handles for the query throughput, latency, and in-flight
+// metrics (doc 20 §3.1). Resolving every (kind, status) handle once at open keeps the record
+// path off the registry lock: recording a finished query is a couple of map reads and an
+// atomic add on a handle, the allocation-free, lock-free hot path (doc 20 §7.4).
+type queryMetrics struct {
+	reg      *metric.Registry
+	total    map[string]map[string]*metric.Counter // gr_queries_total by [kind][status]
+	duration map[string]*metric.Histogram          // gr_query_duration_seconds by [kind]
+	inflight map[string]*metric.Gauge              // gr_query_inflight by [kind]
+}
+
+// newQueryMetrics builds the registry and pre-resolves every query-metric handle (doc 20
+// §3.1). It is called once at Open, so the database always has a live registry and db.Metrics
+// never returns nil.
+func newQueryMetrics() *queryMetrics {
+	reg := metric.NewRegistry()
+	m := &queryMetrics{
+		reg:      reg,
+		total:    make(map[string]map[string]*metric.Counter, len(metricQueryKinds)),
+		duration: make(map[string]*metric.Histogram, len(metricQueryKinds)),
+		inflight: make(map[string]*metric.Gauge, len(metricQueryKinds)),
+	}
+	for _, k := range metricQueryKinds {
+		byStatus := make(map[string]*metric.Counter, len(metricQueryStatuses))
+		for _, s := range metricQueryStatuses {
+			byStatus[s] = reg.Counter("gr_queries_total",
+				"Cypher queries executed, by kind and status", "queries",
+				metric.Labels{"kind": k, "status": s})
+		}
+		m.total[k] = byStatus
+		m.duration[k] = reg.Histogram("gr_query_duration_seconds",
+			"End-to-end query latency, parse through last result row", "seconds",
+			queryLatencyBuckets, metric.Labels{"kind": k})
+		m.inflight[k] = reg.Gauge("gr_query_inflight",
+			"Currently executing queries, by kind", "queries",
+			metric.Labels{"kind": k})
+	}
+	return m
+}
+
+// begin records that a query of the given kind started, raising the in-flight gauge (doc 20
+// §3.1). Every begin is paired with one finish, which lowers the gauge again, so the gauge is
+// the count of queries executing right now.
+func (m *queryMetrics) begin(kind string) {
+	if g := m.inflight[kind]; g != nil {
+		g.Inc()
+	}
+}
+
+// finish records that a query of the given kind ended with the given status after d (doc 20
+// §3.1): it lowers the in-flight gauge, increments the outcome counter, and observes the
+// latency. It is the single completion point both the eager paths and the streaming read path
+// call, so the throughput, the outcome split, and the latency distribution stay consistent.
+func (m *queryMetrics) finish(kind, status string, d time.Duration) {
+	if g := m.inflight[kind]; g != nil {
+		g.Dec()
+	}
+	if byStatus := m.total[kind]; byStatus != nil {
+		if c := byStatus[status]; c != nil {
+			c.Inc()
+		}
+	}
+	if h := m.duration[kind]; h != nil {
+		h.Observe(d.Seconds())
+	}
+}
+
+// metricQueryKind classifies a parsed statement into its query-metric kind label (doc 20
+// §3.1): EXPLAIN is its own kind (it never executes the underlying statement), then admin,
+// pragma, and schema by their clause, then a statement with write clauses is a write and the
+// rest are reads. PROFILE is not yet a distinct statement form, so it is not split out here.
+func metricQueryKind(q *ast.Query) string {
+	switch {
+	case q.Explain:
+		return "explain"
+	case q.Admin != nil:
+		return "admin"
+	case q.Pragma != nil:
+		return "pragma"
+	case q.Schema != nil:
+		return "schema"
+	case queryHasWrites(q):
+		return "write"
+	default:
+		return "read"
+	}
+}
+
+// metricStatusOf maps a query's outcome error to its status label (doc 20 §3.1): no error is
+// ok, a cancelled or timed-out context is timeout (so the deadline tail is distinguishable
+// from a genuine failure), and any other error is a plain error. The killed status waits on
+// the query-kill path that produces it.
+func metricStatusOf(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return "timeout"
+	default:
+		return "error"
+	}
+}
+
+// measureQuery records the query metrics for one statement at a dispatch boundary (doc 20
+// §3.1). begin must already have raised the in-flight gauge for kind. An error or an eagerly
+// executed result (a write, a schema or admin command, a pragma, an EXPLAIN) is complete now,
+// so it records immediately; a streaming read is not finished until the caller drains and
+// closes it, so it carries the recording on the result and fires it once at Close, which is
+// where the parse-through-last-row latency actually ends.
+func (db *DB) measureQuery(kind string, start time.Time, res *Result, err error) (*Result, error) {
+	if err != nil {
+		db.metrics.finish(kind, metricStatusOf(err), time.Since(start))
+		return res, err
+	}
+	if res != nil && res.cursor != nil {
+		res.mdb = db
+		res.mkind = kind
+		res.mstart = start
+		return res, nil
+	}
+	db.metrics.finish(kind, "ok", time.Since(start))
+	return res, nil
+}

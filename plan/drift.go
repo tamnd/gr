@@ -53,6 +53,7 @@ func collectStats(o Op, st Statistics, snap *StatsSnapshot) {
 		recordLabels(x.Rest, st, snap)
 	case *Expand:
 		recordTypes(x.Types, st, snap)
+		recordLabels(x.FromLabels, st, snap)
 		recordLabels(x.ToLabels, st, snap)
 	case *Intersect:
 		recordTypes(x.Legs[0].Types, st, snap)

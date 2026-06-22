@@ -122,7 +122,7 @@ func (bd *builder) path(pp *ast.PathPattern, cur Op, bound map[string]bool) Op {
 	}
 	start := bd.nodeName(pp.Start)
 	cur = bd.joinNode(cur, pp.Start, start, bound)
-	cur = bd.expandChain(cur, start, pp.Chain, bound)
+	cur = bd.expandChain(cur, start, bd.b.NodeLabels(pp.Start), pp.Chain, bound)
 	if pp.Var != "" {
 		cur = &BindPath{Input: cur, Var: pp.Var, Elems: bd.pathElems(pp)}
 	}
@@ -247,25 +247,28 @@ func (bd *builder) mergeMatch(pp *ast.PathPattern, outer map[string]bool) Op {
 	}
 	cur = withPropFilters(cur, start, pp.Start.Properties)
 	prev := start
+	prevLabels := bd.b.NodeLabels(pp.Start)
 	for _, step := range pp.Chain {
 		rel := bd.relName(step.Rel)
 		to := bd.nodeName(step.Node)
 		ex := &Expand{
-			Input:    cur,
-			From:     prev,
-			Rel:      rel,
-			To:       to,
-			Types:    bd.b.RelTypes(step.Rel),
-			ToLabels: bd.b.NodeLabels(step.Node),
-			Dir:      step.Rel.Dir,
-			VarLen:   step.Rel.VarLen,
-			ToBound:  inner[to],
+			Input:      cur,
+			From:       prev,
+			Rel:        rel,
+			To:         to,
+			Types:      bd.b.RelTypes(step.Rel),
+			FromLabels: prevLabels,
+			ToLabels:   bd.b.NodeLabels(step.Node),
+			Dir:        step.Rel.Dir,
+			VarLen:     step.Rel.VarLen,
+			ToBound:    inner[to],
 		}
 		cur = withPropFilters(ex, rel, step.Rel.Properties)
 		cur = withPropFilters(cur, to, step.Node.Properties)
 		inner[rel] = true
 		inner[to] = true
 		prev = to
+		prevLabels = bd.b.NodeLabels(step.Node)
 	}
 	if pp.Var != "" {
 		cur = &BindPath{Input: cur, Var: pp.Var, Elems: bd.pathElems(pp)}
@@ -530,7 +533,7 @@ func (bd *builder) pathCorrelated(pp *ast.PathPattern, outer map[string]bool) Op
 		cur = bd.scanNode(pp.Start, start)
 		inner[start] = true
 	}
-	cur = bd.expandChain(cur, start, pp.Chain, inner)
+	cur = bd.expandChain(cur, start, bd.b.NodeLabels(pp.Start), pp.Chain, inner)
 	if pp.Var != "" {
 		cur = &BindPath{Input: cur, Var: pp.Var, Elems: bd.pathElems(pp)}
 		inner[pp.Var] = true
@@ -585,28 +588,33 @@ func (bd *builder) shortestPathCorrelated(pp *ast.PathPattern, outer, inner map[
 }
 
 // expandChain appends one Expand per relationship step, lowering label and
-// property constraints on each reached node and relationship.
-func (bd *builder) expandChain(cur Op, prev string, chain []ast.PatternChain, bound map[string]bool) Op {
+// property constraints on each reached node and relationship. prevLabels is the
+// source node's labels, threaded so each step's Expand can carry the labels of the
+// node it expands from (the start node for the first step, the previous step's
+// reached node thereafter), which the cost model conditions the fan-out on.
+func (bd *builder) expandChain(cur Op, prev string, prevLabels []bind.NameRef, chain []ast.PatternChain, bound map[string]bool) Op {
 	for _, step := range chain {
 		rel := bd.relName(step.Rel)
 		to := bd.nodeName(step.Node)
 		toBound := bound[to]
 		ex := &Expand{
-			Input:    cur,
-			From:     prev,
-			Rel:      rel,
-			To:       to,
-			Types:    bd.b.RelTypes(step.Rel),
-			ToLabels: bd.b.NodeLabels(step.Node),
-			Dir:      step.Rel.Dir,
-			VarLen:   step.Rel.VarLen,
-			ToBound:  toBound,
+			Input:      cur,
+			From:       prev,
+			Rel:        rel,
+			To:         to,
+			Types:      bd.b.RelTypes(step.Rel),
+			FromLabels: prevLabels,
+			ToLabels:   bd.b.NodeLabels(step.Node),
+			Dir:        step.Rel.Dir,
+			VarLen:     step.Rel.VarLen,
+			ToBound:    toBound,
 		}
 		bound[rel] = true
 		bound[to] = true
 		cur = withPropFilters(ex, rel, step.Rel.Properties)
 		cur = withPropFilters(cur, to, step.Node.Properties)
 		prev = to
+		prevLabels = bd.b.NodeLabels(step.Node)
 	}
 	return cur
 }

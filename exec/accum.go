@@ -69,7 +69,7 @@ func (a *countAcc) add(v value.Value) error {
 	}
 	return nil
 }
-func (a *countAcc) result() value.Value { return value.Int(a.n) }
+func (a *countAcc) result() value.Value     { return value.Int(a.n) }
 func (a *countAcc) merge(other accumulator) { a.n += other.(*countAcc).n }
 
 // sumAcc sums numeric values, staying integer until a float appears (doc 02 §5.2).

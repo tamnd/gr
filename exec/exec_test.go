@@ -331,6 +331,75 @@ func TestParallelAggregateMatchesSerial(t *testing.T) {
 	}
 }
 
+// groupRow is one expected (or observed) group's aggregate values, keyed by the
+// group's team value in the maps the grouped test compares.
+type groupRow struct{ c, lo, hi int64 }
+
+// collectGroups runs a grouped count / min / max query and folds its rows into a
+// team to values map, so two runs can be compared as sets. The MemEngine scans
+// labels in Go-map order, so group output order is nondeterministic per run; the
+// grouped answer (the set of groups and their values) is what must be stable.
+func collectGroups(t *testing.T, e *engine.MemEngine, q string) map[int64]groupRow {
+	t.Helper()
+	rows, _ := run(t, e, q, nil)
+	out := make(map[int64]groupRow, len(rows))
+	for _, r := range rows {
+		team, _ := r["team"].AsInt()
+		c, _ := r["c"].AsInt()
+		lo, _ := r["lo"].AsInt()
+		hi, _ := r["hi"].AsInt()
+		out[team] = groupRow{c: c, lo: lo, hi: hi}
+	}
+	return out
+}
+
+// TestParallelGroupedAggregateMatchesSerial drives the grouped morsel-parallel
+// path: a GROUP BY over a scan large enough to split into several morsels, with the
+// order-independent aggregates count / min / max per group. It runs the identical
+// query serially (GOMAXPROCS 1 forces the serial path) and in parallel (GOMAXPROCS
+// 4); both must produce the same set of groups with the same per-group values, and
+// both must match the values computed directly from the graph. The MemEngine scans
+// in map order so row order is not stable across runs, but the grouped answer is:
+// the parallel aggregates are exactly associative, so each group's merged count /
+// min / max is byte-identical to the serial one.
+func TestParallelGroupedAggregateMatchesSerial(t *testing.T) {
+	const n = 4096 // > 2*morselChunk, so several workers run
+	e := bigPersonGraph(t, n)
+	q := "MATCH (p:Person) RETURN p.age % 3 AS team, count(*) AS c, min(p.age) AS lo, max(p.age) AS hi"
+
+	old := runtime.GOMAXPROCS(1)
+	serial := collectGroups(t, e, q)
+	runtime.GOMAXPROCS(4)
+	parallel := collectGroups(t, e, q)
+	runtime.GOMAXPROCS(old)
+
+	// What the graph actually contains: age i lands in group i%3.
+	want := map[int64]groupRow{}
+	for i := int64(0); i < n; i++ {
+		g := want[i%3]
+		if g.c == 0 {
+			g.lo = i
+		}
+		g.c++
+		g.hi = i
+		want[i%3] = g
+	}
+	if len(want) != 3 {
+		t.Fatalf("expected 3 groups by construction, got %d", len(want))
+	}
+	for team, w := range want {
+		if serial[team] != w {
+			t.Fatalf("serial group %d = %+v, want %+v", team, serial[team], w)
+		}
+		if parallel[team] != w {
+			t.Fatalf("parallel group %d = %+v, want %+v", team, parallel[team], w)
+		}
+	}
+	if len(serial) != 3 || len(parallel) != 3 {
+		t.Fatalf("group counts: serial %d, parallel %d, want 3", len(serial), len(parallel))
+	}
+}
+
 // TestFactorizedCountMatchesEnumeration checks the factorized count(*) over an
 // expand produces the same tally as enumerating the expand and counting the rows.
 // The count query is rewritten to an ExpandCount; the enumeration query returns

@@ -63,17 +63,19 @@ type nodeScanOp struct {
 	rest []engine.Token // additional labels the node must also carry
 	none bool           // an unknown label: the scan is empty
 
-	// src, when set, makes this scan a morsel consumer for parallel aggregation:
-	// instead of buffering its own label scan, it pulls [lo,hi) windows of an
-	// already-scanned shared node slice and applies the residual labels per row.
-	// mhi is the exclusive end of the morsel currently being walked (pos is the
-	// cursor into src.ids). The serial path leaves src nil and uses buf.
-	src *morselSource
-	mhi int
+	// In windowed mode the scan is a morsel consumer for parallel aggregation: it
+	// walks a fixed [winLo,winHi) window of an already-scanned shared node id slice
+	// once, applying the residual labels per row, instead of running its own label
+	// scan. A worker sets winIDs once and winLo/winHi per morsel, re-opening the
+	// pipeline between morsels. The serial path leaves windowed false and uses buf.
+	windowed bool
+	winIDs   []engine.NodeID
+	winLo    int
+	winHi    int
 }
 
 func (o *nodeScanOp) open(ctx *Ctx) error {
-	o.ctx, o.buf, o.pos, o.rest, o.none, o.mhi = ctx, nil, 0, nil, false, 0
+	o.ctx, o.buf, o.pos, o.rest, o.none = ctx, nil, 0, nil, false
 	scanTok := engine.Token(0)
 	for i, l := range o.spec.Labels {
 		if !l.Known {
@@ -86,9 +88,10 @@ func (o *nodeScanOp) open(ctx *Ctx) error {
 			o.rest = append(o.rest, l.Token)
 		}
 	}
-	if o.src != nil {
-		// The shared morsel source already holds the primary-label scan; this copy
-		// only needs its residual labels (set above) to filter each morsel row.
+	if o.windowed {
+		// The shared slice already holds the primary-label scan; this pass only
+		// walks its assigned [winLo,winHi) window, filtering by the residual labels.
+		o.pos = o.winLo
 		return nil
 	}
 	return ctx.Tx.ScanLabel(scanTok, func(id engine.NodeID) error {
@@ -101,8 +104,8 @@ func (o *nodeScanOp) next() (eval.Row, bool, error) {
 	if o.none {
 		return nil, false, nil
 	}
-	if o.src != nil {
-		return o.nextMorsel()
+	if o.windowed {
+		return o.nextWindow()
 	}
 	for o.pos < len(o.buf) {
 		id := o.buf[o.pos]
@@ -118,28 +121,23 @@ func (o *nodeScanOp) next() (eval.Row, bool, error) {
 	return nil, false, nil
 }
 
-// nextMorsel produces the scan's rows from the shared morsel source: it walks the
-// current morsel window, and when that window is spent it atomically takes the
-// next one, stopping when the source is drained.
-func (o *nodeScanOp) nextMorsel() (eval.Row, bool, error) {
-	for {
-		for o.pos < o.mhi {
-			id := o.src.ids[o.pos]
-			o.pos++
-			ok, err := o.hasAll(id)
-			if err != nil {
-				return nil, false, err
-			}
-			if ok {
-				return eval.Row{o.spec.Var: value.Node(uint64(id))}, true, nil
-			}
+// nextWindow produces the scan's rows from its assigned morsel: it walks the fixed
+// [winLo,winHi) window of the shared id slice once, applying the residual labels,
+// and stops when the window is spent. The worker re-opens the pipeline (resetting
+// pos to winLo) for each morsel it takes, so one pass covers exactly one morsel.
+func (o *nodeScanOp) nextWindow() (eval.Row, bool, error) {
+	for o.pos < o.winHi {
+		id := o.winIDs[o.pos]
+		o.pos++
+		ok, err := o.hasAll(id)
+		if err != nil {
+			return nil, false, err
 		}
-		lo, hi, ok := o.src.take()
-		if !ok {
-			return nil, false, nil
+		if ok {
+			return eval.Row{o.spec.Var: value.Node(uint64(id))}, true, nil
 		}
-		o.pos, o.mhi = lo, hi
 	}
+	return nil, false, nil
 }
 
 func (o *nodeScanOp) hasAll(id engine.NodeID) (bool, error) {

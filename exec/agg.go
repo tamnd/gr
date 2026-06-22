@@ -80,10 +80,11 @@ func (o *aggregateOp) next() (eval.Row, bool, error) {
 	return row, true, nil
 }
 
-// run drains the input and builds the output rows. A grouping-free aggregation
-// over a scan-rooted read pipeline of order-independent aggregates runs in
-// parallel across morsels; everything else runs the serial path. The two produce
-// identical rows (the parallel aggregates are exactly associative).
+// run drains the input and builds the output rows. An aggregation over a
+// scan-rooted read pipeline of order-independent aggregates runs in parallel across
+// morsels (grouped or not); everything else runs the serial path. The two produce
+// identical rows in the same order (the parallel aggregates are exactly associative
+// and the merge replays morsels in scan order, so group first-seen order matches).
 func (o *aggregateOp) run() error {
 	if ns := o.parallelScan(); ns != nil {
 		return o.runParallel(ns)
@@ -93,11 +94,12 @@ func (o *aggregateOp) run() error {
 
 // parallelScan returns the NodeScan to parallelize over when this aggregation is
 // eligible for the morsel-driven path, or nil to run serially. Eligibility:
-// read-only, no grouping keys, at least one aggregate and every one of them
-// order-independent and not DISTINCT, more than one core available, and an input
-// pipeline that is a row-independent chain rooted at a node scan.
+// read-only, at least one aggregate and every one of them order-independent and not
+// DISTINCT, more than one core available, and an input pipeline that is a
+// row-independent chain rooted at a node scan. Grouping keys are allowed: the merge
+// reconstructs the serial first-seen group order from the disjoint morsels.
 func (o *aggregateOp) parallelScan() *plan.NodeScan {
-	if o.ctx.Effects != nil || len(o.spec.GroupKeys) != 0 || o.inputPlan == nil {
+	if o.ctx.Effects != nil || o.inputPlan == nil {
 		return nil
 	}
 	if len(o.calls) == 0 || runtime.GOMAXPROCS(0) < 2 {
@@ -112,28 +114,47 @@ func (o *aggregateOp) parallelScan() *plan.NodeScan {
 }
 
 func (o *aggregateOp) runSerial() error {
+	groups, order, err := o.drainGroups(o.input)
+	if err != nil {
+		return err
+	}
+	// With no grouping keys and no input, an aggregation still yields one row (the
+	// empty group: count is 0, the rest null).
+	if len(order) == 0 && len(o.spec.GroupKeys) == 0 {
+		g := &group{rep: eval.Row{}, accs: o.newAccs()}
+		groups[""] = g
+		order = append(order, "")
+	}
+	return o.emit(groups, order)
+}
+
+// drainGroups consumes op to exhaustion, bucketing each row by its grouping-key
+// value into one group (a representative row plus one accumulator per aggregate) and
+// recording the keys in first-seen order. It is the shared core of the serial path
+// and of each parallel worker's per-morsel pass: it touches only freshly allocated
+// state and the read-only snapshot, so many workers run it concurrently over private
+// pipelines that share one engine transaction.
+func (o *aggregateOp) drainGroups(op operator) (map[string]*group, []string, error) {
 	groups := map[string]*group{}
 	var order []string
 	keyExprs := make([]ast.Expr, len(o.spec.GroupKeys))
 	for i, c := range o.spec.GroupKeys {
 		keyExprs[i] = c.Expr
 	}
-	any := false
 	for {
-		in, ok, err := o.input.next()
+		in, ok, err := op.next()
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		if !ok {
 			break
 		}
-		any = true
 		env := o.ctx.env(in)
 		keyVals := make([]value.Value, len(keyExprs))
 		for i, e := range keyExprs {
 			v, err := eval.Eval(e, env)
 			if err != nil {
-				return err
+				return nil, nil, err
 			}
 			keyVals[i] = v
 		}
@@ -146,18 +167,11 @@ func (o *aggregateOp) runSerial() error {
 		}
 		for j, call := range o.calls {
 			if err := o.feed(g.accs[j], call, env); err != nil {
-				return err
+				return nil, nil, err
 			}
 		}
 	}
-	// With no grouping keys and no input, an aggregation still yields one row (the
-	// empty group: count is 0, the rest null).
-	if len(order) == 0 && len(o.spec.GroupKeys) == 0 && !any {
-		g := &group{rep: eval.Row{}, accs: o.newAccs()}
-		groups[""] = g
-		order = append(order, "")
-	}
-	return o.emit(groups, order)
+	return groups, order, nil
 }
 
 func (o *aggregateOp) emit(groups map[string]*group, order []string) error {

@@ -243,6 +243,12 @@ func Open(path string, opt Options) (*DB, error) {
 	db.metrics.reg.ComputedGauge("gr_mvcc_versions_resident",
 		"Element versions held beyond the current committed version, the version-store size", "versions", nil,
 		func() int64 { return db.eng.VersionsResident() })
+	// The watermark lag is the reclaimable backlog: the commit versions GC could drop the moment the
+	// oldest live snapshot releases (doc 20 §5.1). It reads the oracle's lock, never the engine lock,
+	// so a lag that stays high while a reader holds a snapshot is the long-reader signal (§16.4).
+	db.metrics.reg.ComputedGauge("gr_mvcc_watermark_lag_versions",
+		"Commit versions between the newest commit and the GC watermark, the reclaimable backlog", "versions", nil,
+		func() int64 { return db.eng.WatermarkLag() })
 	// The open event reports the file's real geometry and whether this open recovered a
 	// committed WAL prefix after a crash (doc 20 §11.3). StorageInfo reads the header the
 	// engine just mounted, so the format version and page size are the file's own.

@@ -206,6 +206,12 @@ func (e *DiskEngine) GCStats() (runs, reclaimedNode, reclaimedRel uint64) {
 	return e.gcRunsTotal.Load(), e.gcReclaimedNode.Load(), e.gcReclaimedRel.Load()
 }
 
+// WatermarkLag returns the commit versions between the newest commit and the GC watermark (doc 20
+// §5.1), for the gr_mvcc_watermark_lag_versions gauge. It reads the oracle's own lock, never the
+// engine lock, so the metrics snapshot path calls it freely even while a write transaction holds the
+// engine lock; the write path takes the engine lock then the oracle lock, so there is no inversion.
+func (e *DiskEngine) WatermarkLag() int64 { return int64(e.oracle.WatermarkLag()) }
+
 // load (re)builds the store handles over the current pager state, creating the
 // stores when fresh and opening them otherwise. It is also used to rebuild state
 // after a rollback. It does not touch the oracle or overlay, which outlive a

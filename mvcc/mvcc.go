@@ -149,6 +149,22 @@ func (o *Oracle) Watermark() Seq {
 	return wm
 }
 
+// WatermarkLag returns the commit versions between the current commit sequence and the GC
+// watermark (doc 20 §5.1): the reclaimable backlog, the versions GC could drop if the oldest live
+// snapshot released. It is computed under one lock so the sequence and the watermark are consistent,
+// and the watermark never exceeds the sequence, so the result never underflows.
+func (o *Oracle) WatermarkLag() uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	wm := o.seq
+	for _, r := range o.live {
+		if r < wm {
+			wm = r
+		}
+	}
+	return o.seq - wm
+}
+
 // --- the retention overlay ---
 
 type entry struct {

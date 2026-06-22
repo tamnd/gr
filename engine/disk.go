@@ -362,6 +362,10 @@ func (e *DiskEngine) StorageInfo() (StorageInfo, error) {
 	}, nil
 }
 
+// Recovered reports whether opening the database redid a committed WAL prefix
+// after a crash, feeding the open event's recovered flag (doc 20 §11.3).
+func (e *DiskEngine) Recovered() bool { return e.p.Recovered() }
+
 // CatalogVersion returns a monotonic version of the catalog: the total number of
 // interned names across the label, type, and property-key dictionaries. The
 // catalog is append-only (names are interned, never removed), so any schema

@@ -200,6 +200,90 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
+// TestPagerRecoveredFlag confirms a reopen that redoes a committed-but-uncheckpointed
+// WAL prefix reports Recovered, and a clean reopen does not. The clean commit protocol
+// folds and resets the WAL on every commit, so the only way to leave a committed prefix
+// for recovery is a crash between a commit's fsync and its checkpoint; we stage exactly
+// that by appending a committed batch to the WAL directly, without folding it into the
+// file (doc 20 §11.3, the open event's recovered flag).
+func TestPagerRecoveredFlag(t *testing.T) {
+	fsys := vfs.NewMem()
+	p, err := Open(fsys, "r.gr", Options{Sync: wal.SyncFull, SaltSeed: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := p.AllocPage(format.PageTypeData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := f.ID()
+	copy(f.Data, fill(p.PageSize(), 0x11))
+	p.MarkDirty(f)
+	p.Unpin(f)
+	if err := p.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	ps := p.PageSize()
+	pageCount := p.Header().PageCount
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A clean reopen replayed nothing, so it is not a recovery.
+	clean, err := Open(fsys, "r.gr", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clean.Recovered() {
+		t.Errorf("clean reopen reported Recovered, want false")
+	}
+	if err := clean.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stage a torn commit: write a fresh committed image for the page straight into
+	// the WAL and leave the database file untouched, the state a crash between fsync
+	// and checkpoint leaves behind.
+	newImage := fill(ps, 0x22)
+	checksumPage(newImage)
+	wf, err := fsys.Open("r.gr-wal", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := wal.Open(wf, ps, wal.SyncFull, 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Append([]wal.Frame{{PageID: id, Image: newImage}}, true, uint64(pageCount)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen: recovery redoes the committed frame into the file and reports it.
+	p2, err := Open(fsys, "r.gr", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p2.Close()
+	if !p2.Recovered() {
+		t.Errorf("reopen after a torn commit did not report Recovered")
+	}
+	got, err := p2.ReadPage(id)
+	if err != nil {
+		t.Fatalf("ReadPage(%d): %v", id, err)
+	}
+	body := func(b []byte) []byte { return b[format.PayloadOffset() : len(b)-format.ChecksumSize] }
+	if !bytes.Equal(body(got.Data), body(newImage)) {
+		t.Errorf("recovered page content was not redone from the WAL")
+	}
+	p2.Unpin(got)
+}
+
 func TestPagerChecksumDetectsCorruption(t *testing.T) {
 	fsys := vfs.NewMem()
 	p, _ := Open(fsys, "t.gr", Options{})

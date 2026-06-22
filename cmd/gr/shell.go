@@ -39,6 +39,8 @@ type shell struct {
 	stdout   io.Writer // the default data sink
 	errw     io.Writer // the chatter sink (stderr)
 
+	tx *gr.Tx // the open explicit transaction, nil outside one
+
 	code    int  // accumulated worst exit code
 	quitNow bool // set by .quit/.exit
 }
@@ -115,7 +117,15 @@ func (s *shell) runStatement(stmt string) {
 		fmt.Fprintln(s.errw, stmt)
 	}
 	start := time.Now()
-	res, err := s.db.Run(context.Background(), stmt, nil)
+	var (
+		res *gr.Result
+		err error
+	)
+	if s.tx != nil {
+		res, err = s.tx.Run(context.Background(), stmt, nil)
+	} else {
+		res, err = s.db.Run(context.Background(), stmt, nil)
+	}
 	if err != nil {
 		s.reportError(err)
 		return
@@ -305,14 +315,23 @@ func (s *shell) prompt(midStatement bool) string {
 	if midStatement {
 		return "...> "
 	}
+	if s.tx != nil {
+		return "gr*> "
+	}
 	if s.readonly {
 		return "gr(ro)> "
 	}
 	return "gr> "
 }
 
-// closeSinks closes any open .output or .once file at shell shutdown (doc 17 §3.18).
+// closeSinks closes any open .output or .once file at shell shutdown, and rolls back
+// an open explicit transaction so an uncommitted .begin discards rather than commits
+// on exit (doc 17 §3.18, §6.4). An interrupted session leaves the database unchanged.
 func (s *shell) closeSinks() {
+	if s.tx != nil {
+		_ = s.tx.Rollback()
+		s.tx = nil
+	}
 	if s.dataFile != nil {
 		_ = s.dataFile.Close()
 		s.dataFile = nil

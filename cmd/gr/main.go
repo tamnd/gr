@@ -117,6 +117,11 @@ func (s *shell) dotOpen(args []string) {
 		s.code = worst(s.code, exitUsage)
 		return
 	}
+	if s.tx != nil {
+		fmt.Fprintln(s.errw, "Error: commit or rollback the open transaction before .open")
+		s.code = worst(s.code, exitUsage)
+		return
+	}
 	path := args[0]
 	var db *gr.DB
 	var err error

@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/tamnd/gr"
 )
 
 // runDot dispatches a dot-command line (doc 17 §6). The command word selects the
@@ -47,6 +50,12 @@ func (s *shell) runDot(line string) {
 		s.dotRead(args)
 	case ".open":
 		s.dotOpen(args)
+	case ".begin":
+		s.dotBegin(args)
+	case ".commit":
+		s.dotCommit()
+	case ".rollback":
+		s.dotRollback()
 	case ".databases":
 		s.dotDatabases()
 	case ".print":
@@ -68,6 +77,9 @@ func (s *shell) dotHelp() {
 .output [FILE]        Send query output to FILE (no arg restores stdout)
 .once FILE            Send the next query's output to FILE
 .read FILE            Run the statements in FILE
+.begin [read|write]   Open an explicit transaction
+.commit               Commit the open transaction
+.rollback             Discard the open transaction
 .open FILE            Close the current database and open FILE
 .databases            Show the open database and its path
 .timer on|off         Show wall-clock timing after each statement
@@ -166,6 +178,77 @@ func (s *shell) dotRead(args []string) {
 	s.runScript(f)
 }
 
+// dotBegin opens an explicit transaction the following statements run inside until a
+// .commit or .rollback (doc 17 §6.4). The mode defaults to write, or read on a
+// read-only database; an explicit "read" or "write" argument overrides it. Statements
+// run between .begin and .commit see each other's writes and land atomically.
+func (s *shell) dotBegin(args []string) {
+	if s.tx != nil {
+		fmt.Fprintln(s.errw, "Error: a transaction is already open; commit or rollback it first")
+		s.code = worst(s.code, exitUsage)
+		return
+	}
+	mode := gr.Write
+	if s.readonly {
+		mode = gr.Read
+	}
+	if len(args) > 0 {
+		switch strings.ToLower(args[0]) {
+		case "read":
+			mode = gr.Read
+		case "write":
+			if s.readonly {
+				fmt.Fprintln(s.errw, "Error: cannot begin a write transaction on a read-only database")
+				s.code = worst(s.code, exitReadOnly)
+				return
+			}
+			mode = gr.Write
+		default:
+			fmt.Fprintf(s.errw, "Error: .begin expects read or write, got %q\n", args[0])
+			s.code = worst(s.code, exitUsage)
+			return
+		}
+	}
+	tx, err := s.db.Begin(context.Background(), mode)
+	if err != nil {
+		fmt.Fprintln(s.errw, "Error:", err)
+		s.code = worst(s.code, classify(err))
+		return
+	}
+	s.tx = tx
+}
+
+// dotCommit commits the open explicit transaction (doc 17 §6.4). With no transaction
+// open it is a usage error rather than a silent no-op.
+func (s *shell) dotCommit() {
+	if s.tx == nil {
+		fmt.Fprintln(s.errw, "Error: no transaction is open")
+		s.code = worst(s.code, exitUsage)
+		return
+	}
+	err := s.tx.Commit()
+	s.tx = nil
+	if err != nil {
+		fmt.Fprintln(s.errw, "Error:", err)
+		s.code = worst(s.code, classify(err))
+	}
+}
+
+// dotRollback discards the open explicit transaction (doc 17 §6.4).
+func (s *shell) dotRollback() {
+	if s.tx == nil {
+		fmt.Fprintln(s.errw, "Error: no transaction is open")
+		s.code = worst(s.code, exitUsage)
+		return
+	}
+	err := s.tx.Rollback()
+	s.tx = nil
+	if err != nil {
+		fmt.Fprintln(s.errw, "Error:", err)
+		s.code = worst(s.code, classify(err))
+	}
+}
+
 // dotDatabases prints the open database and its path (doc 17 §6.3).
 func (s *shell) dotDatabases() {
 	path := s.db.Path()
@@ -180,7 +263,7 @@ func suggestDot(cmd string) string {
 	known := []string{
 		".help", ".quit", ".exit", ".version", ".mode", ".headers", ".timer",
 		".echo", ".nullvalue", ".separator", ".output", ".once", ".read",
-		".open", ".databases", ".print",
+		".begin", ".commit", ".rollback", ".open", ".databases", ".print",
 	}
 	for _, k := range known {
 		if near(cmd, k) {

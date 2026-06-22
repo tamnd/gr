@@ -728,8 +728,8 @@ func TestMetricsBoltSession(t *testing.T) {
 	if c := snap.Counter("gr_bolt_messages_total", Labels{"type": "HELLO"}); c != 1 {
 		t.Errorf("HELLO messages = %d, want 1", c)
 	}
-	if c := snap.Counter("gr_auth_attempts_total", Labels{"result": "success"}); c != 1 {
-		t.Errorf("auth success = %d, want 1", c)
+	if c := snap.Counter("gr_auth_attempts_total", Labels{"result": "ok"}); c != 1 {
+		t.Errorf("auth ok = %d, want 1", c)
 	}
 
 	obs.SessionClose(2 * time.Second)
@@ -759,7 +759,7 @@ func TestMetricsBoltError(t *testing.T) {
 	if c := snap.Counter("gr_bolt_errors_total", Labels{"code": "handshake"}); c != 1 {
 		t.Errorf("handshake errors = %d, want 1", c)
 	}
-	if c := snap.Counter("gr_auth_attempts_total", Labels{"result": "failure"}); c != 1 {
-		t.Errorf("auth failure = %d, want 1", c)
+	if c := snap.Counter("gr_auth_attempts_total", Labels{"result": "denied"}); c != 1 {
+		t.Errorf("auth denied = %d, want 1", c)
 	}
 }

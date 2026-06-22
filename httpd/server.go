@@ -190,6 +190,11 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 		default:
 			s.metrics.countAuth(authFailure)
 		}
+		// Feed the same outcome to the shared metric registry's gr_auth_attempts_total (doc 20
+		// §3.3), so the unified auth metric spans HTTP and Bolt. A lockout is a denial here, the
+		// ok/denied split the shared metric carries; the server-plane gr_server_auth_total keeps
+		// the finer success/failure/lockout breakdown.
+		s.db.RecordAuthAttempt(fail == nil)
 		// A rejected credential is an operational event an operator watches for a rising
 		// failure rate (doc 20 §11.3); the event names the claimed user, the client, and a
 		// non-disclosing reason. A nil event log makes this a no-op.

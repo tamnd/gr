@@ -2,6 +2,7 @@ package httpd
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -48,6 +49,44 @@ func TestMetricsEndpointRendersDatabaseRegistry(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics body missing %q\n%s", want, body)
 		}
+	}
+}
+
+// TestAuthFeedsSharedRegistry confirms an HTTP authentication outcome lands on the shared
+// gr_auth_attempts_total, the unified auth metric the Bolt surface also feeds (doc 20 §3.3): a good
+// credential counts as ok and a bad one as denied.
+func TestAuthFeedsSharedRegistry(t *testing.T) {
+	db, err := gr.Open(":memory:.gr", gr.Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	p := NewStaticProvider()
+	if err := p.AddUser("alice", "secret", "editor"); err != nil {
+		t.Fatalf("add user: %v", err)
+	}
+	h := Handler(db, Options{Auth: p})
+
+	post := func(authz string) {
+		r := httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2",
+			strings.NewReader(`{"statement":"RETURN 1 AS n"}`))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Authorization", authz)
+		h.ServeHTTP(httptest.NewRecorder(), r)
+	}
+	enc := func(u, pw string) string {
+		return "Basic " + base64.StdEncoding.EncodeToString([]byte(u+":"+pw))
+	}
+	post(enc("alice", "secret"))
+	post(enc("alice", "wrong"))
+
+	snap := db.Metrics()
+	if c := snap.Counter("gr_auth_attempts_total", gr.Labels{"result": "ok"}); c != 1 {
+		t.Errorf("auth ok = %d, want 1", c)
+	}
+	if c := snap.Counter("gr_auth_attempts_total", gr.Labels{"result": "denied"}); c != 1 {
+		t.Errorf("auth denied = %d, want 1", c)
 	}
 }
 

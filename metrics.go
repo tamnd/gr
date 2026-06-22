@@ -52,6 +52,29 @@ func (db *DB) Metrics() MetricsSnapshot {
 	return db.metrics.reg.Snapshot()
 }
 
+// RecordAuthAttempt counts one authentication attempt against the shared metric registry (doc 20
+// §3.3): ok when the credential was allowed, false when it was rejected. Both transports feed it,
+// so gr_auth_attempts_total spans Bolt and HTTP and a reader watches one denied rate for the whole
+// process. The Bolt observer calls it through its own seam; the HTTP server calls it directly.
+func (db *DB) RecordAuthAttempt(ok bool) {
+	db.metrics.recordAuth(ok)
+}
+
+// RecordSessionOpen counts a client connection that has just opened on the named protocol (doc 20
+// §3.3): it bumps the per-protocol live gauge and the lifetime counter. The HTTP server calls it
+// from its connection-state hook; the Bolt observer has its own session reporting. protocol is the
+// wire name, http or bolt.
+func (db *DB) RecordSessionOpen(protocol string) {
+	db.metrics.sessionOpen(protocol)
+}
+
+// RecordSessionClose counts a client connection ending on the named protocol after living dur (doc
+// 20 §3.3): it drops the live gauge back and observes the lifetime. It pairs with RecordSessionOpen
+// so the gauge tracks the true live count.
+func (db *DB) RecordSessionClose(protocol string, dur time.Duration) {
+	db.metrics.sessionClose(protocol, dur)
+}
+
 // WritePrometheus renders a metrics snapshot in the Prometheus text exposition format (doc 20
 // §7.5), re-exported so the server and an embedder render db.Metrics() without importing the
 // low-level metric package.
@@ -159,10 +182,10 @@ var sessionDurationBuckets = []float64{
 }
 
 // metricAuthResults is the bounded domain of the result label on gr_auth_attempts_total (doc 20
-// §3.3): whether an authentication attempt succeeded or failed. Both are pre-registered so a server
-// that has only ever seen successes still exposes the failure series at zero, the shape an alert on
-// a sudden failure rate needs present from the start.
-var metricAuthResults = []string{"success", "failure"}
+// §3.3): whether an authentication attempt was allowed (ok) or rejected (denied). Both are
+// pre-registered so a server that has only ever seen successes still exposes the denied series at
+// zero, the shape an alert on a sudden denial rate needs present from the start.
+var metricAuthResults = []string{"ok", "denied"}
 
 // queryMetrics holds the pre-resolved handles for the query throughput, latency, and in-flight
 // metrics (doc 20 §3.1). Resolving every (kind, status) handle once at open keeps the record
@@ -802,12 +825,13 @@ func (m *queryMetrics) recordBoltError(code string) {
 	actual.(*metric.Counter).Inc()
 }
 
-// recordAuth counts one authentication attempt by result (doc 20 §3.3). Both result series are
-// pre-registered, so this is a map read and an atomic increment.
+// recordAuth counts one authentication attempt by result (doc 20 §3.3): ok when the credential was
+// allowed, denied when it was rejected. Both result series are pre-registered, so this is a map read
+// and an atomic increment.
 func (m *queryMetrics) recordAuth(ok bool) {
-	result := "failure"
+	result := "denied"
 	if ok {
-		result = "success"
+		result = "ok"
 	}
 	if c := m.authAttempts[result]; c != nil {
 		c.Inc()

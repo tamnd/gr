@@ -255,6 +255,13 @@ func Open(path string, opt Options) (*DB, error) {
 	db.metrics.reg.ComputedGauge("gr_mvcc_oldest_snapshot_age_seconds",
 		"Wall-clock age of the oldest live snapshot, the long-reader signal in time", "seconds", nil,
 		func() int64 { return db.eng.OldestSnapshotAgeSeconds() })
+	// The WAL size is the current on-disk footprint of the write-ahead log (doc 20 §5.2). The WAL
+	// republishes it after each append and reset, so this reads a lock-free atomic, never the engine
+	// lock. In the current inline-checkpoint design every commit folds and resets the WAL, so this
+	// oscillates back to the header size after each commit rather than growing into a backlog.
+	db.metrics.reg.ComputedGauge("gr_wal_size_bytes",
+		"Current on-disk size of the write-ahead log", "bytes", nil,
+		func() int64 { return int64(db.eng.WALStats().SizeBytes) })
 	// The open event reports the file's real geometry and whether this open recovered a
 	// committed WAL prefix after a crash (doc 20 §11.3). StorageInfo reads the header the
 	// engine just mounted, so the format version and page size are the file's own.

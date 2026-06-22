@@ -55,6 +55,7 @@ func (db *DB) Metrics() MetricsSnapshot {
 	db.syncBufferPoolMetrics()
 	db.syncCacheMemoryMetrics()
 	db.syncCheckpointMetrics()
+	db.syncWalMetrics()
 	db.syncMvccGCMetrics()
 	return db.metrics.reg.Snapshot()
 }
@@ -213,6 +214,36 @@ func (db *DB) syncCheckpointMetrics() {
 	if c := m.checkpointPagesWritten; c != nil && pages > m.lastCkptPagesWritten {
 		c.Add(pages - m.lastCkptPagesWritten)
 		m.lastCkptPagesWritten = pages
+	}
+}
+
+// syncWalMetrics mirrors the WAL's cumulative write counters into the registry at snapshot time (doc 20
+// §5.2): it advances gr_wal_bytes_written_total by the frame bytes appended and
+// gr_wal_frames_written_total{kind} by the page and commit frames appended, both since the last sync.
+// The WAL owns the authoritative counts, bumped under the engine write lock as it appends, so the
+// append path never touches the registry; the bridge runs only on a scrape. The delta add keeps each
+// counter monotonic, and walMu serializes two concurrent scrapes so neither double-counts. Reading the
+// stats is a lock-free atomic load, never the engine lock, so a long-held write transaction cannot
+// deadlock a snapshot. The current WAL size is a computed gauge registered at open, not mirrored here.
+func (db *DB) syncWalMetrics() {
+	if db.eng == nil {
+		return
+	}
+	st := db.eng.WALStats()
+	m := db.metrics
+	m.walMu.Lock()
+	defer m.walMu.Unlock()
+	if c := m.walBytesWritten; c != nil && st.BytesWritten > m.lastWalBytes {
+		c.Add(st.BytesWritten - m.lastWalBytes)
+		m.lastWalBytes = st.BytesWritten
+	}
+	if c := m.walFrames["page"]; c != nil && st.FramesPage > m.lastWalPage {
+		c.Add(st.FramesPage - m.lastWalPage)
+		m.lastWalPage = st.FramesPage
+	}
+	if c := m.walFrames["commit"]; c != nil && st.FramesCommit > m.lastWalCommit {
+		c.Add(st.FramesCommit - m.lastWalCommit)
+		m.lastWalCommit = st.FramesCommit
 	}
 }
 
@@ -432,6 +463,12 @@ var metricCheckpointStores = []string{"node", "rel"}
 // gr_mvcc_gc_reclaimed_total so the version-reclaim throughput is readable per element.
 var metricMvccElements = []string{"node", "rel"}
 
+// metricWalFrameKinds is the bounded domain of the kind label on gr_wal_frames_written_total (doc 20
+// §5.2): the frame kinds the WAL appends. Every frame is a full page image, so the split is between a
+// page frame and the commit frame that ends a batch; the doc's fullpage kind does not apply here since
+// the WAL has no sub-page frame form, so it is left out rather than reported as a constant zero.
+var metricWalFrameKinds = []string{"page", "commit"}
+
 // metricCacheNames is the bounded domain of the cache label on gr_cache_memory_bytes (doc 20
 // §4.5): the caches that account their resident bytes today, the buffer pool of raw pages and the
 // column cache of decoded property blocks. The full §4.5 domain also names the adjacency, plan,
@@ -559,6 +596,18 @@ type queryMetrics struct {
 	// mirrors it delta-style under checkpointSegMu, and lastCkptPagesWritten holds the last value.
 	checkpointPagesWritten *metric.Counter
 	lastCkptPagesWritten   uint64
+
+	// walBytesWritten holds gr_wal_bytes_written_total and walFrames gr_wal_frames_written_total keyed
+	// by kind (doc 20 §5.2): the WAL write-amplified durability throughput and the per-kind frame
+	// breakdown. The WAL owns the authoritative cumulative atomics, bumped under the engine write lock
+	// as it appends; the sync step mirrors them delta-style under walMu, and the last* fields hold the
+	// last mirrored cumulative values so a scrape advances each counter monotonically.
+	walBytesWritten *metric.Counter
+	walFrames       map[string]*metric.Counter
+	walMu           sync.Mutex
+	lastWalBytes    uint64
+	lastWalPage     uint64
+	lastWalCommit   uint64
 
 	// gcRuns holds gr_mvcc_gc_runs_total and gcReclaimed gr_mvcc_gc_reclaimed_total keyed by element
 	// (doc 20 §5.1). The engine owns the authoritative cumulative totals, bumped under its lock when
@@ -736,6 +785,13 @@ func newQueryMetrics() *queryMetrics {
 		"Adjacency delta entries folded into the base CSR by checkpoints", "entries", nil)
 	m.checkpointPagesWritten = reg.Counter("gr_checkpoint_pages_written_total",
 		"Page images written back to the database file by checkpoints", "pages", nil)
+	m.walBytesWritten = reg.Counter("gr_wal_bytes_written_total",
+		"Bytes appended to the write-ahead log", "bytes", nil)
+	m.walFrames = make(map[string]*metric.Counter, len(metricWalFrameKinds))
+	for _, kind := range metricWalFrameKinds {
+		m.walFrames[kind] = reg.Counter("gr_wal_frames_written_total",
+			"WAL frames appended, by kind", "frames", metric.Labels{"kind": kind})
+	}
 	m.gcRuns = reg.Counter("gr_mvcc_gc_runs_total",
 		"Version-GC passes executed", "runs", nil)
 	m.gcReclaimed = make(map[string]*metric.Counter, len(metricMvccElements))

@@ -15,6 +15,7 @@ package wal
 import (
 	"errors"
 	"hash/crc32"
+	"sync/atomic"
 
 	"github.com/tamnd/gr/format"
 	"github.com/tamnd/gr/vfs"
@@ -50,10 +51,46 @@ type WAL struct {
 	cksum1       uint32 // running checksum state (chained over frames)
 	cksum2       uint32
 
-	frameCount int   // frames physically present after the header
+	frameCount int    // frames physically present after the header
 	maxLSN     uint64 // highest LSN written
 
+	// Observability counters (doc 20 §5.2), bumped on the append and reset paths under the engine
+	// write lock the single writer holds, and read lock-free as atomics off the metrics snapshot path.
+	// bytesWritten is the cumulative frame bytes (header plus image) appended; framesPage and
+	// framesCommit split the frames appended by kind; sizeBytes is the current on-disk WAL size,
+	// republished after each append and each reset so the gauge reads it without the frame count lock.
+	bytesWritten atomic.Uint64
+	framesPage   atomic.Uint64
+	framesCommit atomic.Uint64
+	sizeBytes    atomic.Uint64
+
 	crcTab *crc32.Table
+}
+
+// Stats is a point-in-time view of the WAL's cumulative write activity and current footprint (doc 20
+// §5.2). The counters are cumulative since the WAL was opened; SizeBytes is the live on-disk size.
+type Stats struct {
+	BytesWritten uint64
+	FramesPage   uint64
+	FramesCommit uint64
+	SizeBytes    uint64
+}
+
+// Stats returns the WAL's cumulative write counters and current size, each a lock-free atomic load, so
+// the metrics path reads them without taking any WAL or engine lock (doc 20 §5.2).
+func (w *WAL) Stats() Stats {
+	return Stats{
+		BytesWritten: w.bytesWritten.Load(),
+		FramesPage:   w.framesPage.Load(),
+		FramesCommit: w.framesCommit.Load(),
+		SizeBytes:    w.sizeBytes.Load(),
+	}
+}
+
+// publishSize republishes the current on-disk WAL size for the size gauge, called after every append
+// and reset under the engine write lock. It is header plus the physical frames currently present.
+func (w *WAL) publishSize() {
+	w.sizeBytes.Store(uint64(walHeaderSize) + uint64(w.frameCount)*uint64(w.frameSize()))
 }
 
 var (
@@ -138,7 +175,16 @@ func (w *WAL) Append(frames []Frame, commit bool, dbPages uint64) (uint64, error
 		}
 		off += w.frameSize()
 		w.frameCount++
+		// Count the frame's bytes and its kind for the WAL metrics (doc 20 §5.2). Every frame here is a
+		// full page image; the last frame of a commit batch is the commit frame, the rest are page frames.
+		w.bytesWritten.Add(uint64(w.frameSize()))
+		if isCommit {
+			w.framesCommit.Add(1)
+		} else {
+			w.framesPage.Add(1)
+		}
 	}
+	w.publishSize()
 	if commit && w.sync >= SyncNormal {
 		if err := w.f.Sync(); err != nil {
 			return 0, err
@@ -186,6 +232,7 @@ func (w *WAL) Reset(newSalt uint64) error {
 	if err := w.writeHeader(); err != nil {
 		return err
 	}
+	w.publishSize()
 	if w.sync >= SyncNormal {
 		return w.f.Sync()
 	}
@@ -193,7 +240,13 @@ func (w *WAL) Reset(newSalt uint64) error {
 }
 
 // Init writes a fresh header for a brand-new WAL.
-func (w *WAL) Init() error { return w.writeHeader() }
+func (w *WAL) Init() error {
+	if err := w.writeHeader(); err != nil {
+		return err
+	}
+	w.publishSize()
+	return nil
+}
 
 // Close closes the underlying file.
 func (w *WAL) Close() error { return w.f.Close() }

@@ -287,6 +287,50 @@ func (e *DiskEngine) IndexInfos() []IndexInfo {
 	return out
 }
 
+// ConstraintInfo describes a schema constraint with its label, property names, and
+// kind resolved from the catalog, so a caller listing the schema (a dump's DDL
+// section, doc 17 §13.2, or .info) does not need the raw tokens or kind codes. Kind
+// is the constraint's flavour ("UNIQUE", "EXISTS", or "TYPE"); PropType names the
+// required value type for a TYPE constraint and is empty otherwise.
+type ConstraintInfo struct {
+	Name     string
+	Label    string
+	Props    []string
+	Kind     string
+	PropType string
+}
+
+// ConstraintInfos returns the schema constraints with their names resolved (doc 08
+// §4, doc 17 §13.2). The order follows the catalog's declaration order, so a dump
+// re-creates constraints in the order they were added.
+func (e *DiskEngine) ConstraintInfos() []ConstraintInfo {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	cons := e.cat.Constraints()
+	out := make([]ConstraintInfo, 0, len(cons))
+	for _, c := range cons {
+		info := ConstraintInfo{Name: c.Name}
+		if name, ok := e.cat.Name(catalog.KindLabel, c.Label); ok {
+			info.Label = name
+		}
+		for _, p := range c.Props {
+			name, _ := e.cat.Name(catalog.KindPropKey, p)
+			info.Props = append(info.Props, name)
+		}
+		switch c.Kind {
+		case catalog.UniqueNode:
+			info.Kind = "UNIQUE"
+		case catalog.ExistsNode:
+			info.Kind = "EXISTS"
+		case catalog.TypedNode:
+			info.Kind = "TYPE"
+			info.PropType = value.Type(c.ValueType).String()
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
 // CatalogVersion returns a monotonic version of the catalog: the total number of
 // interned names across the label, type, and property-key dictionaries. The
 // catalog is append-only (names are interned, never removed), so any schema

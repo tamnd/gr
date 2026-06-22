@@ -288,6 +288,19 @@ func (db *DB) Indexes() ([]IndexInfo, error) {
 	return db.eng.IndexInfos(), nil
 }
 
+// ConstraintInfo describes a schema constraint with its names resolved (doc 08 §4).
+type ConstraintInfo = engine.ConstraintInfo
+
+// Constraints returns the schema constraints with their label, property names, and
+// kind resolved, the read behind a dump's DDL section and the schema browser (doc 08
+// §4, doc 17 §13.2).
+func (db *DB) Constraints() ([]ConstraintInfo, error) {
+	if db.eng == nil {
+		return nil, ErrClosed
+	}
+	return db.eng.ConstraintInfos(), nil
+}
+
 // Query runs a Cypher read query against a snapshot of the database and returns a
 // streaming result. It threads the whole read pipeline: the text is parsed to an
 // AST ([parse]), bound against the catalog ([bind]), planned into a logical

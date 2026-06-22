@@ -30,8 +30,15 @@ func main() {
 // returns the process exit code (doc 17 §10). Data goes to stdout, chatter to stderr,
 // so a pipeline reads clean output.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) > 0 && args[0] == "serve" {
-		return runServe(args[1:], stdout, stderr, http.ListenAndServe)
+	if len(args) > 0 {
+		switch args[0] {
+		case "serve":
+			return runServe(args[1:], stdout, stderr, http.ListenAndServe)
+		case "dump":
+			return runDumpCmd(args[1:], stdout, stderr)
+		case "load":
+			return runLoadCmd(args[1:], stdin, stdout, stderr)
+		}
 	}
 	cfg, err := parseArgs(args)
 	if err != nil {
@@ -182,12 +189,15 @@ func printUsage(w io.Writer) {
 Usage:
   gr [flags] [database] [statement]
   gr serve [flags] [database]
+  gr dump  [flags] database
+  gr load  [flags] database
 
 Open the interactive shell on a database, run a one-shot statement, or run a
 script. With no database argument gr opens a transient in-memory database.
 
-The serve subcommand serves the HTTP/JSON API over a database; run
-"gr serve -h" for its flags.
+The serve subcommand serves the HTTP/JSON API over a database; the dump and
+load subcommands write and replay a logical Cypher dump. Run "gr serve -h",
+"gr dump -h", or "gr load -h" for their flags.
 
 Flags:
   -c, --cypher STMT     Run one statement and exit (repeatable)

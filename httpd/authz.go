@@ -15,22 +15,24 @@ const (
 	levelNone   = -1 // no role, or only unknown roles: may run nothing.
 	levelRead   = 0  // reader: read statements only.
 	levelWrite  = 1  // editor: read and write data.
-	levelSchema = 2  // publisher and admin: read, write, and change schema.
+	levelSchema = 2  // publisher: read, write, and change schema.
+	levelAdmin  = 3  // admin: everything publisher may, plus user management.
 )
 
 // roleLevel returns the access level a single role grants (doc 18 §10.6). An unknown
-// role grants nothing, so a typo in a role name fails closed rather than open. Admin is
-// the same level as publisher for query authorization, since the only statement kinds
-// are read, write, and schema; admin's extra power (user management, doc 08) is outside
-// what a query can express and so does not raise its query level.
+// role grants nothing, so a typo in a role name fails closed rather than open. Admin sits
+// above publisher because it alone may run the administrative statements (user and role
+// management, doc 18 §12.3), which a publisher may not.
 func roleLevel(role string) int {
 	switch role {
 	case "reader":
 		return levelRead
 	case "editor":
 		return levelWrite
-	case "publisher", "admin":
+	case "publisher":
 		return levelSchema
+	case "admin":
+		return levelAdmin
 	default:
 		return levelNone
 	}
@@ -50,14 +52,16 @@ func principalLevel(p *Principal) int {
 }
 
 // kindLevel returns the access level a statement of the given kind requires (doc 18
-// §10.6): a read needs levelRead, a write needs levelWrite, a schema change needs
-// levelSchema.
+// §10.6, §12.3): a read needs levelRead, a write needs levelWrite, a schema change needs
+// levelSchema, and an administrative statement needs levelAdmin.
 func kindLevel(k gr.Kind) int {
 	switch k {
 	case gr.WriteStatement:
 		return levelWrite
 	case gr.SchemaStatement:
 		return levelSchema
+	case gr.AdminStatement:
+		return levelAdmin
 	default:
 		return levelRead
 	}

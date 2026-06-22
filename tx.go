@@ -209,6 +209,13 @@ func (tx *Tx) Run(ctx context.Context, cypher string, params Params, opts ...Run
 	if q.Schema != nil {
 		return nil, ErrSchemaCommand
 	}
+	if q.Admin != nil {
+		// An administrative statement manages users through the credential API, which
+		// runs its own durable transaction (gr_admin.go); it would deadlock against the
+		// write lock this transaction holds, so it is not part of a managed transaction.
+		// Run it through the database-level Run.
+		return nil, ErrAdminCommand
+	}
 	if queryHasWrites(q) {
 		if !tx.write {
 			return nil, ErrReadOnly
@@ -292,6 +299,11 @@ func (tx *Tx) Exec(cypher string, params map[string]value.Value) (Summary, error
 		// deadlock against the write lock this transaction already holds, so it is
 		// not part of a managed transaction. Run it through the database-level Exec.
 		return Summary{}, ErrSchemaCommand
+	}
+	if q.Admin != nil {
+		// Likewise an administrative statement runs its own durable transaction through
+		// the credential API, so it is not part of a managed transaction.
+		return Summary{}, ErrAdminCommand
 	}
 	if err := internWriteNames(tx.etx, q); err != nil {
 		return Summary{}, err

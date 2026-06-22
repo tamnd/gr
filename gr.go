@@ -50,6 +50,11 @@ var ErrReadQuery = errors.New("gr: Query is read-only; use Exec for a write stat
 // write transaction and reports the schema mutation in its summary.
 var ErrSchemaCommand = errors.New("gr: schema commands run through Exec, not Query")
 
+// ErrAdminCommand is returned by Query when the statement is an administrative statement
+// (CREATE USER, GRANT ROLE, SHOW USERS); those run through Run, which routes them to the
+// credential API (doc 18 §10, §12.3).
+var ErrAdminCommand = errors.New("gr: administrative statements run through Run, not Query")
+
 // ErrExplain is returned when an EXPLAIN statement reaches an entry point that
 // cannot carry a plan listing. EXPLAIN yields rows (the operator tree), so it runs
 // through Run or a transaction's Run, not through the row-less Exec or the
@@ -555,6 +560,9 @@ func (db *DB) Run(ctx context.Context, cypher string, params Params, opts ...Run
 	if q.Explain {
 		return db.explain(q, db.eng, indexLookup{db.eng}, engineStats{db.eng})
 	}
+	if q.Admin != nil {
+		return db.execAdmin(q.Admin)
+	}
 	if q.Schema != nil {
 		s, err := db.execSchema(q.Schema)
 		if err != nil {
@@ -647,6 +655,18 @@ func (db *DB) Exec(cypher string, params map[string]value.Value) (Summary, error
 	}
 	if q.Explain {
 		return Summary{}, ErrExplain
+	}
+	if q.Admin != nil {
+		// A mutation administrative statement reports an empty summary, since it changes
+		// no graph data; SHOW USERS yields rows, which the row-less Exec cannot carry.
+		if _, isShow := q.Admin.(*ast.ShowUsers); isShow {
+			return Summary{}, ErrAdminRows
+		}
+		res, err := db.execAdmin(q.Admin)
+		if err != nil {
+			return Summary{}, err
+		}
+		return res.summary, nil
 	}
 	if q.Schema != nil {
 		return db.execSchema(q.Schema)
@@ -925,6 +945,9 @@ const (
 	WriteStatement
 	// SchemaStatement changes the schema (CREATE/DROP INDEX or CONSTRAINT).
 	SchemaStatement
+	// AdminStatement manages users and roles (CREATE/ALTER/DROP USER, SHOW USERS,
+	// GRANT/REVOKE ROLE). It requires the admin role (doc 18 §12.3).
+	AdminStatement
 )
 
 // String names the kind for diagnostics.
@@ -934,6 +957,8 @@ func (k Kind) String() string {
 		return "write"
 	case SchemaStatement:
 		return "schema"
+	case AdminStatement:
+		return "admin"
 	default:
 		return "read"
 	}
@@ -954,6 +979,8 @@ func (db *DB) StatementKind(cypher string) (Kind, error) {
 	switch {
 	case q.Explain:
 		return ReadStatement, nil
+	case q.Admin != nil:
+		return AdminStatement, nil
 	case q.Schema != nil:
 		return SchemaStatement, nil
 	case queryHasWrites(q):
@@ -1034,6 +1061,9 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 	if q.Schema != nil {
 		return nil, ErrSchemaCommand
 	}
+	if q.Admin != nil {
+		return nil, ErrAdminCommand
+	}
 	b, err := bind.Bind(q, bind.NewEngineCatalog(db.eng), false)
 	if err != nil {
 		return nil, err
@@ -1061,6 +1091,11 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 // st is nil the listing shows the plan without per-operator row estimates.
 func (db *DB) explain(q *ast.Query, cat bind.TokenResolver, ix plan.IndexLookup, st plan.Statistics) (*Result, error) {
 	if q.Schema != nil {
+		return nil, ErrExplainSchema
+	}
+	if q.Admin != nil {
+		// An administrative statement changes users outside the operator pipeline, so it
+		// has no plan to render, the same as a schema command.
 		return nil, ErrExplainSchema
 	}
 	b, err := bind.Bind(q, bind.NewEngineCatalog(cat), false)

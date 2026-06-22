@@ -17,10 +17,11 @@ import (
 // because a plain http.Handler does not own those; they arrive with the Bolt server and
 // the admission gate, so emitting them now as constant zeros would mislead an operator.
 type metrics struct {
-	mu       sync.Mutex
-	errors   map[string]int64 // by Neo4j status code
-	authOK   atomic.Int64
-	authFail atomic.Int64
+	mu          sync.Mutex
+	errors      map[string]int64 // by Neo4j status code
+	authOK      atomic.Int64
+	authFail    atomic.Int64
+	authLockout atomic.Int64
 }
 
 // newMetrics returns an empty metrics registry.
@@ -35,14 +36,26 @@ func (m *metrics) countError(code string) {
 	m.mu.Unlock()
 }
 
-// countAuth records one authentication outcome (doc 18 §10.3): the success/failure split
-// is the brute-force signal an operator alerts on.
-func (m *metrics) countAuth(ok bool) {
-	if ok {
+// authOutcome is the result of an authentication attempt for the metrics.
+type authOutcome int
+
+const (
+	authSuccess authOutcome = iota
+	authFailure
+	authLocked
+)
+
+// countAuth records one authentication outcome (doc 18 §10.3): the success/failure/lockout
+// split is the brute-force signal an operator alerts on.
+func (m *metrics) countAuth(outcome authOutcome) {
+	switch outcome {
+	case authSuccess:
 		m.authOK.Add(1)
-		return
+	case authLocked:
+		m.authLockout.Add(1)
+	default:
+		m.authFail.Add(1)
 	}
-	m.authFail.Add(1)
 }
 
 // handleMetrics serves GET /metrics in the Prometheus text exposition format (doc 18
@@ -78,6 +91,7 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	help(&b, "gr_server_auth_total", "counter", "authentication outcomes")
 	fmt.Fprintf(&b, "gr_server_auth_total{outcome=\"success\"} %d\n", s.metrics.authOK.Load())
 	fmt.Fprintf(&b, "gr_server_auth_total{outcome=\"failure\"} %d\n", s.metrics.authFail.Load())
+	fmt.Fprintf(&b, "gr_server_auth_total{outcome=\"lockout\"} %d\n", s.metrics.authLockout.Load())
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	_, _ = w.Write([]byte(b.String()))

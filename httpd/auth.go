@@ -29,13 +29,30 @@ type AuthProvider interface {
 	Schemes() []string
 }
 
-// Principal is an authenticated identity and its roles (doc 18 §10.4, §10.6). The
-// roles drive the authorization model, which is enforced in a later slice; this slice
-// authenticates and carries the principal so the transaction store can scope ownership
-// to it (doc 18 §9.9).
+// Principal is an authenticated identity and its roles (doc 18 §10.4, §10.6). The roles
+// drive the authorization model (doc 18 §10.6) and the transaction store scopes ownership
+// to the name (doc 18 §9.9). Token carries the validated claims for a bearer/JWT principal
+// and is nil for a basic credential, which has no token.
 type Principal struct {
 	Name  string
 	Roles []string
+	Token *Claims
+}
+
+// Claims is the validated content of a bearer/JWT token (doc 18 §10.4). It is what a
+// JWTProvider returns on the Principal so a downstream caller (audit, the token cache)
+// can read the subject, the issuer, and the expiry without re-parsing the token. Raw
+// holds every claim as decoded, so a deployment reads a custom claim the typed fields do
+// not name.
+type Claims struct {
+	Subject   string
+	Issuer    string
+	Audience  []string
+	ExpiresAt time.Time
+	NotBefore time.Time
+	IssuedAt  time.Time
+	Roles     []string
+	Raw       map[string]any
 }
 
 // ErrUnauthorized is the credential-check failure, mapped to 401 (doc 18 §12). The
@@ -49,6 +66,12 @@ var ErrUnauthorized = errors.New("gr: unauthorized")
 // metrics can tell a lockout apart from an ordinary failure to raise the brute-force
 // signal (the auth_total{outcome="lockout"} counter).
 var ErrLockedOut = fmt.Errorf("gr: account locked: %w", ErrUnauthorized)
+
+// ErrTokenExpired is returned when a bearer token's expiry has passed (doc 18 §10.4, §12).
+// It wraps ErrUnauthorized so a generic caller treats it as a failure, but the HTTP layer
+// maps it to the distinct Neo.ClientError.Security.TokenExpired code so a client can tell
+// an expired token (refresh and retry) apart from a bad one (re-authenticate).
+var ErrTokenExpired = fmt.Errorf("gr: token expired: %w", ErrUnauthorized)
 
 // Default lockout policy (doc 24): five failures locks a principal for a minute. Zero
 // max disables lockout. These are the spec's defaults; a deployment tunes them through
@@ -291,9 +314,20 @@ func (s *server) authenticate(r *http.Request) (*Principal, *authFail) {
 		}
 		return princ, nil
 	case strings.EqualFold(scheme, "Bearer"):
+		// A validated token is cached for its lifetime (bounded by the cache TTL) so a
+		// high-rate client with a JWT does not re-verify the signature on every request
+		// (doc 18 §10.4). A cache miss validates through the provider and caches the result.
+		if s.bearerCache != nil {
+			if princ, ok := s.bearerCache.get(rest); ok {
+				return princ, nil
+			}
+		}
 		princ, err := s.auth.Authenticate(r.Context(), "bearer", "", []byte(rest))
 		if err != nil {
 			return nil, unauthorized(err)
+		}
+		if s.bearerCache != nil {
+			s.bearerCache.put(rest, princ)
 		}
 		return princ, nil
 	default:
@@ -301,10 +335,18 @@ func (s *server) authenticate(r *http.Request) (*Principal, *authFail) {
 	}
 }
 
-// unauthorized is the generic 401 for a bad credential, non-disclosing about why. It
-// flags a lockout (from the underlying error) so the metrics can record it; the client
-// response is the same regardless.
+// unauthorized is the generic 401 for a bad credential, non-disclosing about why. An
+// expired token is the one exception: it maps to the distinct TokenExpired code with a
+// Bearer challenge so a client knows to refresh rather than re-authenticate (doc 18 §12).
+// It flags a lockout (from the underlying error) so the metrics can record it; the body
+// is otherwise the same regardless.
 func unauthorized(err error) *authFail {
+	if errors.Is(err, ErrTokenExpired) {
+		return &authFail{
+			err:    apiError{Code: "Neo.ClientError.Security.TokenExpired", Message: "authentication token expired"},
+			scheme: "Bearer realm=\"gr\", error=\"invalid_token\", error_description=\"token expired\"",
+		}
+	}
 	return &authFail{
 		err:     apiError{Code: "Neo.ClientError.Security.Unauthorized", Message: "invalid authentication credentials"},
 		scheme:  "Basic realm=\"gr\"",

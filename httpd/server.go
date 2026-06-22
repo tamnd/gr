@@ -18,13 +18,14 @@ const Version = "0.1.0"
 // 18 §7.5). A gr server holds one database; the name in a request path is validated
 // against this and otherwise carries no routing meaning.
 type server struct {
-	db        *gr.DB
-	name      string
-	txns      *txStore
-	now       func() time.Time
-	txTimeout time.Duration
-	auth      AuthProvider
-	metrics   *metrics
+	db          *gr.DB
+	name        string
+	txns        *txStore
+	now         func() time.Time
+	txTimeout   time.Duration
+	auth        AuthProvider
+	bearerCache *tokenCache
+	metrics     *metrics
 }
 
 // Options configures the handler.
@@ -38,6 +39,10 @@ type Options struct {
 	// Auth verifies credentials per request. Nil disables authentication, so every
 	// request is anonymous; set it (for example to a StaticProvider) to require auth.
 	Auth AuthProvider
+	// TokenCacheTTL bounds how long a validated bearer token is cached before it is
+	// revalidated (doc 18 §10.4). Zero uses defaultTokenCacheTTL; the cache is only
+	// consulted when Auth is set, since an anonymous server has no token to cache.
+	TokenCacheTTL time.Duration
 	// now overrides the clock for tests; nil uses time.Now.
 	now func() time.Time
 }
@@ -69,6 +74,13 @@ func New(db *gr.DB, opts Options) *Server {
 		clock = time.Now
 	}
 	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics()}
+	if opts.Auth != nil {
+		ttl := opts.TokenCacheTTL
+		if ttl == 0 {
+			ttl = defaultTokenCacheTTL
+		}
+		s.bearerCache = newTokenCache(ttl, clock)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)

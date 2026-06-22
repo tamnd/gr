@@ -52,6 +52,11 @@ const (
 	SecNodeColSeg
 	// SecRelColSeg is the relationship segmented-column store directory.
 	SecRelColSeg
+	// SecCredentials is the credential store Log (doc 18 §10.3): the served
+	// database's users, their salted password hashes, and their roles, held in a
+	// reserved system area of the file. Its meta field holds the Log's byte length.
+	// Empty until the first user is created.
+	SecCredentials
 	// numSectionsInUse is the count of section ids currently defined. It must
 	// stay <= MaxSections; later milestones add ids before this marker.
 	numSectionsInUse

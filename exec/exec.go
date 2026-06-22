@@ -98,6 +98,19 @@ type GraphObserver interface {
 	// is the raw neighbor count the engine produced for this source, the per-source fan-out whose
 	// tail is the supernode signal.
 	Expand(relType engine.Token, dir engine.Direction, fanout int, dur time.Duration)
+	// WCOJIntersect reports the time one worst-case-optimal multi-way intersection took, the cost
+	// of matching one input row's cyclic pattern (doc 20 §6.3).
+	WCOJIntersect(dur time.Duration)
+	// JoinBuild reports the time spent building one binary hash join's build side, a
+	// pipeline-breaker cost (doc 20 §6.3).
+	JoinBuild(dur time.Duration)
+	// Factorized reports that one operator produced or consumed a factorized intermediate, the
+	// factorization-engaged count (doc 20 §6.3).
+	Factorized()
+	// FactorizationRatio reports the flat-over-factorized size of one factorized intermediate, the
+	// compression factorization achieved; a high ratio is a many-to-many expansion it kept from
+	// blowing up (doc 20 §6.3).
+	FactorizationRatio(ratio float64)
 }
 
 // countScan adds n to the scanned-rows counter when one is armed (doc 20 §3.1). It is the
@@ -137,6 +150,33 @@ func (c *Ctx) countBinaryJoin() {
 func (c *Ctx) countExpand(relType engine.Token, dir engine.Direction, fanout int, dur time.Duration) {
 	if c.Graph != nil {
 		c.Graph.Expand(relType, dir, fanout, dur)
+	}
+}
+
+// countWCOJIntersect, countJoinBuild, countFactorized, and countFactorizationRatio report the
+// graph-join machinery's work to the observer when one is wired (doc 20 §6.3). Each is the single
+// place its operator reports; with no observer set they are a nil check and nothing more.
+func (c *Ctx) countWCOJIntersect(dur time.Duration) {
+	if c.Graph != nil {
+		c.Graph.WCOJIntersect(dur)
+	}
+}
+
+func (c *Ctx) countJoinBuild(dur time.Duration) {
+	if c.Graph != nil {
+		c.Graph.JoinBuild(dur)
+	}
+}
+
+func (c *Ctx) countFactorized() {
+	if c.Graph != nil {
+		c.Graph.Factorized()
+	}
+}
+
+func (c *Ctx) countFactorizationRatio(ratio float64) {
+	if c.Graph != nil {
+		c.Graph.FactorizationRatio(ratio)
 	}
 }
 

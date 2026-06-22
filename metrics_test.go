@@ -609,6 +609,76 @@ func TestMetricsWcoj(t *testing.T) {
 	if c := db.Metrics().Counter("gr_wcoj_total", nil); c != 1 {
 		t.Errorf("worst-case-optimal joins = %d, want 1", c)
 	}
+	if h := db.Metrics().Histogram("gr_wcoj_intersect_seconds", nil); h.Count == 0 {
+		t.Error("wcoj intersect time has no observations, want at least one")
+	}
+}
+
+// TestMetricsJoinBuild confirms the hash-join build-side timing records once per binary join. A
+// disconnected pattern is a binary join whose build side is read once (doc 20 §6.3).
+func TestMetricsJoinBuild(t *testing.T) {
+	db, err := Open("mjb.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	if _, err := db.Run(ctx, "CREATE (:Tag {n: 't'}), (:Doc {n: 'd'})", nil); err != nil {
+		t.Fatal(err)
+	}
+	r, err := db.Run(ctx, "MATCH (a:Tag), (b:Doc) RETURN a, b", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainResult(t, r)
+	if h := db.Metrics().Histogram("gr_join_build_seconds", nil); h.Count != 1 {
+		t.Errorf("join build observations = %d, want 1", h.Count)
+	}
+}
+
+// TestMetricsFactorized confirms a factorized count records the engaged counter and the
+// compression ratio. A count over an expand factorizes into an ExpandCount that emits one tally
+// row standing in for the edges it counted (doc 20 §6.3).
+func TestMetricsFactorized(t *testing.T) {
+	db, err := Open("mfz.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	if _, err := db.Run(ctx, "CREATE (a:Person {n: 'a'})-[:KNOWS]->(:Person {n: 'b'})", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Run(ctx, "MATCH (a:Person {n: 'a'}) CREATE (a)-[:KNOWS]->(:Person {n: 'c'})", nil); err != nil {
+		t.Fatal(err)
+	}
+	// Extra non-Person nodes make the labeled scan the selective end, so the optimizer anchors at
+	// a:Person and expands toward an unlabeled b, the shape the count factorizes (no target label
+	// on the expand).
+	for i := 0; i < 20; i++ {
+		if _, err := db.Run(ctx, "CREATE (:Widget {i: $i})", map[string]any{"i": i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r, err := db.Run(ctx, "MATCH (a:Person)-[:KNOWS]->(b) RETURN count(*) AS c", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainResult(t, r)
+	if c := db.Metrics().Counter("gr_factorized_total", nil); c != 1 {
+		t.Errorf("factorized operators = %d, want 1", c)
+	}
+	// Two KNOWS edges were counted into one tally row, so the flat-over-factorized ratio is two.
+	h := db.Metrics().Histogram("gr_factorization_ratio", nil)
+	if h.Count != 1 {
+		t.Errorf("factorization-ratio observations = %d, want 1", h.Count)
+	}
+	if h.Sum != 2 {
+		t.Errorf("factorization ratio = %v, want 2", h.Sum)
+	}
 }
 
 // TestMetricsAlwaysOn confirms the registry exists on a plain Open with no logging configured,

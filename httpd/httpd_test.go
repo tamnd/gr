@@ -1,0 +1,301 @@
+package httpd
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/tamnd/gr"
+	"github.com/tamnd/gr/vfs"
+)
+
+// newTestDB opens an in-memory database for a test and registers its close.
+func newTestDB(t *testing.T) *gr.DB {
+	t.Helper()
+	db, err := gr.Open(":memory:.gr", gr.Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// post sends a JSON query body to the query endpoint and returns the recorder.
+func post(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// decode unmarshals a JSON response body into a generic map.
+func decode(t *testing.T, b []byte) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("decode %q: %v", b, err)
+	}
+	return m
+}
+
+func TestDiscovery(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	doc := decode(t, rec.Body.Bytes())
+	if doc["gr_version"] != Version {
+		t.Errorf("gr_version = %v, want %q", doc["gr_version"], Version)
+	}
+	if doc["query"] != "/db/neo4j/query/v2" {
+		t.Errorf("query = %v", doc["query"])
+	}
+}
+
+func TestHealthAndReady(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	for _, path := range []string{"/healthz", "/readyz"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s status = %d, want 200", path, rec.Code)
+		}
+	}
+}
+
+func TestReadyzAfterClose(t *testing.T) {
+	db := newTestDB(t)
+	h := Handler(db, Options{})
+	_ = db.Close()
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("readyz after close = %d, want 503", rec.Code)
+	}
+}
+
+func TestBufferedQuery(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	rec := post(t, h, `{"statement":"RETURN 1 AS n, 'hi' AS s"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	out := decode(t, rec.Body.Bytes())
+	data := out["data"].(map[string]any)
+	fields := data["fields"].([]any)
+	if len(fields) != 2 || fields[0] != "n" || fields[1] != "s" {
+		t.Fatalf("fields = %v", fields)
+	}
+	values := data["values"].([]any)
+	if len(values) != 1 {
+		t.Fatalf("values = %v", values)
+	}
+	row := values[0].([]any)
+	if row[0] != float64(1) || row[1] != "hi" {
+		t.Errorf("row = %v", row)
+	}
+	if out["queryType"] != "r" {
+		t.Errorf("queryType = %v, want r", out["queryType"])
+	}
+}
+
+func TestWriteCounters(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	rec := post(t, h, `{"statement":"CREATE (:Person {name:'Ada'})","includeCounters":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	out := decode(t, rec.Body.Bytes())
+	if out["queryType"] != "w" {
+		t.Errorf("queryType = %v, want w", out["queryType"])
+	}
+	c := out["counters"].(map[string]any)
+	if c["containsUpdates"] != true {
+		t.Errorf("containsUpdates = %v", c["containsUpdates"])
+	}
+	if c["nodesCreated"] != float64(1) {
+		t.Errorf("nodesCreated = %v", c["nodesCreated"])
+	}
+}
+
+func TestParameters(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	rec := post(t, h, `{"statement":"RETURN $x + $y AS z","parameters":{"x":2,"y":3}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	out := decode(t, rec.Body.Bytes())
+	row := out["data"].(map[string]any)["values"].([]any)[0].([]any)
+	if row[0] != float64(5) {
+		t.Errorf("z = %v, want 5", row[0])
+	}
+}
+
+func TestLargeIntTagged(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	// 2^53 + 1 is outside the JavaScript-safe range, so it must be string-tagged.
+	rec := post(t, h, `{"statement":"RETURN 9007199254740993 AS big"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	out := decode(t, rec.Body.Bytes())
+	row := out["data"].(map[string]any)["values"].([]any)[0].([]any)
+	tagged, ok := row[0].(map[string]any)
+	if !ok {
+		t.Fatalf("big = %v (%T), want tagged object", row[0], row[0])
+	}
+	if tagged["$type"] != "Integer" || tagged["_value"] != "9007199254740993" {
+		t.Errorf("tagged = %v", tagged)
+	}
+}
+
+func TestIntegerEncodingString(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	req := httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2?integerEncoding=string",
+		strings.NewReader(`{"statement":"RETURN 7 AS n"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	out := decode(t, rec.Body.Bytes())
+	row := out["data"].(map[string]any)["values"].([]any)[0].([]any)
+	tagged, ok := row[0].(map[string]any)
+	if !ok || tagged["_value"] != "7" {
+		t.Errorf("n = %v, want string-tagged 7", row[0])
+	}
+}
+
+func TestReadModeRejectsWrite(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	rec := post(t, h, `{"statement":"CREATE (:X)","accessMode":"READ"}`)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403, body = %s", rec.Code, rec.Body.String())
+	}
+	out := decode(t, rec.Body.Bytes())
+	errs := out["errors"].([]any)
+	first := errs[0].(map[string]any)
+	if first["code"] != "Neo.ClientError.Statement.AccessMode" {
+		t.Errorf("code = %v", first["code"])
+	}
+}
+
+func TestSyntaxError(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	rec := post(t, h, `{"statement":"RETURE 1"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	out := decode(t, rec.Body.Bytes())
+	first := out["errors"].([]any)[0].(map[string]any)
+	if !strings.HasPrefix(first["code"].(string), "Neo.ClientError") {
+		t.Errorf("code = %v, want a client error", first["code"])
+	}
+}
+
+func TestMissingStatement(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	rec := post(t, h, `{"parameters":{}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestMethodNotAllowed(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	req := httptest.NewRequest(http.MethodGet, "/db/neo4j/query/v2", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", rec.Code)
+	}
+}
+
+func TestUnknownDatabase(t *testing.T) {
+	h := Handler(newTestDB(t), Options{Name: "graph"})
+	req := httptest.NewRequest(http.MethodPost, "/db/other/query/v2",
+		strings.NewReader(`{"statement":"RETURN 1"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestNDJSONStream(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	req := httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2?stream=true",
+		strings.NewReader(`{"statement":"UNWIND [1,2,3] AS n RETURN n"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if ct := rec.Header().Get("Content-Type"); ct != "application/x-ndjson" {
+		t.Fatalf("content-type = %q, body = %s", ct, rec.Body.String())
+	}
+	var header, summary map[string]any
+	var rows []map[string]any
+	sc := bufio.NewScanner(bytes.NewReader(rec.Body.Bytes()))
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		m := decode(t, line)
+		switch {
+		case m["header"] != nil:
+			header = m
+		case m["row"] != nil:
+			rows = append(rows, m)
+		case m["summary"] != nil:
+			summary = m
+		}
+	}
+	if header == nil {
+		t.Error("missing header line")
+	}
+	if len(rows) != 3 {
+		t.Errorf("got %d row lines, want 3", len(rows))
+	}
+	if summary == nil {
+		t.Error("missing summary line")
+	}
+}
+
+func TestNDJSONViaAccept(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	req := httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2",
+		strings.NewReader(`{"statement":"RETURN 1 AS n"}`))
+	req.Header.Set("Accept", "application/x-ndjson")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if ct := rec.Header().Get("Content-Type"); ct != "application/x-ndjson" {
+		t.Errorf("content-type = %q", ct)
+	}
+}
+
+func TestSchemaQueryType(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	rec := post(t, h, `{"statement":"CREATE INDEX person_name FOR (p:Person) ON (p.name)","includeCounters":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	out := decode(t, rec.Body.Bytes())
+	if out["queryType"] != "s" {
+		t.Errorf("queryType = %v, want s", out["queryType"])
+	}
+}
+
+func TestInvalidJSON(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	rec := post(t, h, `{not json`)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}

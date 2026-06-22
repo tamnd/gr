@@ -7,6 +7,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 
@@ -29,6 +30,9 @@ func main() {
 // returns the process exit code (doc 17 §10). Data goes to stdout, chatter to stderr,
 // so a pipeline reads clean output.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "serve" {
+		return runServe(args[1:], stdout, stderr, http.ListenAndServe)
+	}
 	cfg, err := parseArgs(args)
 	if err != nil {
 		fmt.Fprintln(stderr, "gr:", err)
@@ -177,9 +181,13 @@ func printUsage(w io.Writer) {
 
 Usage:
   gr [flags] [database] [statement]
+  gr serve [flags] [database]
 
 Open the interactive shell on a database, run a one-shot statement, or run a
 script. With no database argument gr opens a transient in-memory database.
+
+The serve subcommand serves the HTTP/JSON API over a database; run
+"gr serve -h" for its flags.
 
 Flags:
   -c, --cypher STMT     Run one statement and exit (repeatable)

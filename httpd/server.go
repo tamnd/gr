@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/tamnd/gr"
 )
@@ -17,8 +18,11 @@ const Version = "0.1.0"
 // 18 §7.5). A gr server holds one database; the name in a request path is validated
 // against this and otherwise carries no routing meaning.
 type server struct {
-	db   *gr.DB
-	name string
+	db        *gr.DB
+	name      string
+	txns      *txStore
+	now       func() time.Time
+	txTimeout time.Duration
 }
 
 // Options configures the handler.
@@ -26,6 +30,11 @@ type Options struct {
 	// Name is the database name the path /db/{name}/... must use. Empty defaults to
 	// "neo4j", the Neo4j default, so an unconfigured driver's path works.
 	Name string
+	// TxTimeout bounds how long a server-side HTTP transaction may sit idle between
+	// requests before it is reaped. Zero uses defaultTxTimeout.
+	TxTimeout time.Duration
+	// now overrides the clock for tests; nil uses time.Now.
+	now func() time.Time
 }
 
 // Handler builds the HTTP/JSON handler over a database (doc 18 §9.1). It is a plain
@@ -38,7 +47,15 @@ func Handler(db *gr.DB, opts Options) http.Handler {
 	if name == "" {
 		name = "neo4j"
 	}
-	s := &server{db: db, name: name}
+	timeout := opts.TxTimeout
+	if timeout == 0 {
+		timeout = defaultTxTimeout
+	}
+	clock := opts.now
+	if clock == nil {
+		clock = time.Now
+	}
+	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
@@ -66,11 +83,63 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	switch rest {
-	case "query/v2":
+	switch {
+	case rest == "query/v2":
 		s.handleQuery(w, r)
+	case rest == "tx":
+		s.routeTxBegin(w, r, name)
+	case strings.HasPrefix(rest, "tx/"):
+		s.routeTx(w, r, rest[len("tx/"):])
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+// routeTxBegin handles POST /db/{name}/tx (doc 18 §9.5).
+func (s *server) routeTxBegin(w http.ResponseWriter, r *http.Request, name string) {
+	if r.Method != http.MethodPost {
+		s.writeError(w, http.StatusMethodNotAllowed, apiError{
+			Code:    "Neo.ClientError.Request.Invalid",
+			Message: "begin a transaction with POST",
+		})
+		return
+	}
+	s.handleTxBegin(w, r, name)
+}
+
+// routeTx dispatches the id-bearing tx paths (doc 18 §9.5): /tx/{id} runs (POST) or
+// rolls back (DELETE), /tx/{id}/commit commits (POST). The id is the segment after
+// tx/; a /commit suffix selects the commit handler.
+func (s *server) routeTx(w http.ResponseWriter, r *http.Request, idPath string) {
+	if id, ok := strings.CutSuffix(idPath, "/commit"); ok {
+		if strings.Contains(id, "/") || id == "" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			s.writeError(w, http.StatusMethodNotAllowed, apiError{
+				Code:    "Neo.ClientError.Request.Invalid",
+				Message: "commit with POST",
+			})
+			return
+		}
+		s.handleTxCommit(w, r, id)
+		return
+	}
+	if strings.Contains(idPath, "/") || idPath == "" {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodPost:
+		s.handleTxRun(w, r, idPath)
+	case http.MethodDelete:
+		s.handleTxRollback(w, r, idPath)
+	default:
+		s.writeError(w, http.StatusMethodNotAllowed, apiError{
+			Code:    "Neo.ClientError.Request.Invalid",
+			Message: "run with POST or roll back with DELETE",
+		})
 	}
 }
 

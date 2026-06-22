@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tamnd/gr"
@@ -45,11 +46,13 @@ const defaultBoltAddr = ":7687"
 // database name in the URL path) do not overlap the shell's.
 //
 // listen is injected so a test can substitute a stub for net/http's ListenAndServe;
-// the real entry point passes http.ListenAndServe. boltServe is the matching seam for
-// the Bolt listener; serve builds the fully configured listener (address, TLS posture)
-// and boltServe runs it, so a test can inspect the configuration without binding a port.
-// The real entry point passes startBolt, a test passes a stub.
-func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, h http.Handler, tlsConf *tls.Config) error, boltServe func(ln *bolt.Listener) (io.Closer, error)) int {
+// the real entry point passes startHTTP. It receives a connection-state hook the real
+// listen sets on its http.Server so HTTP connections feed the session metrics (doc 20
+// §3.3); a test stub ignores it. boltServe is the matching seam for the Bolt listener;
+// serve builds the fully configured listener (address, TLS posture) and boltServe runs
+// it, so a test can inspect the configuration without binding a port. The real entry
+// point passes startBolt, a test passes a stub.
+func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, h http.Handler, tlsConf *tls.Config, connState func(net.Conn, http.ConnState)) error, boltServe func(ln *bolt.Listener) (io.Closer, error)) int {
 	fs := flag.NewFlagSet("gr serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	addr := fs.String("addr", defaultServeAddr, "address to listen on")
@@ -189,7 +192,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	// listener returns, so the goroutine does not outlive the server.
 	stop := make(chan struct{})
 	go sweepLoop(srv, stop)
-	err = listen(*addr, srv, httpTLSConf)
+	err = listen(*addr, srv, httpTLSConf, httpConnState(db))
 	close(stop)
 	if err != nil {
 		fmt.Fprintln(stderr, "gr:", err)
@@ -512,12 +515,58 @@ func httpTLSPosture(mode, certPath, keyPath string) (*tls.Config, error) {
 // startHTTP serves the HTTP handler at addr, plaintext when tlsConf is nil and HTTPS when
 // it is set. It is the real listen the serve command injects; a test substitutes a stub.
 // The certificate and key already live in tlsConf, so ListenAndServeTLS takes empty paths.
-func startHTTP(addr string, h http.Handler, tlsConf *tls.Config) error {
+// connState is the http.Server hook that feeds the session metrics; both transports build
+// their own server so the hook is set the same way with or without TLS.
+func startHTTP(addr string, h http.Handler, tlsConf *tls.Config, connState func(net.Conn, http.ConnState)) error {
+	srv := &http.Server{Addr: addr, Handler: h, TLSConfig: tlsConf, ConnState: connState}
 	if tlsConf == nil {
-		return http.ListenAndServe(addr, h)
+		return srv.ListenAndServe()
 	}
-	srv := &http.Server{Addr: addr, Handler: h, TLSConfig: tlsConf}
 	return srv.ListenAndServeTLS("", "")
+}
+
+// httpConnState returns the http.Server connection-state hook that feeds the HTTP session
+// metrics (doc 20 §3.3): a new connection opens a session, and a closed or hijacked one ends
+// it after its lifetime. It tracks each connection's open time so the close can report a
+// duration, the long-lived-pooled versus short-lived-churn distinction the gauge and histogram
+// expose. A nil database returns a nil hook, so a server built without metrics sets none.
+func httpConnState(db *gr.DB) func(net.Conn, http.ConnState) {
+	if db == nil {
+		return nil
+	}
+	t := &connTracker{db: db, opened: make(map[net.Conn]time.Time)}
+	return t.onState
+}
+
+// connTracker remembers when each live HTTP connection opened, so it can report a lifetime when
+// the connection closes. http.Server calls the hook from many goroutines, so the map is guarded.
+type connTracker struct {
+	db     *gr.DB
+	mu     sync.Mutex
+	opened map[net.Conn]time.Time
+}
+
+// onState is the http.Server.ConnState callback. A connection enters StateNew once, before its
+// first request, and reaches StateClosed or StateHijacked once at its end, so opening on New and
+// closing on Closed or Hijacked counts each connection exactly once whatever its keep-alive
+// request count. The intermediate Active and Idle transitions are keep-alive churn the session
+// gauge does not observe.
+func (t *connTracker) onState(c net.Conn, state http.ConnState) {
+	switch state {
+	case http.StateNew:
+		t.mu.Lock()
+		t.opened[c] = time.Now()
+		t.mu.Unlock()
+		t.db.RecordSessionOpen("http")
+	case http.StateClosed, http.StateHijacked:
+		t.mu.Lock()
+		start, ok := t.opened[c]
+		delete(t.opened, c)
+		t.mu.Unlock()
+		if ok {
+			t.db.RecordSessionClose("http", time.Since(start))
+		}
+	}
 }
 
 // loadServerTLS loads the certificate chain and private key and returns a server

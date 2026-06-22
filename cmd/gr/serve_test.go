@@ -16,6 +16,7 @@ import (
 	"errors"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -91,7 +92,7 @@ func TestServeBuildsHandler(t *testing.T) {
 	// The real listener blocks until shutdown, so the database is open for the whole
 	// run. The stub mirrors that by exercising the handler before it returns, while
 	// runServe's deferred Close has not yet fired.
-	listen := func(addr string, h http.Handler, _ *tls.Config) error {
+	listen := func(addr string, h http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
 		gotAddr = addr
 		req := httptest.NewRequest(http.MethodPost, "/db/graph/query/v2",
 			strings.NewReader(`{"statement":"RETURN 1 AS n"}`))
@@ -115,7 +116,7 @@ func TestServeBuildsHandler(t *testing.T) {
 // TestServeDefaultAddr confirms the default listen address is the Neo4j HTTP port.
 func TestServeDefaultAddr(t *testing.T) {
 	var gotAddr string
-	listen := func(addr string, h http.Handler, _ *tls.Config) error {
+	listen := func(addr string, h http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
 		gotAddr = addr
 		return nil
 	}
@@ -132,7 +133,7 @@ func TestServeDefaultAddr(t *testing.T) {
 // request without credentials is rejected and one with them succeeds.
 func TestServeWithAuth(t *testing.T) {
 	var h http.Handler
-	listen := func(addr string, handler http.Handler, _ *tls.Config) error {
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
 		h = handler
 		req := httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2",
 			strings.NewReader(`{"statement":"RETURN 1 AS n"}`))
@@ -165,7 +166,7 @@ func TestServeWithAuth(t *testing.T) {
 // reader is refused a write while an editor is allowed one, and a roleless --user
 // defaults to admin (full access).
 func TestServeUserRoles(t *testing.T) {
-	listen := func(addr string, handler http.Handler, _ *tls.Config) error {
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
 		send := func(user, statement string) int {
 			body := `{"statement":"` + statement + `"}`
 			req := httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2", strings.NewReader(body))
@@ -197,7 +198,7 @@ func TestServeUserRoles(t *testing.T) {
 
 // TestServeBadUser rejects a malformed --user as a usage error.
 func TestServeBadUser(t *testing.T) {
-	listen := func(addr string, h http.Handler, _ *tls.Config) error { return nil }
+	listen := func(addr string, h http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
 	var out, errw bytes.Buffer
 	if code := runServe([]string{"--user", "nopassword"}, &out, &errw, listen, noBolt); code != exitUsage {
 		t.Errorf("code = %d, want exitUsage", code)
@@ -226,7 +227,7 @@ func TestServeJWT(t *testing.T) {
 		"exp":   float64(time.Now().Add(time.Hour).Unix()),
 		"roles": []string{"editor"},
 	})
-	listen := func(addr string, handler http.Handler, _ *tls.Config) error {
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
 		send := func(authz, statement string) int {
 			req := httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2", strings.NewReader(`{"statement":"`+statement+`"}`))
 			if authz != "" {
@@ -253,7 +254,7 @@ func TestServeJWT(t *testing.T) {
 // TestServeAuthConflict rejects mixing --user and --jwt-* as a usage error, since the
 // server runs one provider at a time.
 func TestServeAuthConflict(t *testing.T) {
-	listen := func(addr string, h http.Handler, _ *tls.Config) error { return nil }
+	listen := func(addr string, h http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
 	var out, errw bytes.Buffer
 	args := []string{"--user", "alice:secret", "--jwt-hmac-secret", "x"}
 	if code := runServe(args, &out, &errw, listen, noBolt); code != exitUsage {
@@ -277,7 +278,7 @@ func TestServeAuthStore(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	listen := func(addr string, handler http.Handler, _ *tls.Config) error {
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
 		send := func(authz, statement string) int {
 			req := httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2", strings.NewReader(`{"statement":"`+statement+`"}`))
 			if authz != "" {
@@ -308,7 +309,7 @@ func TestServeAuthStore(t *testing.T) {
 
 // TestServeAuthStoreConflict rejects mixing --auth-store with --user as a usage error.
 func TestServeAuthStoreConflict(t *testing.T) {
-	listen := func(addr string, h http.Handler, _ *tls.Config) error { return nil }
+	listen := func(addr string, h http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
 	var out, errw bytes.Buffer
 	args := []string{"--auth-store", "--user", "alice:secret"}
 	if code := runServe(args, &out, &errw, listen, noBolt); code != exitUsage {
@@ -319,7 +320,7 @@ func TestServeAuthStoreConflict(t *testing.T) {
 // TestServeImpersonationNeedsAuth rejects --auth-impersonation with no auth provider as a
 // usage error, since impersonation needs a principal to authorize against.
 func TestServeImpersonationNeedsAuth(t *testing.T) {
-	listen := func(addr string, h http.Handler, _ *tls.Config) error { return nil }
+	listen := func(addr string, h http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
 	var out, errw bytes.Buffer
 	if code := runServe([]string{"--auth-impersonation"}, &out, &errw, listen, noBolt); code != exitUsage {
 		t.Errorf("code = %d, want exitUsage", code)
@@ -329,7 +330,7 @@ func TestServeImpersonationNeedsAuth(t *testing.T) {
 // TestServeImpersonationEndToEnd serves with --user and --auth-impersonation and confirms
 // an admin can run a query as another user over the wire.
 func TestServeImpersonationEndToEnd(t *testing.T) {
-	listen := func(addr string, handler http.Handler, _ *tls.Config) error {
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
 		body := `{"statement":"CREATE (:T)","impersonatedUser":"e"}`
 		req := httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2", strings.NewReader(body))
 		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("boss:pw")))
@@ -349,7 +350,7 @@ func TestServeImpersonationEndToEnd(t *testing.T) {
 
 // TestServeListenError surfaces a listener failure as the I/O exit code.
 func TestServeListenError(t *testing.T) {
-	listen := func(addr string, h http.Handler, _ *tls.Config) error {
+	listen := func(addr string, h http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
 		return http.ErrServerClosed
 	}
 	var out, errw bytes.Buffer
@@ -364,7 +365,7 @@ func TestServeListenError(t *testing.T) {
 // still open.
 func TestServeBolt(t *testing.T) {
 	var ln *bolt.Listener
-	listen := func(addr string, handler http.Handler, _ *tls.Config) error {
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
 		if ln == nil || ln.Server == nil || ln.Server.Handler == nil {
 			t.Fatal("Bolt handler not captured before HTTP listen")
 		}
@@ -409,7 +410,7 @@ func TestServeBolt(t *testing.T) {
 // TestServeBoltAddr confirms --bolt-addr overrides the Bolt listen address.
 func TestServeBoltAddr(t *testing.T) {
 	var ln *bolt.Listener
-	listen := func(addr string, handler http.Handler, _ *tls.Config) error { return nil }
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
 	var out, errw bytes.Buffer
 	code := runServe([]string{"--bolt", "--bolt-addr", "127.0.0.1:9100"}, &out, &errw, listen, captureBolt(&ln))
 	if code != exitOK {
@@ -425,7 +426,7 @@ func TestServeBoltAddr(t *testing.T) {
 // the none scheme is rejected.
 func TestServeBoltAuth(t *testing.T) {
 	var ln *bolt.Listener
-	listen := func(addr string, handler http.Handler, _ *tls.Config) error {
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
 		h := ln.Server.Handler
 		if _, err := h.Authenticate("basic", "alice", "secret"); err != nil {
 			t.Errorf("valid credentials rejected over Bolt: %v", err)
@@ -450,7 +451,7 @@ func TestServeBoltAuth(t *testing.T) {
 func TestServeBoltTLS(t *testing.T) {
 	certPath, keyPath := writeTestCert(t)
 	var ln *bolt.Listener
-	listen := func(addr string, handler http.Handler, _ *tls.Config) error { return nil }
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
 	var out, errw bytes.Buffer
 	args := []string{"--bolt", "--bolt-tls", "required", "--tls-cert", certPath, "--tls-key", keyPath}
 	code := runServe(args, &out, &errw, listen, captureBolt(&ln))
@@ -479,7 +480,7 @@ func TestServeBoltTLS(t *testing.T) {
 func TestServeBoltTLSOptional(t *testing.T) {
 	certPath, keyPath := writeTestCert(t)
 	var ln *bolt.Listener
-	listen := func(addr string, handler http.Handler, _ *tls.Config) error { return nil }
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
 	var out, errw bytes.Buffer
 	args := []string{"--bolt", "--bolt-tls", "optional", "--tls-cert", certPath, "--tls-key", keyPath}
 	code := runServe(args, &out, &errw, listen, captureBolt(&ln))
@@ -496,7 +497,7 @@ func TestServeBoltTLSOptional(t *testing.T) {
 
 // TestServeBoltTLSMissingCert rejects an encrypted posture with no certificate material.
 func TestServeBoltTLSMissingCert(t *testing.T) {
-	listen := func(addr string, handler http.Handler, _ *tls.Config) error { return nil }
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
 	var out, errw bytes.Buffer
 	code := runServe([]string{"--bolt", "--bolt-tls", "required"}, &out, &errw, listen, captureBolt(new(*bolt.Listener)))
 	if code != exitUsage {
@@ -509,7 +510,7 @@ func TestServeBoltTLSMissingCert(t *testing.T) {
 
 // TestServeBoltTLSInvalidMode rejects an unknown posture.
 func TestServeBoltTLSInvalidMode(t *testing.T) {
-	listen := func(addr string, handler http.Handler, _ *tls.Config) error { return nil }
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
 	var out, errw bytes.Buffer
 	code := runServe([]string{"--bolt", "--bolt-tls", "maybe"}, &out, &errw, listen, captureBolt(new(*bolt.Listener)))
 	if code != exitUsage {
@@ -519,7 +520,7 @@ func TestServeBoltTLSInvalidMode(t *testing.T) {
 
 // TestServeBoltError surfaces a Bolt listener bind failure as the I/O exit code.
 func TestServeBoltError(t *testing.T) {
-	listen := func(addr string, h http.Handler, _ *tls.Config) error { return nil }
+	listen := func(addr string, h http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
 	boltServe := func(ln *bolt.Listener) (io.Closer, error) {
 		return nil, errors.New("bind failed")
 	}
@@ -547,11 +548,47 @@ func TestStartBolt(t *testing.T) {
 	}
 }
 
+// TestHTTPConnStateSessionMetrics confirms the connection-state hook feeds the HTTP session
+// metrics (doc 20 §3.3): a new connection opens a session and a closed one ends it, leaving the
+// gauge back at zero and one duration observation.
+func TestHTTPConnStateSessionMetrics(t *testing.T) {
+	db, err := gr.Open(memPath, gr.Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	hook := httpConnState(db)
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	hook(c1, http.StateNew)
+	snap := db.Metrics()
+	if g := snap.Gauge("gr_sessions_open", gr.Labels{"protocol": "http"}); g != 1 {
+		t.Errorf("sessions_open = %d, want 1 while the connection is live", g)
+	}
+	if c := snap.Counter("gr_sessions_total", gr.Labels{"protocol": "http"}); c != 1 {
+		t.Errorf("sessions_total = %d, want 1", c)
+	}
+
+	hook(c1, http.StateActive) // keep-alive churn the gauge ignores
+	hook(c1, http.StateIdle)
+	hook(c1, http.StateClosed)
+	snap = db.Metrics()
+	if g := snap.Gauge("gr_sessions_open", gr.Labels{"protocol": "http"}); g != 0 {
+		t.Errorf("sessions_open = %d, want 0 after the connection closed", g)
+	}
+	if h := snap.Histogram("gr_session_duration_seconds", gr.Labels{"protocol": "http"}); h.Count != 1 {
+		t.Errorf("session duration count = %d, want 1", h.Count)
+	}
+}
+
 // TestServeMaxInFlight confirms the --max-in-flight flag is accepted and the server
 // still serves; the gate's behavior is covered at the unit and adapter level.
 func TestServeMaxInFlight(t *testing.T) {
 	var ln *bolt.Listener
-	listen := func(addr string, h http.Handler, _ *tls.Config) error { return nil }
+	listen := func(addr string, h http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
 	var out, errw bytes.Buffer
 	code := runServe([]string{"--bolt", "--max-in-flight", "4"}, &out, &errw, listen, captureBolt(&ln))
 	if code != exitOK {
@@ -567,7 +604,7 @@ func TestServeMaxInFlight(t *testing.T) {
 func TestServeHTTPTLS(t *testing.T) {
 	certPath, keyPath := writeTestCert(t)
 	var gotTLS *tls.Config
-	listen := func(addr string, h http.Handler, c *tls.Config) error {
+	listen := func(addr string, h http.Handler, c *tls.Config, _ func(net.Conn, http.ConnState)) error {
 		gotTLS = c
 		return nil
 	}
@@ -594,7 +631,7 @@ func TestServeHTTPTLS(t *testing.T) {
 // TestServeHTTPPlaintext confirms the default posture hands the listener a nil TLS config.
 func TestServeHTTPPlaintext(t *testing.T) {
 	var sawTLS bool
-	listen := func(addr string, h http.Handler, c *tls.Config) error {
+	listen := func(addr string, h http.Handler, c *tls.Config, _ func(net.Conn, http.ConnState)) error {
 		sawTLS = c != nil
 		return nil
 	}
@@ -609,7 +646,7 @@ func TestServeHTTPPlaintext(t *testing.T) {
 
 // TestServeHTTPTLSMissingCert rejects --http-tls required with no certificate material.
 func TestServeHTTPTLSMissingCert(t *testing.T) {
-	listen := func(addr string, h http.Handler, _ *tls.Config) error { return nil }
+	listen := func(addr string, h http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
 	var out, errw bytes.Buffer
 	if code := runServe([]string{"--http-tls", "required"}, &out, &errw, listen, noBolt); code != exitUsage {
 		t.Errorf("code = %d, want exitUsage", code)
@@ -618,7 +655,7 @@ func TestServeHTTPTLSMissingCert(t *testing.T) {
 
 // TestServeHTTPTLSInvalidMode rejects an unknown HTTP posture.
 func TestServeHTTPTLSInvalidMode(t *testing.T) {
-	listen := func(addr string, h http.Handler, _ *tls.Config) error { return nil }
+	listen := func(addr string, h http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
 	var out, errw bytes.Buffer
 	if code := runServe([]string{"--http-tls", "maybe"}, &out, &errw, listen, noBolt); code != exitUsage {
 		t.Errorf("code = %d, want exitUsage", code)

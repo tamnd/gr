@@ -92,10 +92,15 @@ type joinOp struct {
 	table map[string][]eval.Row
 	built bool
 
-	// grace is non-nil once the build side has grown past the memory budget and the
-	// join has spilled its partitions to disk (spilljoin.go). When it is set, next
-	// pulls from it instead of probing the in-memory table.
-	grace *graceJoin
+	// grace is non-nil once a keyed join's build side has grown past the memory
+	// budget and the join has spilled its partitions to disk (spilljoin.go); next
+	// then pulls from it instead of probing the in-memory table. blockBuild is the
+	// counterpart for a keyless (cartesian) join, which cannot be partitioned by key:
+	// the build side spills to one file that blockRdr streams once per probe row, a
+	// block-nested-loop over disk.
+	grace      *graceJoin
+	blockBuild *spillPart
+	blockRdr   *partReader
 
 	cur     eval.Row
 	matches []eval.Row
@@ -104,6 +109,7 @@ type joinOp struct {
 
 func (o *joinOp) open(ctx *Ctx) error {
 	o.ctx, o.table, o.built, o.grace = ctx, nil, false, nil
+	o.blockBuild, o.blockRdr = nil, nil
 	o.cur, o.matches, o.mpos = nil, nil, 0
 	if err := o.right.open(ctx); err != nil {
 		return err
@@ -113,14 +119,14 @@ func (o *joinOp) open(ctx *Ctx) error {
 
 // build reads the whole build (right) side. While the budget allows it the rows go
 // into the in-memory hash table, the fast path. If the table grows past the budget
-// (and spilling is configured and the join has a key to partition on), the join
-// switches to a grace hash join: it moves the buffered rows and the rest of the
-// build side into partition temp files, then partitions the entire probe (left)
-// side too, leaving next to iterate the partitions.
+// and spilling is configured, the join spills to disk: a keyed join switches to a
+// grace hash join (partition both inputs by key), and a keyless join (a cartesian
+// product, which has no key to partition on) spills the build side to one file that
+// next streams per probe row.
 func (o *joinOp) build() error {
 	o.table = map[string][]eval.Row{}
 	var bytes int64
-	canSpill := o.ctx.spillEnabled() && len(o.on) > 0
+	canSpill := o.ctx.spillEnabled()
 	for {
 		row, ok, err := o.right.next()
 		if err != nil {
@@ -129,20 +135,29 @@ func (o *joinOp) build() error {
 		if !ok {
 			break
 		}
-		if o.grace == nil && canSpill && bytes > o.ctx.MemBudget {
-			if err := o.spill(); err != nil {
+		if canSpill && o.grace == nil && o.blockBuild == nil && bytes > o.ctx.MemBudget {
+			if len(o.on) > 0 {
+				if err := o.spillKeyed(); err != nil {
+					return err
+				}
+			} else if err := o.spillKeyless(); err != nil {
 				return err
 			}
 		}
-		if o.grace != nil {
+		switch {
+		case o.grace != nil:
 			if err := o.grace.partitionRight(row); err != nil {
 				return err
 			}
-			continue
+		case o.blockBuild != nil:
+			if err := o.blockBuild.write(row); err != nil {
+				return err
+			}
+		default:
+			k := rowKey(row, o.on)
+			o.table[k] = append(o.table[k], row)
+			bytes += rowSize(row)
 		}
-		k := rowKey(row, o.on)
-		o.table[k] = append(o.table[k], row)
-		bytes += rowSize(row)
 	}
 	if o.grace != nil {
 		for {
@@ -163,9 +178,9 @@ func (o *joinOp) build() error {
 	return nil
 }
 
-// spill creates the grace join and moves the rows buffered so far into its
+// spillKeyed creates the grace join and moves the rows buffered so far into its
 // partition files, after which build routes the remaining build-side rows there too.
-func (o *joinOp) spill() error {
+func (o *joinOp) spillKeyed() error {
 	g, err := newGraceJoin(o.ctx, o.on)
 	if err != nil {
 		return err
@@ -183,6 +198,26 @@ func (o *joinOp) spill() error {
 	return nil
 }
 
+// spillKeyless opens one spill file for a cartesian join's build side and moves the
+// rows buffered so far into it, after which build appends the rest there too.
+func (o *joinOp) spillKeyless() error {
+	part, err := newSpillPart(o.ctx)
+	if err != nil {
+		return err
+	}
+	for _, rows := range o.table {
+		for _, r := range rows {
+			if err := part.write(r); err != nil {
+				_ = part.discardOnce()
+				return err
+			}
+		}
+	}
+	o.table = nil
+	o.blockBuild = part
+	return nil
+}
+
 func (o *joinOp) next() (eval.Row, bool, error) {
 	if !o.built {
 		if err := o.build(); err != nil {
@@ -191,6 +226,9 @@ func (o *joinOp) next() (eval.Row, bool, error) {
 	}
 	if o.grace != nil {
 		return o.grace.next()
+	}
+	if o.blockBuild != nil {
+		return o.nextBlock()
 	}
 	for {
 		for o.mpos < len(o.matches) {
@@ -208,9 +246,36 @@ func (o *joinOp) next() (eval.Row, bool, error) {
 	}
 }
 
+// nextBlock is the block-nested-loop probe for a spilled cartesian join: for each
+// left row it streams the whole spilled build side from disk, pairing every build
+// row with the current left row.
+func (o *joinOp) nextBlock() (eval.Row, bool, error) {
+	for {
+		if o.blockRdr != nil {
+			row, ok, err := o.blockRdr.next()
+			if err != nil {
+				return nil, false, err
+			}
+			if ok {
+				return mergeRows(o.cur, row), true, nil
+			}
+			o.blockRdr = nil
+		}
+		left, ok, err := o.left.next()
+		if err != nil || !ok {
+			return nil, false, err
+		}
+		o.cur = left
+		o.blockRdr = &partReader{p: o.blockBuild}
+	}
+}
+
 func (o *joinOp) close() error {
 	if o.grace != nil {
 		o.grace.cleanup()
+	}
+	if o.blockBuild != nil {
+		_ = o.blockBuild.discardOnce()
 	}
 	err := o.left.close()
 	if rerr := o.right.close(); err == nil {

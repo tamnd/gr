@@ -150,36 +150,65 @@ func TestSpillJoinMatchesInMemory(t *testing.T) {
 	}
 }
 
-// TestSpillJoinEmptyKeyStaysInMemory checks a keyless join (a cartesian product)
-// is never spilled even with a budget armed, since it has no key to partition on.
-func TestSpillJoinEmptyKeyStaysInMemory(t *testing.T) {
-	left := []eval.Row{{"l": value.Int(1)}, {"l": value.Int(2)}}
-	right := []eval.Row{{"r": value.Int(10)}, {"r": value.Int(20)}}
+// runCartesian drains a fresh keyless join (a cartesian product) under the given
+// context and returns its output rows as a multiset.
+func runCartesian(t *testing.T, ctx *Ctx, left, right []eval.Row) map[string]int {
+	t.Helper()
 	o := &joinOp{
 		on:    nil,
 		left:  &staticOp{rows: left},
 		right: &staticOp{rows: right},
 	}
-	ctx := &Ctx{MemBudget: 1, TempFile: memTempFiles()}
 	if err := o.open(ctx); err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	defer o.close()
-	n := 0
+	out := map[string]int{}
 	for {
-		_, ok, err := o.next()
+		row, ok, err := o.next()
 		if err != nil {
 			t.Fatalf("next: %v", err)
 		}
 		if !ok {
 			break
 		}
-		n++
+		out[rowCanon(row)]++
 	}
-	if o.grace != nil {
-		t.Fatal("keyless join should not spill")
+	return out
+}
+
+// TestSpillCartesianMatchesInMemory checks a keyless join (a cartesian product),
+// which has no key to partition on, spills its build side to one file and streams it
+// per probe row (a block-nested-loop over disk) without changing its output. The
+// spilled run uses a tiny budget that forces the build side out of memory.
+func TestSpillCartesianMatchesInMemory(t *testing.T) {
+	const (
+		nLeft  = 200
+		nRight = 300
+	)
+	var left []eval.Row
+	for i := 0; i < nLeft; i++ {
+		left = append(left, eval.Row{"l": value.Int(int64(i))})
 	}
-	if n != len(left)*len(right) {
-		t.Fatalf("cartesian product: got %d rows, want %d", n, len(left)*len(right))
+	var right []eval.Row
+	for i := 0; i < nRight; i++ {
+		right = append(right, eval.Row{
+			"r": value.Int(int64(i)),
+			"p": value.String("padding-padding-padding-padding"),
+		})
+	}
+
+	want := runCartesian(t, &Ctx{}, left, right)
+
+	spillCtx := &Ctx{MemBudget: 512, TempFile: memTempFiles()}
+	got := runCartesian(t, spillCtx, left, right)
+
+	if len(want) != len(got) || len(want) != nLeft*nRight {
+		t.Fatalf("distinct rows: in-memory %d, spilled %d, want %d", len(want), len(got), nLeft*nRight)
+	}
+	for k, n := range want {
+		if got[k] != n {
+			t.Fatalf("row %q count: in-memory %d, spilled %d", k, n, got[k])
+		}
 	}
 }

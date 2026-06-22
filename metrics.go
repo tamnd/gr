@@ -3,6 +3,7 @@ package gr
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -181,6 +182,13 @@ var sessionDurationBuckets = []float64{
 	0.001, 0.01, 0.1, 1, 10, 60, 300, 900, 1800, 3600,
 }
 
+// metricIndexKinds is the bounded domain of the kind label on the index metrics (doc 20 §6.4):
+// the access kind a lookup used. gr_index_lookup_seconds is pre-registered for each so its
+// histogram series are present before the first lookup of a kind. The point kind is the equality
+// seek the planner's seek rewrite produces today; the rest are registered ahead of the access paths
+// that will fill them.
+var metricIndexKinds = []string{"unique", "range", "point", "label", "fulltext"}
+
 // metricAuthResults is the bounded domain of the result label on gr_auth_attempts_total (doc 20
 // §3.3): whether an authentication attempt was allowed (ok) or rejected (denied). Both are
 // pre-registered so a server that has only ever seen successes still exposes the denied series at
@@ -224,6 +232,18 @@ type queryMetrics struct {
 
 	authAttempts map[string]*metric.Counter // gr_auth_attempts_total by [result]
 
+	indexLookupSeconds map[string]*metric.Histogram // gr_index_lookup_seconds by [kind]
+
+	// indexNameOf resolves an indexed (label, property) token pair to the index name for the
+	// gr_index_lookups_total index label. It is wired at Open once the engine exists; until then it
+	// is nil and a lookup is attributed to a derived label.token:prop.token name.
+	indexNameOf func(label, prop engine.Token) string
+	// indexLookups caches the per-(index,kind) lookup counter, keyed by indexKey. The index name
+	// resolution scans the engine's index list, too much for a per-lookup path, so the first lookup
+	// of a (label,prop,kind) resolves the name and stores the counter and every later one is a
+	// lock-free load. The key space is the schema's indexes times the access kinds, so it stays small.
+	indexLookups sync.Map // indexKey -> *metric.Counter
+
 	// sessionHandles caches the per-protocol session metric handles, keyed by protocol string
 	// (bolt, http). A protocol's handles are registered on its first session and loaded lock-free
 	// after, the same pattern the expand handles use. The key space is the set of wire protocols the
@@ -247,6 +267,15 @@ type queryMetrics struct {
 	// handles and every later one is a lock-free load. The key space is bounded by the schema's
 	// relationship types times three directions, so the cache stays small (§7.2).
 	expandHandles sync.Map // expandKey -> *expandHandles
+}
+
+// indexKey identifies the lookup counter for one index access: the indexed label and property
+// tokens and the access kind. The tokens resolve to the index name once and the counter is cached
+// under this key, so the resolution cost is paid once per distinct access shape.
+type indexKey struct {
+	label engine.Token
+	prop  engine.Token
+	kind  string
 }
 
 // expandKey identifies the metric handles for one expand shape: the operator's type token (zero
@@ -300,10 +329,17 @@ func newQueryMetrics() *queryMetrics {
 		txDuration: make(map[string]*metric.Histogram, len(metricTxModes)),
 
 		authAttempts: make(map[string]*metric.Counter, len(metricAuthResults)),
+
+		indexLookupSeconds: make(map[string]*metric.Histogram, len(metricIndexKinds)),
 	}
 	for _, r := range metricAuthResults {
 		m.authAttempts[r] = reg.Counter("gr_auth_attempts_total",
 			"Authentication attempts, by result", "attempts", metric.Labels{"result": r})
+	}
+	for _, k := range metricIndexKinds {
+		m.indexLookupSeconds[k] = reg.Histogram("gr_index_lookup_seconds",
+			"Index-descent latency, the anchor cost, by access kind", "seconds",
+			queryLatencyBuckets, metric.Labels{"kind": k})
 	}
 	for _, mode := range metricTxModes {
 		m.txOpen[mode] = reg.Gauge("gr_transactions_open",
@@ -694,6 +730,44 @@ func (g graphObserver) FactorizationRatio(ratio float64) {
 	if g.m.factorizationRatio != nil {
 		g.m.factorizationRatio.Observe(ratio)
 	}
+}
+
+func (g graphObserver) IndexSeek(label, prop engine.Token, kind string, dur time.Duration) {
+	g.m.recordIndexSeek(label, prop, kind, dur)
+}
+
+// recordIndexSeek records one index-served anchor lookup (doc 20 §6.4): it bumps the
+// per-(index,kind) lookup counter and observes the descent latency by kind. The counter handle is
+// resolved once per access shape and cached, so the steady-state cost is a sync.Map load and two
+// updates.
+func (m *queryMetrics) recordIndexSeek(label, prop engine.Token, kind string, dur time.Duration) {
+	m.indexLookupCounter(label, prop, kind).Inc()
+	if h := m.indexLookupSeconds[kind]; h != nil {
+		h.Observe(dur.Seconds())
+	}
+}
+
+// indexLookupCounter returns the cached lookup counter for an (index,kind), resolving the index
+// name on the first lookup of that access shape. The name comes from the engine's index list; when
+// it does not resolve (an index dropped, or no resolver wired yet) the lookup is attributed to a
+// derived label.token:prop.token name so a count is never lost.
+func (m *queryMetrics) indexLookupCounter(label, prop engine.Token, kind string) *metric.Counter {
+	key := indexKey{label: label, prop: prop, kind: kind}
+	if v, ok := m.indexLookups.Load(key); ok {
+		return v.(*metric.Counter)
+	}
+	name := ""
+	if m.indexNameOf != nil {
+		name = m.indexNameOf(label, prop)
+	}
+	if name == "" {
+		name = fmt.Sprintf("%d:%d", label, prop)
+	}
+	c := m.reg.Counter("gr_index_lookups_total",
+		"Index lookups that served a query anchor, by index and access kind", "lookups",
+		metric.Labels{"index": name, "kind": kind})
+	actual, _ := m.indexLookups.LoadOrStore(key, c)
+	return actual.(*metric.Counter)
 }
 
 // recordExpand records one source position expanded (doc 20 §6.1): it bumps the per-(type,dir)

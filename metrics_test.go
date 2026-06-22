@@ -763,3 +763,29 @@ func TestMetricsBoltError(t *testing.T) {
 		t.Errorf("auth denied = %d, want 1", c)
 	}
 }
+
+// TestMetricsIndexSeek confirms an index-served equality match records the index-lookup metric
+// (doc 20 §6.4): the lookup counts under the index name with kind point, and the descent latency
+// histogram takes an observation.
+func TestMetricsIndexSeek(t *testing.T) {
+	db := openMem(t, "mixseek.gr")
+	defer db.Close()
+
+	mustExec(t, db, "CREATE INDEX person_email FOR (p:Person) ON (p.email)", nil)
+	mustExec(t, db, "CREATE (:Person {email: 'a@x'})", nil)
+	mustExec(t, db, "CREATE (:Person {email: 'b@x'})", nil)
+
+	res, err := db.Query("MATCH (p:Person {email: 'a@x'}) RETURN p", nil)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	drainResult(t, res)
+
+	snap := db.Metrics()
+	if c := snap.Counter("gr_index_lookups_total", Labels{"index": "person_email", "kind": "point"}); c != 1 {
+		t.Errorf("index lookups = %d, want 1", c)
+	}
+	if h := snap.Histogram("gr_index_lookup_seconds", Labels{"kind": "point"}); h.Count != 1 {
+		t.Errorf("index lookup seconds count = %d, want 1", h.Count)
+	}
+}

@@ -1,6 +1,7 @@
 package gr
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,7 +15,7 @@ import (
 // rows. It fails the test if the result does not look like a plan listing.
 func planText(t *testing.T, db *DB, q string) string {
 	t.Helper()
-	res, err := db.Run(q, nil)
+	res, err := db.Run(context.Background(), q, nil)
 	if err != nil {
 		t.Fatalf("EXPLAIN %q: %v", q, err)
 	}
@@ -126,13 +127,13 @@ func TestExplainWriteTxOmitsEstimates(t *testing.T) {
 	db := openMem(t, "explainwritetxrows.gr")
 	defer func() { _ = db.Close() }()
 
-	tx, err := db.Begin(Write)
+	tx, err := db.Begin(context.Background(), Write)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	res, err := tx.Run("EXPLAIN MATCH (p:Person) RETURN p", nil)
+	res, err := tx.Run(context.Background(), "EXPLAIN MATCH (p:Person) RETURN p", nil)
 	if err != nil {
 		t.Fatalf("write-tx EXPLAIN: %v", err)
 	}
@@ -352,7 +353,7 @@ func TestExplainRejectsSchemaCommand(t *testing.T) {
 	db := openMem(t, "explainschema.gr")
 	defer func() { _ = db.Close() }()
 
-	if _, err := db.Run("EXPLAIN CREATE INDEX FOR (p:Person) ON (p.email)", nil); !errors.Is(err, ErrExplainSchema) {
+	if _, err := db.Run(context.Background(), "EXPLAIN CREATE INDEX FOR (p:Person) ON (p.email)", nil); !errors.Is(err, ErrExplainSchema) {
 		t.Fatalf("EXPLAIN of a schema command returned %v, want ErrExplainSchema", err)
 	}
 }
@@ -387,13 +388,13 @@ func TestExplainInReadTransaction(t *testing.T) {
 
 	mustExec(t, db, "CREATE (:Person {name: 'Ada'})", nil)
 
-	tx, err := db.Begin(Read)
+	tx, err := db.Begin(context.Background(), Read)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	res, err := tx.Run("EXPLAIN MATCH (p:Person) RETURN p", nil)
+	res, err := tx.Run(context.Background(), "EXPLAIN MATCH (p:Person) RETURN p", nil)
 	if err != nil {
 		t.Fatalf("tx EXPLAIN: %v", err)
 	}
@@ -418,12 +419,12 @@ func TestExplainInWriteTransaction(t *testing.T) {
 	db := openMem(t, "explainwritetx.gr")
 	defer func() { _ = db.Close() }()
 
-	tx, err := db.Begin(Write)
+	tx, err := db.Begin(context.Background(), Write)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	res, err := tx.Run("EXPLAIN CREATE (:Person {name: 'Ada'})", nil)
+	res, err := tx.Run(context.Background(), "EXPLAIN CREATE (:Person {name: 'Ada'})", nil)
 	if err != nil {
 		t.Fatalf("write-tx EXPLAIN: %v", err)
 	}
@@ -458,7 +459,7 @@ func TestTxExecRejectsExplain(t *testing.T) {
 	db := openMem(t, "explaintxexec.gr")
 	defer func() { _ = db.Close() }()
 
-	tx, err := db.Begin(Write)
+	tx, err := db.Begin(context.Background(), Write)
 	if err != nil {
 		t.Fatal(err)
 	}

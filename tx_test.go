@@ -1,6 +1,7 @@
 package gr
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -77,7 +78,7 @@ func TestUpdateReadYourWrites(t *testing.T) {
 		if _, err := tx.Exec("CREATE (:Person {name:'Ada'})", nil); err != nil {
 			return err
 		}
-		res, err := tx.Run("MATCH (p:Person) RETURN p.name AS name", nil)
+		res, err := tx.Run(context.Background(), "MATCH (p:Person) RETURN p.name AS name", nil)
 		if err != nil {
 			return err
 		}
@@ -108,7 +109,7 @@ func TestViewReadsSnapshot(t *testing.T) {
 
 	var name string
 	err := db.View(func(tx *Tx) error {
-		res, err := tx.Run("MATCH (p:Person) RETURN p.name AS name", nil)
+		res, err := tx.Run(context.Background(), "MATCH (p:Person) RETURN p.name AS name", nil)
 		if err != nil {
 			return err
 		}
@@ -151,7 +152,7 @@ func TestRunWriteOnReadTxRejected(t *testing.T) {
 	db := openMem(t, "v3.gr")
 
 	err := db.View(func(tx *Tx) error {
-		_, err := tx.Run("CREATE (:Person {name:'Ada'})", nil)
+		_, err := tx.Run(context.Background(), "CREATE (:Person {name:'Ada'})", nil)
 		return err
 	})
 	if !errors.Is(err, ErrReadOnly) {
@@ -166,8 +167,8 @@ func TestRunWriteReturnsRows(t *testing.T) {
 	db := openMem(t, "v4.gr")
 
 	err := db.Update(func(tx *Tx) error {
-		res, err := tx.Run("CREATE (p:Person {name:$n}) RETURN p.name AS name",
-			map[string]value.Value{"n": value.String("Ada")})
+		res, err := tx.Run(context.Background(), "CREATE (p:Person {name:$n}) RETURN p.name AS name",
+			Params{"n": "Ada"})
 		if err != nil {
 			return err
 		}
@@ -198,8 +199,8 @@ func TestRunWriteReturnsRows(t *testing.T) {
 func TestRunAutoCommitsWrite(t *testing.T) {
 	db := openMem(t, "r1.gr")
 
-	res, err := db.Run("CREATE (p:Person {name:$n}) RETURN p.name AS name",
-		map[string]value.Value{"n": value.String("Ada")})
+	res, err := db.Run(context.Background(), "CREATE (p:Person {name:$n}) RETURN p.name AS name",
+		Params{"n": "Ada"})
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -229,7 +230,7 @@ func TestRunAutoReadsSnapshot(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	res, err := db.Run("MATCH (p:Person) RETURN p.name AS name", nil)
+	res, err := db.Run(context.Background(), "MATCH (p:Person) RETURN p.name AS name", nil)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -251,7 +252,7 @@ func TestRunAutoReadsSnapshot(t *testing.T) {
 func TestRunSchemaCommand(t *testing.T) {
 	db := openMem(t, "r3.gr")
 
-	res, err := db.Run("CREATE CONSTRAINT person_name FOR (p:Person) REQUIRE p.name IS UNIQUE", nil)
+	res, err := db.Run(context.Background(), "CREATE CONSTRAINT person_name FOR (p:Person) REQUIRE p.name IS UNIQUE", nil)
 	if err != nil {
 		t.Fatalf("run schema: %v", err)
 	}
@@ -268,7 +269,7 @@ func TestRunSchemaCommand(t *testing.T) {
 func TestExplicitCommit(t *testing.T) {
 	db := openMem(t, "e1.gr")
 
-	tx, err := db.Begin(Write)
+	tx, err := db.Begin(context.Background(), Write)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +290,7 @@ func TestExplicitCommit(t *testing.T) {
 func TestExplicitRollback(t *testing.T) {
 	db := openMem(t, "e2.gr")
 
-	tx, err := db.Begin(Write)
+	tx, err := db.Begin(context.Background(), Write)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +310,7 @@ func TestExplicitRollback(t *testing.T) {
 func TestTxnDoneAfterFinish(t *testing.T) {
 	db := openMem(t, "e3.gr")
 
-	tx, err := db.Begin(Write)
+	tx, err := db.Begin(context.Background(), Write)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +320,7 @@ func TestTxnDoneAfterFinish(t *testing.T) {
 	if _, err := tx.Exec("CREATE (:Person {name:'Ada'})", nil); !errors.Is(err, ErrTxnDone) {
 		t.Fatalf("Exec after commit = %v, want ErrTxnDone", err)
 	}
-	if _, err := tx.Run("MATCH (p) RETURN p", nil); !errors.Is(err, ErrTxnDone) {
+	if _, err := tx.Run(context.Background(), "MATCH (p) RETURN p", nil); !errors.Is(err, ErrTxnDone) {
 		t.Fatalf("Run after commit = %v, want ErrTxnDone", err)
 	}
 	if err := tx.Commit(); !errors.Is(err, ErrTxnDone) {

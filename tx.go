@@ -57,9 +57,12 @@ type Tx struct {
 // caller drives it with Run and Exec and finishes it with Commit or Rollback;
 // Rollback (or Commit) must always be called, so the idiom is a deferred Rollback,
 // which is a no-op once the transaction has committed.
-func (db *DB) Begin(mode AccessMode) (*Tx, error) {
+func (db *DB) Begin(ctx context.Context, mode AccessMode) (*Tx, error) {
 	if db.eng == nil {
 		return nil, ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	etx, err := db.eng.Begin(mode == Write)
 	if err != nil {
@@ -111,10 +114,17 @@ func (tx *Tx) releaseSession() {
 // commits nothing, since a read transaction has nothing to commit, and it never
 // conflicts. The closure's error is returned to the caller unchanged.
 func (db *DB) View(fn func(tx *Tx) error) error {
+	return db.ViewContext(context.Background(), fn)
+}
+
+// ViewContext is View with an explicit context (doc 16 §6.2). The context is
+// honoured at begin: a context already cancelled when ViewContext is called returns
+// its error without opening a transaction or running the closure.
+func (db *DB) ViewContext(ctx context.Context, fn func(tx *Tx) error) error {
 	if db.eng == nil {
 		return ErrClosed
 	}
-	tx, err := db.Begin(Read)
+	tx, err := db.Begin(ctx, Read)
 	if err != nil {
 		return err
 	}
@@ -132,11 +142,20 @@ func (db *DB) View(fn func(tx *Tx) error) error {
 // the same writes from the same inputs each time and hold no side effect outside the
 // transaction that a re-run would double (doc 16 §6.2).
 func (db *DB) Update(fn func(tx *Tx) error) error {
+	return db.UpdateContext(context.Background(), fn)
+}
+
+// UpdateContext is Update with an explicit context (doc 16 §6.2, §6.4). The context
+// bounds the retry loop: [Retry] checks it before each attempt, so a cancelled
+// context stops the re-run rather than spinning against a conflict that will not
+// clear, and a context already cancelled at the call returns without running the
+// closure.
+func (db *DB) UpdateContext(ctx context.Context, fn func(tx *Tx) error) error {
 	if db.eng == nil {
 		return ErrClosed
 	}
-	return Retry(context.Background(), db.maxRetries, func() error {
-		tx, err := db.Begin(Write)
+	return Retry(ctx, db.maxRetries, func() error {
+		tx, err := db.Begin(ctx, Write)
 		if err != nil {
 			return err
 		}
@@ -160,9 +179,16 @@ func (db *DB) Update(fn func(tx *Tx) error) error {
 // writes (read-your-writes, doc 06 §2.3) and binds against the transaction's
 // catalog view, so it resolves names the transaction has interned but not yet
 // committed. A write in a read transaction is rejected with ErrReadOnly.
-func (tx *Tx) Run(cypher string, params map[string]value.Value) (*Result, error) {
+func (tx *Tx) Run(ctx context.Context, cypher string, params Params) (*Result, error) {
 	if tx.done {
 		return nil, ErrTxnDone
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	vals, err := toValues(params)
+	if err != nil {
+		return nil, err
 	}
 	q, err := parse.Parse(cypher)
 	if err != nil {
@@ -186,9 +212,9 @@ func (tx *Tx) Run(cypher string, params map[string]value.Value) (*Result, error)
 		if !tx.write {
 			return nil, ErrReadOnly
 		}
-		return tx.runWrite(q, params)
+		return tx.runWrite(q, vals)
 	}
-	return tx.runRead(cypher, q, params)
+	return tx.runRead(cypher, q, vals)
 }
 
 // runRead opens a read statement over the transaction's snapshot and returns a

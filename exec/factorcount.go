@@ -78,6 +78,7 @@ func (o *expandCountOp) countRow(in eval.Row) (int64, error) {
 	var n int64
 	dir := toEngineDir(o.spec.Dir)
 	err := o.ctx.Tx.Expand(engine.NodeID(src), o.relTok, dir, func(nb engine.Neighbor) error {
+		o.ctx.countScan(1)
 		if o.allow != nil && !o.allow[nb.Type] {
 			return nil
 		}
@@ -182,6 +183,7 @@ func (o *productCountOp) countRow(in eval.Row) (int64, error) {
 		}
 		var deg int64
 		err := o.ctx.Tx.Expand(engine.NodeID(src), leg.relTok, leg.dir, func(nb engine.Neighbor) error {
+			o.ctx.countScan(1)
 			if leg.allow != nil && !leg.allow[nb.Type] {
 				return nil
 			}

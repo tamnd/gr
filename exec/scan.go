@@ -95,6 +95,7 @@ func (o *nodeScanOp) open(ctx *Ctx) error {
 		return nil
 	}
 	return ctx.Tx.ScanLabel(scanTok, func(id engine.NodeID) error {
+		ctx.countScan(1)
 		o.buf = append(o.buf, id)
 		return nil
 	})
@@ -234,6 +235,7 @@ func (o *expandOp) next() (eval.Row, bool, error) {
 		o.cur, o.queue, o.qpos = in, o.queue[:0], 0
 		dir := toEngineDir(o.spec.Dir)
 		err = o.ctx.Tx.Expand(engine.NodeID(src), o.relTok, dir, func(nb engine.Neighbor) error {
+			o.ctx.countScan(1)
 			o.queue = append(o.queue, nb)
 			return nil
 		})

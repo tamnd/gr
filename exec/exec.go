@@ -23,6 +23,7 @@ package exec
 
 import (
 	"fmt"
+	"sync/atomic"
 
 	"github.com/tamnd/gr/bind"
 	"github.com/tamnd/gr/engine"
@@ -64,6 +65,24 @@ type Ctx struct {
 	// spill area is configured, in which case an over-budget operator stays in
 	// memory (best effort) rather than failing.
 	TempFile func() (vfs.File, func() error, error)
+	// Scanned counts the rows scans and expands touch during execution (doc 20 §3.1),
+	// the work behind gr_query_rows_scanned and the amplification numerator the PROFILE
+	// footer also reports. The scan, seek, and expand operators add to it as the storage
+	// layer hands them each id or neighbor; the library reads it after draining the
+	// cursor. It is a pointer so every operator, including the morsel workers of a
+	// parallel aggregate, shares the one counter; nil means no caller asked for the count
+	// and the operators skip the add.
+	Scanned *atomic.Int64
+}
+
+// countScan adds n to the scanned-rows counter when one is armed (doc 20 §3.1). It is the
+// single place the scan, seek, and expand operators record the work they did, counted where
+// the storage layer delivers a row so a filtered-out or rejected row still counts as touched.
+// With no counter set it is a nil check and nothing more, so an uninstrumented run pays nothing.
+func (c *Ctx) countScan(n int64) {
+	if c.Scanned != nil {
+		c.Scanned.Add(n)
+	}
 }
 
 // spillEnabled reports whether an over-budget operator may spill: a positive
@@ -173,6 +192,11 @@ func (c *Cursor) Next() (eval.Row, bool, error) { return c.root.next() }
 
 // Close releases the operator tree.
 func (c *Cursor) Close() error { return c.root.close() }
+
+// ScanCount returns the cursor's shared scanned-rows counter, or nil when none is armed (doc 20
+// §3.1). The library stores it on the result so Close reads the final scan work after the stream
+// is drained, the amplification numerator for gr_query_rows_scanned.
+func (c *Cursor) ScanCount() *atomic.Int64 { return c.ctx.Scanned }
 
 // compile lowers one logical operator into its executor operator, recursively
 // compiling its inputs. Relationship-uniqueness peers are threaded by compileRel.

@@ -3,6 +3,7 @@ package gr
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	"github.com/tamnd/gr/ast"
@@ -275,7 +276,7 @@ func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value
 	if err != nil {
 		return nil, err
 	}
-	return &Result{cols: cur.Cols(), cursor: cur, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy)}, nil
+	return &Result{cols: cur.Cols(), cursor: cur, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy), mscan: cur.ScanCount()}, nil
 }
 
 // runWrite executes a write statement eagerly and returns a result over its
@@ -286,11 +287,11 @@ func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value
 // catalog view (doc 13 §9), so the write takes no lock it does not already hold and
 // leaves no orphan token on rollback (doc 13 §16).
 func (tx *Tx) runWrite(q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
-	cols, buf, summary, err := tx.db.execWriteBuffered(tx.etx, q, params)
+	cols, buf, summary, scanned, err := tx.db.execWriteBuffered(tx.etx, q, params)
 	if err != nil {
 		return nil, err
 	}
-	return &Result{cols: cols, buf: buf, summary: summary, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy)}, nil
+	return &Result{cols: cols, buf: buf, summary: summary, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy), mscan: scanned}, nil
 }
 
 // Exec runs a Cypher write statement against the transaction and returns a summary
@@ -410,5 +411,8 @@ func (tx *Tx) readCtx(b *bind.Bound, params map[string]value.Value) *exec.Ctx {
 		LabelName:   tx.db.tokenNamer(catalog.KindLabel),
 		RelTypeName: tx.db.tokenNamer(catalog.KindRelType),
 		PropKeyName: tx.db.tokenNamer(catalog.KindPropKey),
+		// Arm the scanned-rows counter the same way the auto-commit path does, so a read run
+		// inside a managed transaction records gr_query_rows_scanned too (doc 20 §3.1).
+		Scanned: new(atomic.Int64),
 	}
 }

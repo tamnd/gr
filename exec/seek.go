@@ -79,6 +79,7 @@ func (o *nodeIndexSeekOp) open(ctx *Ctx) error {
 // index keys, so the per-key probes return disjoint node sets and no node is
 // buffered twice.
 func (o *nodeIndexSeekOp) collect(id engine.NodeID) error {
+	o.ctx.countScan(1)
 	o.buf = append(o.buf, id)
 	return nil
 }

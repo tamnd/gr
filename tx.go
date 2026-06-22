@@ -154,7 +154,7 @@ func (db *DB) UpdateContext(ctx context.Context, fn func(tx *Tx) error) error {
 	if db.eng == nil {
 		return ErrClosed
 	}
-	return Retry(ctx, db.maxRetries, func() error {
+	return Retry(ctx, db.retries(), func() error {
 		tx, err := db.Begin(ctx, Write)
 		if err != nil {
 			return err
@@ -215,6 +215,12 @@ func (tx *Tx) Run(ctx context.Context, cypher string, params Params, opts ...Run
 		// write lock this transaction holds, so it is not part of a managed transaction.
 		// Run it through the database-level Run.
 		return nil, ErrAdminCommand
+	}
+	if q.Pragma != nil {
+		// A PRAGMA reads or sets connection and file configuration, not transactional
+		// graph data (doc 24 §3), so it is not part of a managed transaction; run it
+		// through the database-level Run.
+		return nil, ErrPragmaCommand
 	}
 	if queryHasWrites(q) {
 		if !tx.write {
@@ -305,6 +311,11 @@ func (tx *Tx) Exec(cypher string, params map[string]value.Value) (Summary, error
 		// the credential API, so it is not part of a managed transaction.
 		return Summary{}, ErrAdminCommand
 	}
+	if q.Pragma != nil {
+		// A PRAGMA is connection and file configuration, not a graph write (doc 24 §3);
+		// run it through the database-level Run.
+		return Summary{}, ErrPragmaCommand
+	}
 	if err := internWriteNames(tx.etx, q); err != nil {
 		return Summary{}, err
 	}
@@ -344,7 +355,7 @@ func (tx *Tx) NodeByElementId(id string) (Node, error) {
 	if !ok {
 		return Node{}, ErrNotFound
 	}
-	return tx.db.materializer(tx.etx, tx.db.lazyProps).node(raw), nil
+	return tx.db.materializer(tx.etx, tx.db.lazyDefault()).node(raw), nil
 }
 
 // RelationshipByElementId fetches a single relationship by its element id under the
@@ -367,7 +378,7 @@ func (tx *Tx) RelationshipByElementId(id string) (Relationship, error) {
 	if !ok {
 		return Relationship{}, ErrNotFound
 	}
-	return tx.db.materializer(tx.etx, tx.db.lazyProps).rel(raw), nil
+	return tx.db.materializer(tx.etx, tx.db.lazyDefault()).rel(raw), nil
 }
 
 // readCtx builds the execution context for a statement run against this

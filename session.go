@@ -209,7 +209,7 @@ func (s *Session) execute(ctx context.Context, mode AccessMode, fn func(tx *Tx) 
 	}
 
 	var out any
-	err := Retry(ctx, s.db.maxRetries, func() error {
+	err := Retry(ctx, s.db.retries(), func() error {
 		tx, err := s.db.Begin(ctx, Write)
 		if err != nil {
 			return err

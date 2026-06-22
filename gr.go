@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/tamnd/gr/ast"
@@ -70,11 +71,22 @@ var ErrExplainSchema = errors.New("gr: cannot EXPLAIN a schema command")
 // over the underlying file; queries run against snapshots the engine hands out.
 // It also owns the plan cache, so a repeated query shape reuses its compiled plan.
 type DB struct {
-	path        string
-	eng         *engine.DiskEngine
-	cache       *plan.Cache
+	path  string
+	eng   *engine.DiskEngine
+	cache *plan.Cache
+
+	// cfgMu guards the live-settable session knobs below (maxRetries, driftFactor,
+	// memBudget, lazyProps), which a PRAGMA set form changes on an open connection (doc
+	// 24 §3.4). A statement reads them through the accessor methods in pragma.go, so a
+	// concurrent PRAGMA and a concurrent query do not race on the field. readOnly is fixed
+	// at Open and never set live, so it sits outside the lock.
+	cfgMu       sync.RWMutex
 	maxRetries  int
 	driftFactor float64
+
+	// readOnly records whether the database was opened read-only (doc 16 §3.4); it backs
+	// the read-only read_only pragma and never changes after Open.
+	readOnly bool
 
 	// fsys is the filesystem the database was opened through, kept so a query that
 	// outgrows its memory budget can open spill files in the same namespace as the
@@ -173,6 +185,7 @@ func Open(path string, opt Options) (*DB, error) {
 		fsys:        fsys,
 		memBudget:   opt.MemBudget,
 		lazyProps:   opt.LazyProperties,
+		readOnly:    opt.ReadOnly,
 	}, nil
 }
 
@@ -199,7 +212,7 @@ func WithLazyProperties(lazy bool) RunOption {
 
 // resolveRun folds a statement's RunOptions onto the database's open-time defaults.
 func (db *DB) resolveRun(opts []RunOption) runConfig {
-	c := runConfig{lazy: db.lazyProps}
+	c := runConfig{lazy: db.lazyDefault()}
 	for _, o := range opts {
 		o(&c)
 	}
@@ -423,7 +436,7 @@ func countRows(tx *Tx, cypher string) (int, error) {
 // the read path treats as the schema-optional empty result rather than an error
 // (doc 08 §5.3).
 func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, error) {
-	return db.query(cypher, params, db.lazyProps)
+	return db.query(cypher, params, db.lazyDefault())
 }
 
 // query is the body of Query with the resolved property-materialization mode threaded
@@ -467,8 +480,10 @@ func (db *DB) execCtx(etx engine.Tx, b *bind.Bound, params map[string]value.Valu
 	}
 	// Arm spilling only when a budget is configured. With the default zero budget
 	// the executor never spills, so leaving TempFile unset keeps the in-memory path.
-	if db.memBudget > 0 {
-		ctx.MemBudget = db.memBudget
+	// The budget is read once here so a concurrent PRAGMA set does not change it
+	// mid-statement (doc 24 §3.4).
+	if mb := db.memBudgetVal(); mb > 0 {
+		ctx.MemBudget = mb
 		ctx.TempFile = db.tempFile
 	}
 	return ctx
@@ -562,6 +577,9 @@ func (db *DB) Run(ctx context.Context, cypher string, params Params, opts ...Run
 	}
 	if q.Admin != nil {
 		return db.execAdmin(q.Admin)
+	}
+	if q.Pragma != nil {
+		return db.execPragma(q.Pragma)
 	}
 	if q.Schema != nil {
 		s, err := db.execSchema(q.Schema)
@@ -667,6 +685,12 @@ func (db *DB) Exec(cypher string, params map[string]value.Value) (Summary, error
 			return Summary{}, err
 		}
 		return res.summary, nil
+	}
+	if q.Pragma != nil {
+		// A PRAGMA reads or sets configuration and yields its value as rows in the query
+		// form, neither of which the row-less, write-oriented Exec carries; run it through
+		// Run.
+		return Summary{}, ErrPragmaCommand
 	}
 	if q.Schema != nil {
 		return db.execSchema(q.Schema)
@@ -948,6 +972,10 @@ const (
 	// AdminStatement manages users and roles (CREATE/ALTER/DROP USER, SHOW USERS,
 	// GRANT/REVOKE ROLE). It requires the admin role (doc 18 §12.3).
 	AdminStatement
+	// PragmaStatement reads or sets a configuration knob (PRAGMA, doc 24 §3). It touches
+	// no graph data; the query form is an introspection read and the set form changes
+	// connection or file configuration.
+	PragmaStatement
 )
 
 // String names the kind for diagnostics.
@@ -959,6 +987,8 @@ func (k Kind) String() string {
 		return "schema"
 	case AdminStatement:
 		return "admin"
+	case PragmaStatement:
+		return "pragma"
 	default:
 		return "read"
 	}
@@ -981,6 +1011,8 @@ func (db *DB) StatementKind(cypher string) (Kind, error) {
 		return ReadStatement, nil
 	case q.Admin != nil:
 		return AdminStatement, nil
+	case q.Pragma != nil:
+		return PragmaStatement, nil
 	case q.Schema != nil:
 		return SchemaStatement, nil
 	case queryHasWrites(q):
@@ -1046,7 +1078,7 @@ func summaryOf(e *exec.SideEffects) Summary {
 func (db *DB) compile(cypher string) (*plan.Entry, error) {
 	key := plan.Key{Text: plan.NormalizeText(cypher), Catalog: db.eng.CatalogVersion()}
 	st := engineStats{db.eng}
-	if entry, ok := db.cache.Get(key); ok && !plan.Drifted(entry.Stats, st, db.driftFactor) {
+	if entry, ok := db.cache.Get(key); ok && !plan.Drifted(entry.Stats, st, db.drift()) {
 		return entry, nil
 	}
 	q, err := parse.Parse(cypher)
@@ -1063,6 +1095,9 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 	}
 	if q.Admin != nil {
 		return nil, ErrAdminCommand
+	}
+	if q.Pragma != nil {
+		return nil, ErrPragmaCommand
 	}
 	b, err := bind.Bind(q, bind.NewEngineCatalog(db.eng), false)
 	if err != nil {
@@ -1097,6 +1132,11 @@ func (db *DB) explain(q *ast.Query, cat bind.TokenResolver, ix plan.IndexLookup,
 		// An administrative statement changes users outside the operator pipeline, so it
 		// has no plan to render, the same as a schema command.
 		return nil, ErrExplainSchema
+	}
+	if q.Pragma != nil {
+		// A PRAGMA reads or sets configuration outside the operator pipeline, so it has no
+		// plan to render either.
+		return nil, ErrExplainPragma
 	}
 	b, err := bind.Bind(q, bind.NewEngineCatalog(cat), false)
 	if err != nil {

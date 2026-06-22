@@ -33,6 +33,12 @@ import (
 // ErrClosed is returned by operations on a database that has been closed.
 var ErrClosed = errors.New("gr: database is closed")
 
+// ErrNotFound is returned by NodeByElementId and RelationshipByElementId when no
+// element with the given id is visible under the transaction's snapshot, and for an
+// id string that is not a well-formed element id (doc 16 §10.7). A program tells "no
+// such element" from a real read failure by comparing against this sentinel.
+var ErrNotFound = errors.New("gr: no element with that id")
+
 // ErrReadQuery is returned by Query when the statement contains a write clause,
 // and by Exec when, conversely, a read-only statement is run where a write is
 // expected (a read-only Exec is allowed, but Query rejects writes outright).
@@ -72,6 +78,13 @@ type DB struct {
 	fsys      vfs.VFS
 	memBudget int64
 	tmpSeq    atomic.Uint64
+
+	// lazyProps is the open-time default for property materialization (doc 16 §10.6):
+	// false (the default) materializes a graph object's properties eagerly when its
+	// record is produced, so the object outlives its transaction; true defers each
+	// property read to first access from the transaction's snapshot. A per-run
+	// WithLazyProperties overrides it for one statement.
+	lazyProps bool
 }
 
 // Options configure how a database is opened. The zero value is the default:
@@ -109,6 +122,15 @@ type Options struct {
 	// so the answers and the in-memory fast path are unchanged; set it to cap the
 	// memory a large join uses at the cost of disk I/O for the overflow.
 	MemBudget int64
+	// LazyProperties sets the database's default for graph-object property
+	// materialization (doc 16 §10.6). The zero value, false, materializes a node's or
+	// relationship's properties eagerly when its record is produced, so the object
+	// keeps its properties after its transaction ends; true defers each property read
+	// to first access from the transaction's snapshot, which is cheaper when most
+	// returned objects are never inspected but ties their property reads to the
+	// transaction's lifetime. A single statement can override this with
+	// WithLazyProperties.
+	LazyProperties bool
 }
 
 // Open opens the database at path, creating it with a fresh graph structure if it
@@ -144,7 +166,52 @@ func Open(path string, opt Options) (*DB, error) {
 		driftFactor: driftFactor,
 		fsys:        fsys,
 		memBudget:   opt.MemBudget,
+		lazyProps:   opt.LazyProperties,
 	}, nil
+}
+
+// RunOption tunes one statement run without changing the database's open-time
+// defaults (doc 16 §10.6). It is the variadic-option seam Run and a transaction's Run
+// take, so a caller threads a per-statement setting through the same call it already
+// makes.
+type RunOption func(*runConfig)
+
+// runConfig holds the resolved per-run settings: the open-time defaults with any
+// RunOption applied on top.
+type runConfig struct {
+	lazy bool
+}
+
+// WithLazyProperties overrides property materialization for one statement (doc 16
+// §10.6): true defers each graph object's property reads to first access from the
+// transaction's snapshot, false materializes them eagerly when the record is
+// produced so the object outlives the transaction. It overrides the database's
+// Options.LazyProperties for this run only.
+func WithLazyProperties(lazy bool) RunOption {
+	return func(c *runConfig) { c.lazy = lazy }
+}
+
+// resolveRun folds a statement's RunOptions onto the database's open-time defaults.
+func (db *DB) resolveRun(opts []RunOption) runConfig {
+	c := runConfig{lazy: db.lazyProps}
+	for _, o := range opts {
+		o(&c)
+	}
+	return c
+}
+
+// materializer builds the graph-object materializer for a result: the snapshot to
+// read structural attributes and (eagerly) properties from, plus the three reverse
+// token namers that turn catalog tokens into names (doc 16 §10.2). lazy carries the
+// resolved per-run materialization mode.
+func (db *DB) materializer(tx engine.Tx, lazy bool) *objectMaterializer {
+	return &objectMaterializer{
+		tx:          tx,
+		labelName:   db.tokenNamer(catalog.KindLabel),
+		relTypeName: db.tokenNamer(catalog.KindRelType),
+		propKeyName: db.tokenNamer(catalog.KindPropKey),
+		lazy:        lazy,
+	}
 }
 
 // tempFile opens a fresh, empty spill file in the database's filesystem and
@@ -238,6 +305,13 @@ func (db *DB) Indexes() ([]IndexInfo, error) {
 // the read path treats as the schema-optional empty result rather than an error
 // (doc 08 §5.3).
 func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, error) {
+	return db.query(cypher, params, db.lazyProps)
+}
+
+// query is the body of Query with the resolved property-materialization mode threaded
+// in, so the auto-commit read path and the per-run Run path (which may override the
+// mode with WithLazyProperties) share one implementation.
+func (db *DB) query(cypher string, params map[string]value.Value, lazy bool) (*Result, error) {
 	if db.eng == nil {
 		return nil, ErrClosed
 	}
@@ -257,7 +331,7 @@ func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, erro
 		_ = tx.Abort()
 		return nil, err
 	}
-	return &Result{cols: cur.Cols(), cursor: cur, tx: tx, ownTx: true}, nil
+	return &Result{cols: cur.Cols(), cursor: cur, tx: tx, ownTx: true, mat: db.materializer(tx, lazy)}, nil
 }
 
 // execCtx builds the execution context shared by every run of a statement: the
@@ -349,13 +423,14 @@ func cloneRow(row eval.Row) eval.Row {
 // at entry: a context already cancelled when Run is called returns its error without
 // touching the engine. The caller must Close the result; for a write or schema result
 // Close has nothing to release, since the implicit transaction has already committed.
-func (db *DB) Run(ctx context.Context, cypher string, params Params) (*Result, error) {
+func (db *DB) Run(ctx context.Context, cypher string, params Params, opts ...RunOption) (*Result, error) {
 	if db.eng == nil {
 		return nil, ErrClosed
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	cfg := db.resolveRun(opts)
 	vals, err := toValues(params)
 	if err != nil {
 		return nil, err
@@ -375,9 +450,9 @@ func (db *DB) Run(ctx context.Context, cypher string, params Params) (*Result, e
 		return &Result{summary: s}, nil
 	}
 	if queryHasWrites(q) {
-		return db.runAutoWrite(q, vals)
+		return db.runAutoWrite(q, vals, cfg.lazy)
 	}
-	return db.Query(cypher, vals)
+	return db.query(cypher, vals, cfg.lazy)
 }
 
 // runAutoWrite executes a write statement in an implicit write transaction and
@@ -387,7 +462,7 @@ func (db *DB) Run(ctx context.Context, cypher string, params Params) (*Result, e
 // before the commit; any error aborts the transaction and leaves the database
 // unchanged. The returned result iterates the buffered rows and reports the mutations
 // through Summary; it owns no open transaction, so Close has nothing to release.
-func (db *DB) runAutoWrite(q *ast.Query, params map[string]value.Value) (*Result, error) {
+func (db *DB) runAutoWrite(q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
 	tx, err := db.eng.Begin(true)
 	if err != nil {
 		return nil, err
@@ -400,7 +475,20 @@ func (db *DB) runAutoWrite(q *ast.Query, params map[string]value.Value) (*Result
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return &Result{cols: cols, buf: buf, summary: summary}, nil
+	res := &Result{cols: cols, buf: buf, summary: summary}
+	// A write commits before returning, so its buffered rows have no live snapshot to
+	// materialize their graph objects against. When the result carries rows, open a
+	// fresh read transaction over the just-committed state and let the result own it,
+	// so a returned node or relationship resolves its labels, type, endpoints, and
+	// properties; the result aborts this snapshot on Close (doc 16 §10.6). A result
+	// with no rows needs no snapshot.
+	if len(buf) > 0 {
+		if rtx, err := db.eng.Begin(false); err == nil {
+			res.tx, res.ownTx = rtx, true
+			res.mat = db.materializer(rtx, lazy)
+		}
+	}
+	return res, nil
 }
 
 // Summary reports the graph mutations a write statement performed, the normative
@@ -962,6 +1050,11 @@ type Result struct {
 	summary Summary
 	tx      engine.Tx
 	ownTx   bool
+	// mat materializes the graph handles in a row into self-describing Node,
+	// Relationship, and Path objects, reading from the result's snapshot (doc 16
+	// §10.2). It is nil for a result with no graph objects to materialize (a schema or
+	// EXPLAIN result), where the nil-safe materializer yields bare handles.
+	mat *objectMaterializer
 	// curRow holds the row the most recent Next advanced to, the row Record wraps;
 	// err holds the first error that stopped streaming, surfaced through Err. Both are
 	// the database/sql.Rows-style streaming state (doc 16 §8.2).
@@ -1003,7 +1096,7 @@ func (r *Result) Record() *Record {
 	if r.curRow == nil {
 		return nil
 	}
-	return newRecord(r.cols, r.curRow)
+	return newRecord(r.cols, r.curRow, r.mat)
 }
 
 // Err returns the first error that stopped streaming, or nil if the stream ended
@@ -1050,15 +1143,17 @@ func (r *Result) NextRow() (eval.Row, bool, error) { return r.next() }
 // it is complete as soon as Run returns, since a write executes eagerly.
 func (r *Result) Summary() Summary { return r.summary }
 
-// Close releases the result's cursor. For an auto-commit Query result it also
-// aborts the read transaction it owns; for a managed-transaction Run result it
-// leaves the borrowed transaction untouched, since the caller commits or rolls it
-// back. It is safe to call more than once.
+// Close releases the result's cursor and any read transaction it owns. For an
+// auto-commit Query result it aborts the read snapshot the stream runs against; for
+// an auto-commit write result it aborts the read snapshot opened after commit to
+// materialize the buffered rows' graph objects (doc 16 §10.6); for a managed
+// transaction's Run result it leaves the borrowed transaction untouched, since the
+// caller commits or rolls it back. It is safe to call more than once.
 func (r *Result) Close() error {
-	if r.cursor == nil {
-		return nil
+	var cerr error
+	if r.cursor != nil {
+		cerr = r.cursor.Close()
 	}
-	cerr := r.cursor.Close()
 	var terr error
 	if r.ownTx && r.tx != nil {
 		terr = r.tx.Abort()

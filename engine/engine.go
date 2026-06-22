@@ -93,6 +93,11 @@ type Tx interface {
 	// RelType returns the type token of a relationship (the read behind the
 	// type() function, doc 09 §7).
 	RelType(id RelID) (Token, error)
+	// RelEndpoints returns the start and end node ids of a relationship,
+	// preserving its direction (doc 02 §2.3): src is the start node, dst the end
+	// node. It is the read behind a relationship value's StartElementId and
+	// EndElementId (doc 16 §10.3). For a self-loop the two are equal.
+	RelEndpoints(id RelID) (src, dst NodeID, err error)
 	// NodePropertyKeys returns the property keys a node carries under this
 	// snapshot, the enumeration behind keys() and properties() (doc 09 §7).
 	NodePropertyKeys(id NodeID) ([]Token, error)

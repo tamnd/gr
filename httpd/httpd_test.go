@@ -110,6 +110,46 @@ func TestBufferedQuery(t *testing.T) {
 	}
 }
 
+// TestGraphObjectJSON confirms a returned node and relationship serialize with their
+// labels, type, endpoints, and properties, not just an element id (doc 18 §9.4): the
+// graph-object surface reaching the wire.
+func TestGraphObjectJSON(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	if rec := post(t, h, `{"statement":"CREATE (:Person {name:'Ada', age:36})-[:KNOWS {since:2019}]->(:Person {name:'Lin'})"}`); rec.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec := post(t, h, `{"statement":"MATCH (a:Person)-[r:KNOWS]->(b) RETURN a, r"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	out := decode(t, rec.Body.Bytes())
+	row := out["data"].(map[string]any)["values"].([]any)[0].([]any)
+
+	node := row[0].(map[string]any)
+	if node["elementId"] == nil || node["elementId"] == "" {
+		t.Errorf("node elementId = %v", node["elementId"])
+	}
+	labels := node["labels"].([]any)
+	if len(labels) != 1 || labels[0] != "Person" {
+		t.Errorf("node labels = %v", labels)
+	}
+	props := node["properties"].(map[string]any)
+	if props["name"] != "Ada" || props["age"] != float64(36) {
+		t.Errorf("node properties = %v", props)
+	}
+
+	rel := row[1].(map[string]any)
+	if rel["type"] != "KNOWS" {
+		t.Errorf("rel type = %v", rel["type"])
+	}
+	if rel["startNodeElementId"] == nil || rel["endNodeElementId"] == nil {
+		t.Errorf("rel endpoints = %v / %v", rel["startNodeElementId"], rel["endNodeElementId"])
+	}
+	if rel["properties"].(map[string]any)["since"] != float64(2019) {
+		t.Errorf("rel properties = %v", rel["properties"])
+	}
+}
+
 func TestWriteCounters(t *testing.T) {
 	h := Handler(newTestDB(t), Options{})
 	rec := post(t, h, `{"statement":"CREATE (:Person {name:'Ada'})","includeCounters":true}`)

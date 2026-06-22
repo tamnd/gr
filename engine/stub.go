@@ -152,6 +152,16 @@ func (t *memTx) RelType(id RelID) (Token, error) {
 	return r.typ, nil
 }
 
+func (t *memTx) RelEndpoints(id RelID) (NodeID, NodeID, error) {
+	t.e.mu.Lock()
+	defer t.e.mu.Unlock()
+	r, ok := t.e.rels[id]
+	if !ok {
+		return 0, 0, ErrNoSuchRel
+	}
+	return r.src, r.dst, nil
+}
+
 func (t *memTx) NodePropertyKeys(id NodeID) ([]Token, error) {
 	t.e.mu.Lock()
 	defer t.e.mu.Unlock()

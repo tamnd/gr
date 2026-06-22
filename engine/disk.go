@@ -612,6 +612,30 @@ func (t *diskTx) RelType(id RelID) (Token, error) {
 	return toTok(r.Type), nil
 }
 
+func (t *diskTx) RelEndpoints(id RelID) (NodeID, NodeID, error) {
+	defer t.rguard()()
+	pos, err := t.relPos(id)
+	if err != nil {
+		return 0, 0, err
+	}
+	r, err := t.e.rels.Get(pos)
+	if err != nil {
+		return 0, 0, err
+	}
+	// r.Src and r.Dst are dense node positions; map them back to the stable node
+	// ids the API hands out (the reverse of nodePos), so the endpoints come out as
+	// external ids, never the internal positions (doc 02 §5.1).
+	src, ok := t.e.ids.Eid(idmap.KindNode, r.Src)
+	if !ok {
+		return 0, 0, ErrNoSuchNode
+	}
+	dst, ok := t.e.ids.Eid(idmap.KindNode, r.Dst)
+	if !ok {
+		return 0, 0, ErrNoSuchNode
+	}
+	return NodeID(src), NodeID(dst), nil
+}
+
 // NodePropertyKeys probes every property column for a snapshot-visible value at
 // the node's position; a key with a present value is one the node carries. The
 // candidate set is the columns that exist (a key never written has no column and

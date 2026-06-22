@@ -20,6 +20,7 @@ type fakeTx struct {
 	relProps   map[propKey]value.Value
 	nodeLabels map[uint64][]engine.Token
 	relTypes   map[uint64]engine.Token
+	relEnds    map[uint64][2]engine.NodeID
 }
 
 func (f *fakeTx) NodeProperty(id engine.NodeID, key engine.Token) (value.Value, error) {
@@ -32,6 +33,11 @@ func (f *fakeTx) RelProperty(id engine.RelID, key engine.Token) (value.Value, er
 
 func (f *fakeTx) RelType(id engine.RelID) (engine.Token, error) {
 	return f.relTypes[uint64(id)], nil
+}
+
+func (f *fakeTx) RelEndpoints(id engine.RelID) (engine.NodeID, engine.NodeID, error) {
+	e := f.relEnds[uint64(id)]
+	return e[0], e[1], nil
 }
 
 func (f *fakeTx) NodePropertyKeys(id engine.NodeID) ([]engine.Token, error) {

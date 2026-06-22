@@ -40,18 +40,71 @@ func renderText(v gr.Value, null string) string {
 	case map[string]gr.Value:
 		return renderMapText(x, null)
 	case gr.Node:
-		return "(:#" + strconv.FormatUint(x.ID, 10) + ")"
+		return renderNodeText(x, null)
 	case gr.Relationship:
-		return "[#" + strconv.FormatUint(x.ID, 10) + "]"
+		return renderRelText(x, null)
 	case gr.Path:
-		parts := make([]string, len(x.Elements))
-		for i, e := range x.Elements {
-			parts[i] = renderText(e, null)
-		}
-		return strings.Join(parts, "")
+		return renderPathText(x, null)
 	default:
 		return null
 	}
+}
+
+// renderNodeText renders a node in the compact pattern form (doc 17 §5.7):
+// (:Label1:Label2 {key: value, ...}), labels then properties, each part omitted when
+// empty so an unlabeled propertyless node is (). The element id is not shown in the
+// text form; it surfaces only in the JSON form, which is the round-trippable one.
+func renderNodeText(n gr.Node, null string) string {
+	var b strings.Builder
+	b.WriteByte('(')
+	labels := n.Labels()
+	for _, l := range labels {
+		b.WriteByte(':')
+		b.WriteString(l)
+	}
+	if props := n.Props(); len(props) > 0 {
+		if len(labels) > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(renderMapText(props, null))
+	}
+	b.WriteByte(')')
+	return b.String()
+}
+
+// renderRelText renders a relationship in the compact pattern form (doc 17 §5.7):
+// [:TYPE {key: value, ...}], its single type then its properties.
+func renderRelText(r gr.Relationship, null string) string {
+	var b strings.Builder
+	b.WriteString("[:")
+	b.WriteString(r.Type())
+	if props := r.Props(); len(props) > 0 {
+		b.WriteByte(' ')
+		b.WriteString(renderMapText(props, null))
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
+// renderPathText renders a path as its nodes and relationships zipped into a pattern
+// (doc 17 §5.7): (n0)-[r0]-(n1)-[r1]-(n2). Direction is not encoded; the relationship
+// endpoints carry it, and the JSON form is where a consumer reads them.
+func renderPathText(p gr.Path, null string) string {
+	nodes := p.Nodes()
+	if len(nodes) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(renderNodeText(nodes[0], null))
+	for i, r := range p.Relationships() {
+		b.WriteString("-")
+		b.WriteString(renderRelText(r, null))
+		b.WriteString("-")
+		if i+1 < len(nodes) {
+			b.WriteString(renderNodeText(nodes[i+1], null))
+		}
+	}
+	return b.String()
 }
 
 // renderMapText renders a map with its keys in sorted order so the text form is
@@ -178,18 +231,82 @@ func renderJSON(v gr.Value) string {
 		}
 		return "{" + strings.Join(parts, ",") + "}"
 	case gr.Node:
-		return `{"_id":` + strconv.FormatUint(x.ID, 10) + `}`
+		return renderNodeJSON(x)
 	case gr.Relationship:
-		return `{"_id":` + strconv.FormatUint(x.ID, 10) + `}`
+		return renderRelJSON(x)
 	case gr.Path:
-		parts := make([]string, len(x.Elements))
-		for i, e := range x.Elements {
-			parts[i] = renderJSON(e)
-		}
-		return `{"_path":[` + strings.Join(parts, ",") + "]}"
+		return renderPathJSON(x)
 	default:
 		return "null"
 	}
+}
+
+// renderNodeJSON renders a node as a JSON object (doc 17 §5.4): the element id under
+// "_id", the labels under "_labels", and the properties inlined at the top level, so
+// a node reads like a plain record with its structural fields underscore-prefixed out
+// of the way of property names.
+func renderNodeJSON(n gr.Node) string {
+	parts := []string{
+		`"_id":` + jsonString(n.ElementId()),
+		`"_labels":` + jsonStringList(n.Labels()),
+	}
+	parts = append(parts, propEntriesJSON(n.Props())...)
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// renderRelJSON renders a relationship as a JSON object (doc 17 §5.4): the element id
+// under "_id", the type under "_type", the endpoint element ids under "_start" and
+// "_end", and the properties inlined at the top level.
+func renderRelJSON(r gr.Relationship) string {
+	parts := []string{
+		`"_id":` + jsonString(r.ElementId()),
+		`"_type":` + jsonString(r.Type()),
+		`"_start":` + jsonString(r.StartElementId()),
+		`"_end":` + jsonString(r.EndElementId()),
+	}
+	parts = append(parts, propEntriesJSON(r.Props())...)
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// renderPathJSON renders a path as its nodes and relationships in traversal order
+// (doc 17 §5.4): {"_nodes":[...],"_rels":[...]}.
+func renderPathJSON(p gr.Path) string {
+	nodes := p.Nodes()
+	nparts := make([]string, len(nodes))
+	for i, n := range nodes {
+		nparts[i] = renderNodeJSON(n)
+	}
+	rels := p.Relationships()
+	rparts := make([]string, len(rels))
+	for i, r := range rels {
+		rparts[i] = renderRelJSON(r)
+	}
+	return `{"_nodes":[` + strings.Join(nparts, ",") + `],"_rels":[` + strings.Join(rparts, ",") + "]}"
+}
+
+// propEntriesJSON renders a property map as JSON object members, keys sorted so the
+// output is deterministic, ready to join with the structural members of a node or
+// relationship object.
+func propEntriesJSON(props map[string]gr.Value) []string {
+	keys := make([]string, 0, len(props))
+	for k := range props {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = jsonString(k) + ":" + renderJSON(props[k])
+	}
+	return parts
+}
+
+// jsonStringList renders a slice of strings as a JSON array of strings.
+func jsonStringList(ss []string) string {
+	parts := make([]string, len(ss))
+	for i, s := range ss {
+		parts[i] = jsonString(s)
+	}
+	return "[" + strings.Join(parts, ",") + "]"
 }
 
 // jsonString encodes a string as a JSON string literal with the mandatory escapes.

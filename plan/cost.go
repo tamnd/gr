@@ -139,6 +139,9 @@ func EstimateRows(o Op, st Statistics) float64 {
 		// A grouping-free count collapses its whole input to a single tally row, the
 		// same one row the aggregate it replaced would emit.
 		return 1
+	case *ProductCount:
+		// Like any grouping-free count, the factorized product collapses to one row.
+		return 1
 	case *Join:
 		return joinRows(x, st)
 	case *Optional:

@@ -103,3 +103,100 @@ func (o *expandCountOp) unique(rel engine.RelID) bool {
 }
 
 func (o *expandCountOp) close() error { return o.input.close() }
+
+// productCountOp is the executor for a factorized product count (doc 11 §7, §8): it
+// counts the rows the cross-product of two or more independent expands from a shared
+// source would produce, without building that product. For each input row it reads
+// the source node and counts the matching edges along each leg, multiplies the
+// per-leg degrees, and sums the product over the source rows. Because the legs leave
+// the source along disjoint relationship types, no edge is counted by two legs and no
+// relationship-uniqueness couples them, so the product is exactly the row count the
+// naive plan's cross-product would have.
+//
+// Like a grouping-free aggregate it always emits exactly one row, zero included: an
+// empty input or a source whose every leg has degree zero yields a single tally row.
+type productCountOp struct {
+	spec  *plan.ProductCount
+	input operator
+	ctx   *Ctx
+
+	done bool
+	legs []resolvedLeg
+}
+
+// resolvedLeg is one leg's expand parameters resolved once at open: the type token
+// to expand (or zero for all), the multi-type allow set, whether the type set
+// matches nothing, and the engine direction.
+type resolvedLeg struct {
+	relTok engine.Token
+	allow  map[engine.Token]bool
+	noType bool
+	dir    engine.Direction
+}
+
+func (o *productCountOp) open(ctx *Ctx) error {
+	o.ctx, o.done = ctx, false
+	o.legs = make([]resolvedLeg, len(o.spec.Legs))
+	for i, l := range o.spec.Legs {
+		tok, allow, none := resolveTypes(l.Types)
+		o.legs[i] = resolvedLeg{relTok: tok, allow: allow, noType: none, dir: toEngineDir(l.Dir)}
+	}
+	return o.input.open(ctx)
+}
+
+func (o *productCountOp) next() (eval.Row, bool, error) {
+	if o.done {
+		return nil, false, nil
+	}
+	o.done = true
+	var total int64
+	for {
+		in, ok, err := o.input.next()
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok {
+			break
+		}
+		n, err := o.countRow(in)
+		if err != nil {
+			return nil, false, err
+		}
+		total += n
+	}
+	return eval.Row{o.spec.Col: value.Int(total)}, true, nil
+}
+
+// countRow returns the product of the source's per-leg degrees for one input row, a
+// null or absent source contributing nothing. A leg whose type set matches nothing
+// has degree zero, so the whole product is zero for that row.
+func (o *productCountOp) countRow(in eval.Row) (int64, error) {
+	src, ok := in[o.spec.From].AsNode()
+	if !ok {
+		return 0, nil
+	}
+	product := int64(1)
+	for _, leg := range o.legs {
+		if leg.noType {
+			return 0, nil
+		}
+		var deg int64
+		err := o.ctx.Tx.Expand(engine.NodeID(src), leg.relTok, leg.dir, func(nb engine.Neighbor) error {
+			if leg.allow != nil && !leg.allow[nb.Type] {
+				return nil
+			}
+			deg++
+			return nil
+		})
+		if err != nil {
+			return 0, err
+		}
+		if deg == 0 {
+			return 0, nil
+		}
+		product *= deg
+	}
+	return product, nil
+}
+
+func (o *productCountOp) close() error { return o.input.close() }

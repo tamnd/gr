@@ -107,6 +107,52 @@ func TestEstimateExpandInto(t *testing.T) {
 	wantRows(t, exp, st, 250*DefaultEqualitySelectivity)
 }
 
+// TestEstimateVarLenExpand confirms a variable-length expand costs the sum of the
+// per-hop fan-out over its range, not a single hop, so a wider range costs more.
+func TestEstimateVarLenExpand(t *testing.T) {
+	st := fakeStats{nodes: 100, rels: 500, relType: map[uint32]float64{3: 300}}
+	// Degree 3 (300 KNOWS over 100 nodes), 100 source rows.
+	mk := func(min, max int) *Expand {
+		return &Expand{
+			Input: &NodeScan{Var: "a"},
+			From:  "a", To: "b", Rel: "r",
+			Types:  []bind.NameRef{known(3)},
+			VarLen: &ast.VarLength{Min: min, Max: max},
+		}
+	}
+	// [*1..2]: per source row d + d^2 = 3 + 9 = 12; 100 rows = 1200.
+	wantRows(t, mk(1, 2), st, 1200)
+	// [*2..3]: d^2 + d^3 = 9 + 27 = 36; 100 rows = 3600.
+	wantRows(t, mk(2, 3), st, 3600)
+	// [*0..1]: the zero-hop path plus one hop, 1 + 3 = 4; 100 rows = 400.
+	wantRows(t, mk(0, 1), st, 400)
+	// A single fixed hop stays the bare degree: 100 rows * 3 = 300, the var-length
+	// estimate for [*1..1] must agree with it.
+	wantRows(t, mk(1, 1), st, 300)
+}
+
+// TestEstimateVarLenUnbounded confirms an omitted upper bound is capped at
+// DefaultVarLenMaxHops so the estimate stays finite and still grows with the range.
+func TestEstimateVarLenUnbounded(t *testing.T) {
+	st := fakeStats{nodes: 100, rels: 200} // typeless degree 2
+	exp := &Expand{
+		Input: &NodeScan{Var: "a"},
+		From:  "a", To: "b", Rel: "r",
+		VarLen: &ast.VarLength{Min: 1, Max: -1},
+	}
+	// Capped at DefaultVarLenMaxHops: sum of 2^k for k in 1..6 = 2+4+...+64 = 126;
+	// 100 rows = 12600.
+	var perRow float64
+	for k := 1; k <= DefaultVarLenMaxHops; k++ {
+		term := 1.0
+		for i := 0; i < k; i++ {
+			term *= 2
+		}
+		perRow += term
+	}
+	wantRows(t, exp, st, 100*perRow)
+}
+
 // TestEstimateFilterEquality confirms an equality filter keeps the equality fraction
 // of its input.
 func TestEstimateFilterEquality(t *testing.T) {

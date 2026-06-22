@@ -46,6 +46,13 @@ const (
 	// DefaultListLength is the assumed length of the list an UNWIND expands when the
 	// length cannot be read from the expression.
 	DefaultListLength = 10.0
+	// DefaultVarLenMaxHops is the depth a variable-length expand with an omitted (or
+	// very large) upper bound is costed to. Relationship-uniqueness terminates an
+	// unbounded traversal at the graph's edge count, far too deep to cost literally,
+	// so the model stands in a practical small-world depth, the same kind of planning
+	// constant DefaultListLength is for UNWIND. It only has to make a wider range cost
+	// more than a narrower one and a var-length expand cost more than a single hop.
+	DefaultVarLenMaxHops = 6
 )
 
 // EstimateRows estimates how many rows an operator tree produces, the cardinality
@@ -77,7 +84,19 @@ func EstimateRows(o Op, st Statistics) float64 {
 		}
 		return rows
 	case *Expand:
-		rows := EstimateRows(x.Input, st) * avgDegree(x.Types, st)
+		d := avgDegree(x.Types, st)
+		fan := d
+		if x.VarLen != nil {
+			// A variable-length expand emits one row per trail whose length is in the
+			// range, so its fan-out is the sum of the per-hop fan-out over every
+			// admissible length, not a single hop (doc 11 §2.4).
+			lo := x.VarLen.Min
+			if lo < 0 {
+				lo = 1
+			}
+			fan = varLenFanout(d, lo, x.VarLen.Max)
+		}
+		rows := EstimateRows(x.Input, st) * fan
 		if x.ToBound {
 			// An expand-into keeps only the edges that reach an already-bound node, far
 			// fewer than the full fan-out.
@@ -207,6 +226,35 @@ func labelRows(ref bind.NameRef, st Statistics) float64 {
 		return 0
 	}
 	return st.LabelCount(uint32(ref.Token))
+}
+
+// varLenFanout estimates the number of trails a variable-length expand emits per
+// source row at per-hop fan-out d over the hop range [lo..max]: the sum of d^k for
+// every length k the range admits, since a length-k path branches d ways at each of
+// its k hops. A length-zero hop contributes the single empty path (d^0 = 1) without
+// fanning out. An omitted or very large upper bound is capped at DefaultVarLenMaxHops
+// so the geometric sum stays finite. The power is built up iteratively so the helper
+// needs no math import and each length reuses the previous one's product.
+func varLenFanout(d float64, lo, max int) float64 {
+	if max < 0 || max > DefaultVarLenMaxHops {
+		max = DefaultVarLenMaxHops
+	}
+	if lo < 0 {
+		lo = 0
+	}
+	if lo > max {
+		return 0 // an empty range admits no path
+	}
+	term := 1.0 // d^lo, built up from d^0
+	for i := 0; i < lo; i++ {
+		term *= d
+	}
+	var sum float64
+	for k := lo; k <= max; k++ {
+		sum += term
+		term *= d
+	}
+	return sum
 }
 
 // avgDegree estimates the average number of relationships a node expands along. With

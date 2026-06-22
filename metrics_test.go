@@ -1127,6 +1127,39 @@ func TestMetricsMvccGC(t *testing.T) {
 	}
 }
 
+func TestMetricsWatermarkLag(t *testing.T) {
+	db := openMem(t, "mxlag.gr")
+	defer db.Close()
+
+	mustExec(t, db, "CREATE (:Person {n: 0})", nil)
+
+	// With no reader pinning a snapshot the watermark is caught up to the latest commit.
+	if g := db.Metrics().Gauge("gr_mvcc_watermark_lag_versions", nil); g != 0 {
+		t.Fatalf("watermark lag with no live reader = %d, want 0", g)
+	}
+
+	// Hold a read snapshot open, then commit writes: the watermark stays pinned at the reader's
+	// read sequence while the commit sequence advances, so the reclaimable backlog grows.
+	rtx, err := db.Begin(context.Background(), Read)
+	if err != nil {
+		t.Fatalf("begin read: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		mustExec(t, db, "MATCH (p:Person) SET p.n = p.n + 1", nil)
+	}
+	if g := db.Metrics().Gauge("gr_mvcc_watermark_lag_versions", nil); g <= 0 {
+		t.Fatalf("watermark lag with a pinned reader = %d, want > 0", g)
+	}
+
+	// Releasing the reader lets the watermark catch up, so the lag falls back to zero.
+	if err := rtx.Rollback(); err != nil {
+		t.Fatalf("rollback read: %v", err)
+	}
+	if g := db.Metrics().Gauge("gr_mvcc_watermark_lag_versions", nil); g != 0 {
+		t.Fatalf("watermark lag after the reader released = %d, want 0", g)
+	}
+}
+
 func TestMetricsConstraintChecks(t *testing.T) {
 	db := openMem(t, "mxcons.gr")
 	defer db.Close()

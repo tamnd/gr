@@ -547,6 +547,21 @@ func TestStartBolt(t *testing.T) {
 	}
 }
 
+// TestServeMaxInFlight confirms the --max-in-flight flag is accepted and the server
+// still serves; the gate's behavior is covered at the unit and adapter level.
+func TestServeMaxInFlight(t *testing.T) {
+	var ln *bolt.Listener
+	listen := func(addr string, h http.Handler, _ *tls.Config) error { return nil }
+	var out, errw bytes.Buffer
+	code := runServe([]string{"--bolt", "--max-in-flight", "4"}, &out, &errw, listen, captureBolt(&ln))
+	if code != exitOK {
+		t.Fatalf("code = %d, stderr = %s", code, errw.String())
+	}
+	if ln == nil || ln.Server == nil || ln.Server.Handler == nil {
+		t.Fatal("Bolt handler not configured with the gate")
+	}
+}
+
 // TestServeHTTPTLS confirms --http-tls required hands the HTTP listener a TLS config
 // loaded from the shared certificate material with the hardening defaults.
 func TestServeHTTPTLS(t *testing.T) {

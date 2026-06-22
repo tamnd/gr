@@ -3,6 +3,7 @@ package gr
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/tamnd/gr/bolt"
 	"github.com/tamnd/gr/value"
@@ -382,4 +383,47 @@ func TestBoltAdapterAuthFunc(t *testing.T) {
 	if _, err := h.Authenticate("basic", "ada", "nope"); err == nil {
 		t.Error("verifier-denied credentials accepted")
 	}
+}
+
+// TestBoltAdapterAdmission confirms the in-flight gate sheds a query as a transient when
+// the gate is full and admits it again once the holding cursor closes (doc 18 §8.9).
+func TestBoltAdapterAdmission(t *testing.T) {
+	db := boltDB(t)
+	h := db.BoltHandler(WithBoltAdmission(NewAdmission(1, 10*time.Millisecond)))
+
+	// Open and hold a cursor, claiming the only slot.
+	tx1, err := h.Begin(map[string]any{}, bolt.Auth{})
+	if err != nil {
+		t.Fatalf("begin 1: %v", err)
+	}
+	cur1, err := tx1.Run("RETURN 1 AS n", nil)
+	if err != nil {
+		t.Fatalf("run 1: %v", err)
+	}
+
+	// A second query finds the gate full and sheds as a retryable transient.
+	tx2, err := h.Begin(map[string]any{}, bolt.Auth{})
+	if err != nil {
+		t.Fatalf("begin 2: %v", err)
+	}
+	_, err = tx2.Run("RETURN 2 AS n", nil)
+	var se *bolt.StatusError
+	if !errors.As(err, &se) {
+		t.Fatalf("full-gate run err = %v, want StatusError", err)
+	}
+	if se.Code != "Neo.TransientError.General.TransientError" {
+		t.Errorf("full-gate code = %q, want transient", se.Code)
+	}
+
+	// Closing the first cursor frees the slot, so the query is admitted on retry.
+	if err := cur1.Close(); err != nil {
+		t.Fatalf("close 1: %v", err)
+	}
+	tx1.Commit()
+	cur2, err := tx2.Run("RETURN 2 AS n", nil)
+	if err != nil {
+		t.Fatalf("run 2 after slot freed: %v", err)
+	}
+	cur2.Close()
+	tx2.Commit()
 }

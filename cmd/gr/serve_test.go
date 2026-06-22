@@ -674,3 +674,65 @@ func TestBuildQueryLog(t *testing.T) {
 		t.Errorf("logfmt entry missing event=query: %s", line)
 	}
 }
+
+// TestBuildEventLog confirms the --log flags map to a log or to nil, that an invalid value
+// is rejected, and that the level threshold gates an event.
+func TestBuildEventLog(t *testing.T) {
+	// none yields a nil log.
+	el, err := buildEventLog(io.Discard, "none", "json", "info")
+	if err != nil {
+		t.Fatalf("none: %v", err)
+	}
+	if el != nil {
+		t.Errorf("none should yield a nil log, got %v", el)
+	}
+
+	// An invalid mode, format, and level are each rejected.
+	for _, bad := range []struct{ mode, format, level string }{
+		{"yes", "json", "info"},
+		{"on", "xml", "info"},
+		{"on", "json", "loud"},
+	} {
+		if _, err := buildEventLog(io.Discard, bad.mode, bad.format, bad.level); err == nil {
+			t.Errorf("buildEventLog(%+v) accepted an invalid flag", bad)
+		}
+	}
+
+	// A constructed log writes an open event in JSON.
+	var buf bytes.Buffer
+	el, err = buildEventLog(&buf, "on", "json", "info")
+	if err != nil {
+		t.Fatalf("on: %v", err)
+	}
+	el.Open("db.gr", 1, 4096, false)
+	if out := buf.String(); !strings.Contains(out, `"event":"open"`) {
+		t.Errorf("event log missing the open event: %s", out)
+	}
+
+	// The level threshold drops an info event when set to warn, keeps a warn one.
+	buf.Reset()
+	el, err = buildEventLog(&buf, "on", "json", "warn")
+	if err != nil {
+		t.Fatalf("warn: %v", err)
+	}
+	el.Open("db.gr", 1, 4096, false)               // info, dropped
+	el.AuthFailure("bob", "10.0.0.2", "bad token") // warn, kept
+	out := buf.String()
+	if strings.Contains(out, `"event":"open"`) {
+		t.Errorf("warn threshold should have dropped the info open: %s", out)
+	}
+	if !strings.Contains(out, `"event":"auth_failure"`) {
+		t.Errorf("warn threshold should have kept the auth failure: %s", out)
+	}
+
+	// logfmt format produces a non-JSON line.
+	buf.Reset()
+	el, err = buildEventLog(&buf, "on", "logfmt", "info")
+	if err != nil {
+		t.Fatalf("logfmt: %v", err)
+	}
+	el.Open("db.gr", 1, 4096, false)
+	if line := buf.String(); !strings.Contains(line, "event=open") {
+		t.Errorf("logfmt entry missing event=open: %s", line)
+	}
+}

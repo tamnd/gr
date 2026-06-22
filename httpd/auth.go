@@ -241,6 +241,12 @@ type authFail struct {
 	err     apiError
 	scheme  string
 	lockout bool
+	// user is the credential's claimed identity when one was presented (the basic-auth
+	// username), for the auth_failure event; it is empty when no name was offered, as on a
+	// missing header or a bearer token. reason is a short non-disclosing cause for the
+	// same event (the body the client sees stays uniform regardless).
+	user   string
+	reason string
 }
 
 // authenticate verifies a request and returns its principal (doc 18 §9.8). With no
@@ -256,6 +262,7 @@ func (s *server) authenticate(r *http.Request) (*Principal, *authFail) {
 		return nil, &authFail{
 			err:    apiError{Code: "Neo.ClientError.Security.Unauthorized", Message: "authentication required"},
 			scheme: "Basic realm=\"gr\"",
+			reason: "no credentials presented",
 		}
 	}
 	scheme, rest, ok := strings.Cut(header, " ")
@@ -274,7 +281,9 @@ func (s *server) authenticate(r *http.Request) (*Principal, *authFail) {
 		}
 		princ, err := s.auth.Authenticate(r.Context(), "basic", user, []byte(pass))
 		if err != nil {
-			return nil, unauthorized(err)
+			f := unauthorized(err)
+			f.user = user
+			return nil, f
 		}
 		return princ, nil
 	case strings.EqualFold(scheme, "Bearer"):
@@ -309,12 +318,18 @@ func unauthorized(err error) *authFail {
 		return &authFail{
 			err:    apiError{Code: "Neo.ClientError.Security.TokenExpired", Message: "authentication token expired"},
 			scheme: "Bearer realm=\"gr\", error=\"invalid_token\", error_description=\"token expired\"",
+			reason: "token expired",
 		}
+	}
+	reason := "invalid credentials"
+	if errors.Is(err, ErrLockedOut) {
+		reason = "account locked"
 	}
 	return &authFail{
 		err:     apiError{Code: "Neo.ClientError.Security.Unauthorized", Message: "invalid authentication credentials"},
 		scheme:  "Basic realm=\"gr\"",
 		lockout: errors.Is(err, ErrLockedOut),
+		reason:  reason,
 	}
 }
 

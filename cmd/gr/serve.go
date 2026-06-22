@@ -80,6 +80,9 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	queryLogFormat := fs.String("query-log-format", "json", "query log format: json or logfmt")
 	queryLogRedact := fs.String("query-log-redact", "all", "query parameter redaction: all (keys and types only), hashed (stable value hashes), or none (verbatim values)")
 	queryLogSlow := fs.Duration("query-log-slow", 0, "slow-query threshold; a query slower than this is logged regardless of level (0 uses the default of one second)")
+	eventLog := fs.String("log", "none", "structured event log: none (off) or on (open, close, auth failures, overload, and the rest of the taxonomy)")
+	eventLogFormat := fs.String("log-format", "json", "event log format: json or logfmt")
+	eventLogLevel := fs.String("log-level", "info", "event log severity threshold: trace, debug, info, warn, or error")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: gr serve [flags] [database]")
 		fmt.Fprintln(stderr)
@@ -92,8 +95,17 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 		return exitUsage
 	}
 
+	// The event log is built before the database opens so the open event is the first
+	// entry it records (doc 20 §11.3). A level of none returns a nil log, which records
+	// nothing. It writes to stderr through slog, alongside the startup banner.
+	elog, err := buildEventLog(stderr, *eventLog, *eventLogFormat, *eventLogLevel)
+	if err != nil {
+		fmt.Fprintln(stderr, "gr:", err)
+		return exitUsage
+	}
+
 	path := fs.Arg(0)
-	db, err := openServeDB(path, *readonly)
+	db, err := openServeDB(path, *readonly, elog)
 	if err != nil {
 		fmt.Fprintln(stderr, "gr:", err)
 		return exitOpen
@@ -135,7 +147,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 		fmt.Fprintln(stderr, "gr:", err)
 		return exitUsage
 	}
-	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL, Impersonation: *impersonation, Admission: admission, QueryMaxTime: *queryMaxTime, RateLimiter: limiter, QueryLog: qlog})
+	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL, Impersonation: *impersonation, Admission: admission, QueryMaxTime: *queryMaxTime, RateLimiter: limiter, QueryLog: qlog, EventLog: elog})
 	defer srv.Close()
 	fmt.Fprintf(stderr, "gr serving %s on %s (database %q, TLS %s)\n", describeDB(path), *addr, *name, *httpTLS)
 	if auth == nil {
@@ -201,14 +213,14 @@ func sweepLoop(srv *httpd.Server, stop <-chan struct{}) {
 
 // openServeDB opens the database serve will host. An empty or :memory: path opens a
 // transient in-memory database over the in-memory VFS, matching the shell's rule.
-func openServeDB(path string, readonly bool) (*gr.DB, error) {
+func openServeDB(path string, readonly bool, elog *gr.EventLog) (*gr.DB, error) {
 	if path == "" || path == ":memory:" {
-		return gr.Open(memPath, gr.Options{VFS: vfs.NewMem()})
+		return gr.Open(memPath, gr.Options{VFS: vfs.NewMem(), EventLog: elog})
 	}
 	if _, err := os.Stat(path); err != nil && readonly {
 		return nil, fmt.Errorf("cannot open a read-only database that does not exist: %s", path)
 	}
-	return gr.Open(path, gr.Options{ReadOnly: readonly})
+	return gr.Open(path, gr.Options{ReadOnly: readonly, EventLog: elog})
 }
 
 // jwtOptions collects the bearer-token (JWT) flags. When any is set, serve runs the JWT
@@ -367,6 +379,45 @@ func buildQueryLog(w io.Writer, level, format, redact string, slow time.Duration
 		return nil, fmt.Errorf("invalid --query-log-format %q, want json or logfmt", format)
 	}
 	return gr.NewQueryLog(slog.New(handler), lvl, pol, slow), nil
+}
+
+// buildEventLog turns the --log flags into an event log, or nil when the level is none so
+// no log is constructed (doc 20 §11). The format selects the slog handler (JSON or
+// logfmt), and the level sets the handler's severity threshold, which gates every event:
+// an event below it costs only the call. trace is gr's own level below slog's debug.
+func buildEventLog(w io.Writer, mode, format, level string) (*gr.EventLog, error) {
+	if mode == "none" || mode == "" {
+		return nil, nil
+	}
+	if mode != "on" {
+		return nil, fmt.Errorf("invalid --log %q, want none or on", mode)
+	}
+	var lvl slog.Level
+	switch level {
+	case "trace":
+		lvl = gr.LevelTrace
+	case "debug":
+		lvl = slog.LevelDebug
+	case "info", "":
+		lvl = slog.LevelInfo
+	case "warn":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		return nil, fmt.Errorf("invalid --log-level %q, want trace, debug, info, warn, or error", level)
+	}
+	opts := &slog.HandlerOptions{Level: lvl}
+	var handler slog.Handler
+	switch format {
+	case "json", "":
+		handler = slog.NewJSONHandler(w, opts)
+	case "logfmt":
+		handler = slog.NewTextHandler(w, opts)
+	default:
+		return nil, fmt.Errorf("invalid --log-format %q, want json or logfmt", format)
+	}
+	return gr.NewEventLog(slog.New(handler)), nil
 }
 
 // boltAuthOptions builds the Bolt handler options that match the HTTP auth posture. With

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/eval"
@@ -62,6 +63,7 @@ const (
 	tierSession pragmaTier = iota
 	tierCreate
 	tierReadOnly
+	tierAction
 )
 
 // String names the tier for the pragma_list discovery surface (doc 24 §23.2).
@@ -71,6 +73,8 @@ func (t pragmaTier) String() string {
 		return "session"
 	case tierCreate:
 		return "create-time"
+	case tierAction:
+		return "action"
 	default:
 		return "read-only"
 	}
@@ -80,12 +84,16 @@ func (t pragmaTier) String() string {
 // messages), a getter that reads the live effective value, and a setter that applies a new
 // value live. set is nil for a knob with no set form (a create-time or read-only knob); a
 // set against it reports ErrConfigConflict for a create-time knob and ErrNotSettable for a
-// read-only one (doc 24 §24.4).
+// read-only one (doc 24 §24.4). act is non-nil for an action pragma (doc 24 §3.7): it runs
+// the action with the call-form argument (or a null argument for the bare invocation) and
+// returns the action's result. An action pragma has no get or set; a value pragma has no
+// act.
 type pragmaDesc struct {
 	tier pragmaTier
 	typ  string
 	get  func(*DB) value.Value
 	set  func(*DB, value.Value) error
+	act  func(*DB, value.Value) (*Result, error)
 }
 
 // pragmas is the knob registry (doc 24 §3.8): one canonical lower-snake-case name to its
@@ -179,6 +187,45 @@ var pragmas = map[string]pragmaDesc{
 		tier: tierReadOnly, typ: "int",
 		get: func(db *DB) value.Value { return value.Int(int64(db.cache.Cap())) },
 	},
+	"wal_checkpoint": {
+		tier: tierAction, typ: "action",
+		act: (*DB).walCheckpoint,
+	},
+}
+
+// walCheckpoint runs a WAL checkpoint now (doc 24 §3.7): it flushes every committed frame
+// into the main file and truncates the WAL, the on-demand counterpart to the automatic
+// triggers (doc 05 §6). The optional mode argument names the SQLite checkpoint mode; gr has
+// one checkpoint primitive (full flush plus WAL truncation), which is the TRUNCATE mode and
+// also satisfies FULL (every frame is checkpointed), so those two modes run it and the
+// finer-grained PASSIVE (non-blocking partial) and RESTART modes are rejected rather than
+// silently treated as a truncating checkpoint they are not. It returns a one-row result
+// naming the mode that ran.
+func (db *DB) walCheckpoint(arg value.Value) (*Result, error) {
+	if db.readOnly {
+		return nil, fmt.Errorf("%w: wal_checkpoint", ErrReadOnly)
+	}
+	mode := "TRUNCATE"
+	if !arg.IsNull() {
+		s, ok := arg.AsString()
+		if !ok {
+			return nil, fmt.Errorf("%w: wal_checkpoint mode must be a word (PASSIVE/FULL/RESTART/TRUNCATE)", ErrConfigType)
+		}
+		mode = strings.ToUpper(s)
+	}
+	switch mode {
+	case "TRUNCATE", "FULL":
+		// gr's checkpoint flushes all committed frames and truncates the WAL, which is a
+		// superset of FULL (all frames checkpointed) and exactly TRUNCATE (WAL reset).
+	case "PASSIVE", "RESTART":
+		return nil, fmt.Errorf("%w: wal_checkpoint mode %s is not implemented; gr runs a full, WAL-truncating checkpoint (use TRUNCATE)", ErrConfigRange, mode)
+	default:
+		return nil, fmt.Errorf("%w: unknown wal_checkpoint mode %q", ErrConfigRange, mode)
+	}
+	if err := db.eng.Checkpoint(); err != nil {
+		return nil, err
+	}
+	return &Result{cols: []string{"wal_checkpoint"}, buf: []eval.Row{{"wal_checkpoint": value.String(strings.ToLower(mode))}}}, nil
 }
 
 // execPragma runs a PRAGMA against the configuration subsystem and returns its result: the
@@ -190,9 +237,9 @@ func (db *DB) execPragma(cmd *ast.PragmaCommand) (*Result, error) {
 	if db.eng == nil {
 		return nil, ErrClosed
 	}
-	// pragma_list is the discovery surface, not a settable knob (doc 24 §23.2).
+	// pragma_list is the discovery surface, not a settable or callable knob (doc 24 §23.2).
 	if cmd.Name == "pragma_list" {
-		if cmd.Set {
+		if cmd.Set || cmd.Call {
 			return nil, fmt.Errorf("%w: pragma_list", ErrNotSettable)
 		}
 		return db.pragmaListResult(), nil
@@ -200,6 +247,23 @@ func (db *DB) execPragma(cmd *ast.PragmaCommand) (*Result, error) {
 	p, ok := pragmas[cmd.Name]
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrUnknownPragma, cmd.Name)
+	}
+	// An action pragma (doc 24 §3.7) runs on the call form PRAGMA name(arg) or the bare
+	// query form PRAGMA name; it is invoked, never set. The bare form carries a null
+	// argument, which the action treats as its default.
+	if p.act != nil {
+		if cmd.Set {
+			return nil, fmt.Errorf("%w: %s is an action pragma and is invoked, not set", ErrNotSettable, cmd.Name)
+		}
+		arg := value.Null
+		if cmd.Call {
+			arg = cmd.Value
+		}
+		return p.act(db, arg)
+	}
+	// A value pragma has no call form; the parenthesis is a misuse.
+	if cmd.Call {
+		return nil, fmt.Errorf("%w: %s is not an action pragma and takes no call form", ErrNotSettable, cmd.Name)
 	}
 	if cmd.Set {
 		if p.set == nil {

@@ -231,6 +231,11 @@ func Open(path string, opt Options) (*DB, error) {
 	// the file growing without the write path touching the registry.
 	db.metrics.reg.ComputedGauge("gr_file_size_bytes",
 		"Current size of the main .gr file", "bytes", nil, func() int64 { return db.eng.FileSizeBytes() })
+	// Reusable space on the free list is a sibling computed gauge over the count the engine
+	// publishes at commit, so a large free list after a delete shows the space compaction can
+	// reclaim (doc 20 §4.2).
+	db.metrics.reg.ComputedGauge("gr_freelist_pages",
+		"Pages on the free list, reusable space", "pages", nil, func() int64 { return db.eng.FreelistPages() })
 	// The open event reports the file's real geometry and whether this open recovered a
 	// committed WAL prefix after a crash (doc 20 §11.3). StorageInfo reads the header the
 	// engine just mounted, so the format version and page size are the file's own.

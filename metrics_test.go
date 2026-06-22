@@ -909,6 +909,29 @@ func TestMetricsFileSizeBytes(t *testing.T) {
 	}
 }
 
+func TestMetricsFreelistPages(t *testing.T) {
+	db := openMem(t, "mxfreelist.gr")
+	defer db.Close()
+
+	// A fresh database has nothing freed yet.
+	if g := db.Metrics().Gauge("gr_freelist_pages", nil); g != 0 {
+		t.Fatalf("freelist pages on fresh db = %d, want 0", g)
+	}
+
+	// Build a segmented base, then rewrite the column and checkpoint again: the second
+	// fold replaces the base and returns the old base's pages to the free list.
+	for i := 0; i < 300; i++ {
+		mustExec(t, db, "CREATE (:Person {note: 'value'})", nil)
+	}
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+	mustExec(t, db, "MATCH (p:Person) SET p.note = 'changed'", nil)
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+
+	if g := db.Metrics().Gauge("gr_freelist_pages", nil); g <= 0 {
+		t.Fatalf("freelist pages = %d, want > 0 after a reclaimed base", g)
+	}
+}
+
 func TestMetricsBufferPoolAccesses(t *testing.T) {
 	db := openMem(t, "mxbufpool.gr")
 	defer db.Close()

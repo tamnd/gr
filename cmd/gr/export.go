@@ -100,6 +100,8 @@ func resolveFormat(format, to string) string {
 	switch strings.ToLower(filepath.Ext(to)) {
 	case ".tsv":
 		return "tsv"
+	case ".parquet":
+		return "parquet"
 	default:
 		return "csv"
 	}

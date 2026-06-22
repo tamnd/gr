@@ -58,6 +58,9 @@ func (s *server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if !s.authorize(w, r, req.Statement) {
 		return
 	}
+	if !s.rateLimit(w, r) {
+		return
+	}
 
 	// Apply the effective deadline: the request's maxExecutionTime capped by the
 	// server-wide query time limit (doc 18 §8.6). withTimeout takes the smaller of the

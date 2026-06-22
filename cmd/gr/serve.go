@@ -1,15 +1,19 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/tamnd/gr"
+	"github.com/tamnd/gr/bolt"
 	"github.com/tamnd/gr/httpd"
 	"github.com/tamnd/gr/vfs"
 )
@@ -27,19 +31,27 @@ func (u *userList) Set(v string) error {
 // 7474 is the Neo4j HTTP port, so a tool pointed at the usual port finds the server.
 const defaultServeAddr = ":7474"
 
+// defaultBoltAddr is the address the Bolt listener binds when --bolt is given with no
+// --bolt-addr (doc 18 §1.4). 7687 is the Neo4j Bolt port, so a driver pointed at the
+// usual port finds the server.
+const defaultBoltAddr = ":7687"
+
 // runServe implements the `gr serve` subcommand (doc 18 §9): it opens a database and
 // serves the HTTP/JSON API over it until the process is stopped. It parses its own
 // flag set rather than the shell's, since the serve options (the listen address, the
 // database name in the URL path) do not overlap the shell's.
 //
 // listen is injected so a test can substitute a stub for net/http's ListenAndServe;
-// the real entry point passes http.ListenAndServe.
-func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, h http.Handler) error) int {
+// the real entry point passes http.ListenAndServe. boltListen is the matching seam for
+// the Bolt listener; the real entry point passes startBolt, a test passes a stub.
+func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, h http.Handler) error, boltListen func(addr string, h bolt.Handler) (io.Closer, error)) int {
 	fs := flag.NewFlagSet("gr serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	addr := fs.String("addr", defaultServeAddr, "address to listen on")
 	name := fs.String("name", "neo4j", "database name in the URL path")
 	readonly := fs.Bool("readonly", false, "open the database read-only")
+	boltEnabled := fs.Bool("bolt", false, "also serve the Bolt protocol so Neo4j drivers can connect")
+	boltAddr := fs.String("bolt-addr", defaultBoltAddr, "address the Bolt listener binds when --bolt is set")
 	var users userList
 	fs.Var(&users, "user", "name:password[:roles] for HTTP auth (repeatable); roles is a comma list of reader/editor/publisher/admin, default admin; none means auth is off")
 	authStore := fs.Bool("auth-store", false, "authenticate against the database's own credential store (the users created with CreateUser), not an in-memory --user list")
@@ -85,6 +97,21 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	fmt.Fprintf(stderr, "gr serving %s on %s (database %q)\n", describeDB(path), *addr, *name)
 	if auth == nil {
 		fmt.Fprintln(stderr, "gr: WARNING authentication is off, every request is anonymous; pass --user or --auth-store to require auth")
+	}
+
+	// Serve Bolt alongside HTTP over the same database when asked, so a Neo4j driver
+	// can connect to the same data the HTTP surface serves (doc 18 §5, §11.4). Auth is
+	// the same provider as HTTP, so a deployment configures it once (doc 18 §10.4). The
+	// listener runs in the background; closing it on exit drains its connections.
+	if *boltEnabled {
+		bh := db.BoltHandler(boltAuthOptions(auth)...)
+		closer, err := boltListen(*boltAddr, bh)
+		if err != nil {
+			fmt.Fprintln(stderr, "gr:", err)
+			return exitIO
+		}
+		defer func() { _ = closer.Close() }()
+		fmt.Fprintf(stderr, "gr serving Bolt on %s\n", *boltAddr)
 	}
 
 	// Reap transactions whose client vanished, so a dead HTTP client cannot pin the
@@ -241,6 +268,56 @@ func parseUser(u string) (name, pass string, roles []string, err error) {
 		roles = []string{"admin"}
 	}
 	return name, pass, roles, nil
+}
+
+// boltAuthOptions builds the Bolt handler options that match the HTTP auth posture. With
+// an auth provider configured, Bolt routes authentication through the same provider so
+// both transports enforce one credential source (doc 18 §10.4); with none, Bolt accepts
+// anonymous connections, matching the anonymous HTTP surface (doc 18 §11.4).
+func boltAuthOptions(auth httpd.AuthProvider) []gr.BoltOption {
+	if auth == nil {
+		return nil
+	}
+	return []gr.BoltOption{gr.WithBoltAuthFunc(boltAuthFunc(auth))}
+}
+
+// boltAuthFunc adapts an HTTP auth provider to the Bolt handler's auth seam (doc 18
+// §10.4). The Bolt "basic" scheme carries the principal and password, "bearer" carries a
+// token in the credentials with no principal; both route to the provider's Authenticate.
+// The "none" scheme is rejected, since reaching here means auth is required.
+func boltAuthFunc(auth httpd.AuthProvider) func(scheme, principal, credentials string) error {
+	return func(scheme, principal, credentials string) error {
+		if scheme == "" || scheme == "none" {
+			return errors.New("authentication required")
+		}
+		_, err := auth.Authenticate(context.Background(), scheme, principal, []byte(credentials))
+		return err
+	}
+}
+
+// startBolt binds the Bolt listen address and serves the protocol in the background,
+// returning the listener so the caller can close it on shutdown. It is the real
+// boltListen the serve command injects; a test substitutes a stub.
+func startBolt(addr string, h bolt.Handler) (io.Closer, error) {
+	netLn, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	ln := &bolt.Listener{Server: &bolt.Server{Handler: h}}
+	go func() { _ = ln.Serve(netLn) }()
+	return boltCloser{ln}, nil
+}
+
+// boltCloser shuts a Bolt listener down with a short drain deadline when the serve
+// command exits, so a lingering connection cannot block the process from stopping.
+type boltCloser struct {
+	ln *bolt.Listener
+}
+
+func (c boltCloser) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return c.ln.Shutdown(ctx)
 }
 
 // describeDB names the database for the startup banner.

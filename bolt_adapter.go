@@ -23,9 +23,23 @@ type BoltOption func(*boltHandler)
 // WithBoltAuth makes the handler require authentication: a connection must present
 // valid credentials, and the "none" scheme is rejected (doc 18 §10). Without it
 // the handler authorizes every connection, the embedded-friendly default for a
-// server bound to localhost (doc 18 §11.4).
+// server bound to localhost (doc 18 §11.4). Authentication runs against the
+// database's own credential store.
 func WithBoltAuth() BoltOption {
 	return func(h *boltHandler) { h.requireAuth = true }
+}
+
+// WithBoltAuthFunc routes Bolt authentication through an external verifier instead
+// of the database credential store, so the Bolt and HTTP transports share one auth
+// provider (doc 18 §10.4): a deployment configures auth once and both surfaces
+// enforce it identically. The function receives the HELLO/LOGON scheme, principal,
+// and credentials and returns nil to admit the connection or an error to reject it;
+// it is responsible for rejecting the "none" scheme when auth is required.
+func WithBoltAuthFunc(fn func(scheme, principal, credentials string) error) BoltOption {
+	return func(h *boltHandler) {
+		h.requireAuth = true
+		h.authFunc = fn
+	}
 }
 
 // BoltHandler returns a bolt.Handler that runs Cypher over the database for a Bolt
@@ -52,6 +66,7 @@ func (db *DB) BoltHandler(opts ...BoltOption) bolt.Handler {
 type boltHandler struct {
 	db          *DB
 	requireAuth bool
+	authFunc    func(scheme, principal, credentials string) error
 	bookmark    atomic.Uint64
 }
 
@@ -61,6 +76,11 @@ type boltHandler struct {
 func (h *boltHandler) Authenticate(scheme, principal, credentials string) error {
 	if !h.requireAuth {
 		return nil
+	}
+	// An external verifier (the shared auth provider) takes over entirely when set,
+	// including rejecting the "none" scheme (doc 18 §10.4).
+	if h.authFunc != nil {
+		return h.authFunc(scheme, principal, credentials)
 	}
 	if scheme == "none" || scheme == "" {
 		return errors.New("authentication required")

@@ -1088,6 +1088,41 @@ func TestMetricsVersionsResident(t *testing.T) {
 	}
 }
 
+func TestMetricsCheckpointDeltaFolded(t *testing.T) {
+	db := openMem(t, "mxckptfold.gr")
+	defer db.Close()
+
+	// Before any checkpoint no delta has been folded.
+	if c := db.Metrics().Counter("gr_checkpoint_delta_folded_total", nil); c != 0 {
+		t.Fatalf("delta folded before any checkpoint = %d, want 0", c)
+	}
+
+	// Create relationships so the adjacency delta has staged edges for the fold to absorb.
+	for i := 0; i < 50; i++ {
+		mustExec(t, db, "CREATE (:Person {note: 'value'})", nil)
+	}
+	mustExec(t, db, "MATCH (a:Person), (b:Person) WITH a, b LIMIT 20 CREATE (a)-[:KNOWS {since: 2020}]->(b)", nil)
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+
+	folded := db.Metrics().Counter("gr_checkpoint_delta_folded_total", nil)
+	if folded == 0 {
+		t.Fatalf("delta folded after a checkpoint with edges = %d, want > 0", folded)
+	}
+
+	// A checkpoint with no new edges folds nothing, so the cumulative counter holds steady.
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+	if again := db.Metrics().Counter("gr_checkpoint_delta_folded_total", nil); again != folded {
+		t.Fatalf("delta folded after an empty checkpoint = %d, want %d (unchanged)", again, folded)
+	}
+
+	// New edges stage a fresh delta, so the next checkpoint advances the counter again.
+	mustExec(t, db, "MATCH (a:Person), (b:Person) WITH a, b LIMIT 10 CREATE (a)-[:LIKES]->(b)", nil)
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+	if more := db.Metrics().Counter("gr_checkpoint_delta_folded_total", nil); more <= folded {
+		t.Fatalf("delta folded after more edges = %d, want > %d", more, folded)
+	}
+}
+
 func TestMetricsMvccGC(t *testing.T) {
 	db := openMem(t, "mxgc.gr")
 	defer db.Close()

@@ -106,6 +106,12 @@ type DiskEngine struct {
 	ckptNodeSegmentsTotal atomic.Uint64
 	ckptRelSegmentsTotal  atomic.Uint64
 
+	// ckptDeltaFoldedTotal counts the adjacency delta entries every fold has merged into the base CSR,
+	// bumped under the engine lock at the start of each checkpoint by the staged delta length (doc 20
+	// §5.4). It is the authoritative cumulative count the metrics path mirrors into
+	// gr_checkpoint_delta_folded_total delta-style, read off the snapshot path as a lock-free atomic.
+	ckptDeltaFoldedTotal atomic.Uint64
+
 	// gcRunsTotal counts version-GC passes, and gcReclaimedNode and gcReclaimedRel the pre-images
 	// each pass dropped, split by element, all bumped under the engine lock when GC runs at
 	// checkpoint (doc 20 §5.1). They are the authoritative cumulative counts the metrics path mirrors
@@ -199,6 +205,12 @@ func (e *DiskEngine) FreelistPages() int64 { return int64(e.freelistPages.Load()
 func (e *DiskEngine) CheckpointSegmentsTotal() (node, rel uint64) {
 	return e.ckptNodeSegmentsTotal.Load(), e.ckptRelSegmentsTotal.Load()
 }
+
+// CheckpointDeltaFoldedTotal returns the cumulative count of adjacency delta entries every fold has
+// merged into the base CSR (doc 20 §5.4), read lock-free from the atomic each checkpoint bumps. The
+// metrics path mirrors it into gr_checkpoint_delta_folded_total delta-style, so this never takes the
+// engine lock and is safe off the snapshot path.
+func (e *DiskEngine) CheckpointDeltaFoldedTotal() uint64 { return e.ckptDeltaFoldedTotal.Load() }
 
 // VersionsResident returns the number of element versions the MVCC overlay still holds beyond the
 // current committed version (doc 20 §5.1), for the gr_mvcc_versions_resident gauge. It reads the
@@ -583,9 +595,14 @@ func (e *DiskEngine) Begin(write bool) (Tx, error) {
 func (e *DiskEngine) Checkpoint() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// Capture the staged adjacency delta before the fold drains it, so the metrics path can mirror the
+	// edge work this checkpoint absorbed (doc 20 §5.4). The fold clears the delta to empty, so reading
+	// it after would always be zero; we hold the engine lock, so no writer is appending concurrently.
+	folded := uint64(e.adj.DeltaLen())
 	if err := e.adj.Checkpoint(uint64(e.nodes.Count())); err != nil {
 		return err
 	}
+	e.ckptDeltaFoldedTotal.Add(folded)
 	// Merge the naive delta over the current base into a fresh segmented base, then
 	// drain the delta to empty so the next checkpoint window starts clean. The
 	// merge reads the old base and the old delta, so hold on to both, compute the

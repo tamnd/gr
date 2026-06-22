@@ -82,17 +82,20 @@ type NodeIndexSeek struct {
 // Types is the resolved type set (empty matches any type), Dir the direction,
 // and VarLen the variable-length range (nil for a single hop). ToBound marks an
 // expand-into: the target was already bound, so the expand keeps only edges that
-// reach it.
+// reach it. FromLabels carries the source node's labels (empty when the source is
+// unlabeled or a back-reference), which the cost model uses to condition the
+// expand's fan-out on the source population rather than the whole graph.
 type Expand struct {
-	Input    Op
-	From     string
-	Rel      string
-	To       string
-	Types    []bind.NameRef
-	ToLabels []bind.NameRef // labels the reached node must carry (empty: any)
-	Dir      ast.Direction
-	VarLen   *ast.VarLength
-	ToBound  bool
+	Input      Op
+	From       string
+	Rel        string
+	To         string
+	Types      []bind.NameRef
+	FromLabels []bind.NameRef // labels of the source node (cost-model only)
+	ToLabels   []bind.NameRef // labels the reached node must carry (empty: any)
+	Dir        ast.Direction
+	VarLen     *ast.VarLength
+	ToBound    bool
 }
 
 // Filter keeps input rows for which Pred holds (a WHERE, or a pattern's

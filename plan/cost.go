@@ -84,7 +84,7 @@ func EstimateRows(o Op, st Statistics) float64 {
 		}
 		return rows
 	case *Expand:
-		d := avgDegree(x.Types, st)
+		d := expandDegree(x.Types, x.FromLabels, st)
 		fan := d
 		if x.VarLen != nil {
 			// A variable-length expand emits one row per trail whose length is in the
@@ -276,6 +276,53 @@ func avgDegree(types []bind.NameRef, st Statistics) float64 {
 		}
 	}
 	return rels / n
+}
+
+// expandDegree estimates the per-hop fan-out of an expand from a source carrying
+// fromLabels: the relationship count of the types divided by the source population,
+// the number of nodes the expand starts from. With known source labels the
+// population is the rarest label's count (a node carrying every label is at most as
+// common as its rarest), so the degree is the out-degree of a source-labeled node
+// rather than the all-node average; with no usable label it falls back to avgDegree
+// over the whole graph. Conditioning on the source is what stops a labeled scan's
+// expand from being under-estimated: a scan of a rare label times an all-node
+// average hides that those few nodes carry most of the type's edges.
+func expandDegree(types, fromLabels []bind.NameRef, st Statistics) float64 {
+	pop := sourcePopulation(fromLabels, st)
+	if pop <= 0 {
+		return avgDegree(types, st)
+	}
+	var rels float64
+	if len(types) == 0 {
+		rels = st.RelCount()
+	} else {
+		for _, t := range types {
+			if t.Known {
+				rels += st.RelTypeCount(uint32(t.Token))
+			}
+		}
+	}
+	return rels / pop
+}
+
+// sourcePopulation is the number of nodes an expand starts from: the rarest source
+// label's count, or zero when no label is usable (an unlabeled or back-referenced
+// source), which signals expandDegree to fall back to the all-node average.
+func sourcePopulation(fromLabels []bind.NameRef, st Statistics) float64 {
+	pop := -1.0
+	for _, l := range fromLabels {
+		if !l.Known {
+			continue
+		}
+		c := st.LabelCount(uint32(l.Token))
+		if pop < 0 || c < pop {
+			pop = c
+		}
+	}
+	if pop < 0 {
+		return 0 // no usable label
+	}
+	return pop
 }
 
 // joinRows estimates a join's output. An empty key set is a cartesian product, the

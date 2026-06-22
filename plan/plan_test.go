@@ -51,6 +51,71 @@ func eq(t *testing.T, label, got, want string) {
 	}
 }
 
+// TestBuildExpandCarriesSourceLabels confirms the builder threads each expand's
+// source-node labels onto the Expand, the start node's for the first hop and the
+// previous reached node's thereafter, so the cost model can condition the fan-out
+// on the source population. The labels are cost-model metadata and do not show in
+// the plan's String form, so this checks the field directly.
+func TestBuildExpandCarriesSourceLabels(t *testing.T) {
+	b := bound(t, "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN c")
+	var expands []*Expand
+	var walk func(o Op)
+	walk = func(o Op) {
+		if e, ok := o.(*Expand); ok {
+			expands = append(expands, e)
+		}
+		for _, c := range nodeChildren(o) {
+			walk(c)
+		}
+	}
+	walk(Build(b))
+	if len(expands) != 2 {
+		t.Fatalf("found %d expands, want 2", len(expands))
+	}
+	// The walk visits the outer (b->c) expand before its (a->b) child.
+	bc, ab := expands[0], expands[1]
+	if ab.From != "a" || bc.From != "b" {
+		t.Fatalf("expands in unexpected order: %q then %q", bc.From, ab.From)
+	}
+	// a is :Person, so the first hop's source labels name Person; b is unlabeled, so
+	// the second hop carries none.
+	if len(ab.FromLabels) != 1 || !ab.FromLabels[0].Known {
+		t.Fatalf("a->b FromLabels = %+v, want one known label", ab.FromLabels)
+	}
+	if len(bc.FromLabels) != 0 {
+		t.Fatalf("b->c FromLabels = %+v, want none (b is unlabeled)", bc.FromLabels)
+	}
+}
+
+// TestPlanKeepsSourceLabels guards that the source-label cost metadata survives the
+// whole planning pipeline, not just Build. The optimizer and join-order passes
+// rebuild operators through mapChildren, and an Expand rebuild that listed its
+// fields by hand used to drop FromLabels, silently reverting the source-label
+// degree conditioning to the all-node average before the cost model ever read it.
+// Person is the only labeled node here, so the anchor stays put and the natural
+// chain reaches join ordering and drift with its source label intact.
+func TestPlanKeepsSourceLabels(t *testing.T) {
+	b := bound(t, "MATCH (a:Person)-[:KNOWS]->(b) RETURN b")
+	st := fakeStats{nodes: 1000, rels: 300, label: map[uint32]float64{1: 200}, relType: map[uint32]float64{1: 300}}
+	var exp *Expand
+	var walk func(o Op)
+	walk = func(o Op) {
+		if e, ok := o.(*Expand); ok {
+			exp = e
+		}
+		for _, c := range nodeChildren(o) {
+			walk(c)
+		}
+	}
+	walk(PlanWithStats(b, st))
+	if exp == nil || exp.From != "a" {
+		t.Fatalf("expand = %+v, want one anchored at a", exp)
+	}
+	if len(exp.FromLabels) != 1 || !exp.FromLabels[0].Known || exp.FromLabels[0].Token != 1 {
+		t.Fatalf("planned expand FromLabels = %+v, want [Person(#1)] to survive the pipeline", exp.FromLabels)
+	}
+}
+
 func TestBuildFriendsOfFriends(t *testing.T) {
 	b := bound(t, "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN c.name AS name")
 	want := `Project c.name AS name

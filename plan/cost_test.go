@@ -107,6 +107,38 @@ func TestEstimateExpandInto(t *testing.T) {
 	wantRows(t, exp, st, 250*DefaultEqualitySelectivity)
 }
 
+// TestEstimateExpandConditionsOnSourceLabel confirms an expand from a labeled
+// source divides the type's edges by the source label's count, not the whole node
+// count, so a scan of a rare label expanding a type those nodes own is not
+// under-estimated. Person is a fifth of the graph but owns all the KNOWS edges:
+// 200 Persons * (300 KNOWS / 200 Persons) = 300, the true edge total, where the
+// all-node average would give 200 * 300/1000 = 60.
+func TestEstimateExpandConditionsOnSourceLabel(t *testing.T) {
+	st := fakeStats{nodes: 1000, rels: 300, label: map[uint32]float64{1: 200}, relType: map[uint32]float64{3: 300}}
+	exp := &Expand{
+		Input: &NodeScan{Var: "a", Labels: []bind.NameRef{known(1)}},
+		From:  "a", To: "b", Rel: "r",
+		Types:      []bind.NameRef{known(3)},
+		FromLabels: []bind.NameRef{known(1)},
+	}
+	wantRows(t, exp, st, 300)
+}
+
+// TestEstimateExpandTwoSourceLabels confirms a source carrying two labels is
+// populated by the rarer one, so the fan-out is the type edges over the smaller
+// count, the conservative (larger) degree.
+func TestEstimateExpandTwoSourceLabels(t *testing.T) {
+	st := fakeStats{nodes: 1000, relType: map[uint32]float64{3: 300}, label: map[uint32]float64{1: 200, 2: 50}}
+	exp := &Expand{
+		Input: &NodeScan{Var: "a", Labels: []bind.NameRef{known(1), known(2)}},
+		From:  "a", To: "b", Rel: "r",
+		Types:      []bind.NameRef{known(3)},
+		FromLabels: []bind.NameRef{known(1), known(2)},
+	}
+	// Scan of two labels is the rarer (50); degree is 300/50 = 6; 50 * 6 = 300.
+	wantRows(t, exp, st, 300)
+}
+
 // TestEstimateVarLenExpand confirms a variable-length expand costs the sum of the
 // per-hop fan-out over its range, not a single hop, so a wider range costs more.
 func TestEstimateVarLenExpand(t *testing.T) {

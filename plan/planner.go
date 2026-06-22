@@ -139,6 +139,17 @@ func reanchor(ch linChain, st Statistics) Op {
 // each candidate anchor can be costed by building it and reading its plan cost.
 func buildAnchored(ch linChain, k int) Op {
 	var cur Op = &NodeScan{Var: ch.nodes[k].name, Labels: ch.nodes[k].labels}
+	// A re-anchored expand deliberately leaves FromLabels unset. Conditioning the
+	// fan-out on the source population (the source-label degree, doc 11 §2.4) is
+	// only sound when both candidate directions are conditioned the same way, and
+	// the model is not yet direction-aware: a forward expand from a rare labeled
+	// source would estimate a large conservative fan while the reverse expand into
+	// that same rare label keeps the all-node average, so wiring the source labels
+	// into one direction here mis-ranks the anchors. Anchor selection therefore
+	// costs every candidate on the direction-agnostic average, the same metric the
+	// pre-source-label planner used, until the degree statistics are direction-aware
+	// (doc 71 §6). FromLabels still rides the chain's natural-anchor shape, which
+	// buildAnchored does not rebuild, so the feature reaches join ordering and drift.
 	for i := k; i < len(ch.rels); i++ {
 		cur = &Expand{
 			Input:    cur,
@@ -317,7 +328,7 @@ func mapChildren(o Op, f func(Op) Op) Op {
 	case *Expand:
 		return &Expand{
 			Input: f(x.Input), From: x.From, Rel: x.Rel, To: x.To,
-			Types: x.Types, ToLabels: x.ToLabels, Dir: x.Dir,
+			Types: x.Types, FromLabels: x.FromLabels, ToLabels: x.ToLabels, Dir: x.Dir,
 			VarLen: x.VarLen, ToBound: x.ToBound,
 		}
 	case *Intersect:

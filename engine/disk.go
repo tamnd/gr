@@ -528,6 +528,12 @@ func (e *DiskEngine) Backup(w io.Writer) (int64, error) {
 // reports without reaching past the engine into the pager.
 func (e *DiskEngine) PageSize() uint32 { return e.p.PageSize() }
 
+// BufferPoolStats returns the pager's buffer-pool lookup outcomes and resident population (doc 20
+// §4.1), the numbers the buffer-pool metrics expose. It reads only the pager's pool lock, never the
+// engine lock, so the metrics snapshot path calls it freely even while a write transaction holds
+// the engine lock.
+func (e *DiskEngine) BufferPoolStats() pager.PoolStats { return e.p.PoolStats() }
+
 // Close releases the engine and its pager.
 func (e *DiskEngine) Close() error {
 	e.mu.Lock()

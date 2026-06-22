@@ -885,6 +885,34 @@ func TestMetricsColcacheAccesses(t *testing.T) {
 	}
 }
 
+func TestMetricsBufferPoolAccesses(t *testing.T) {
+	db := openMem(t, "mxbufpool.gr")
+	defer db.Close()
+
+	mustExec(t, db, "CREATE (:Person {name: 'a'})", nil)
+	mustExec(t, db, "CREATE (:Person {name: 'b'})", nil)
+	res, err := db.Run(context.Background(), "MATCH (p:Person) RETURN p.name", nil)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	drainResult(t, res)
+
+	snap := db.Metrics()
+	// Any write or read touches pages through the pool, so accesses are nonzero and the
+	// resident gauges report a live pool.
+	hit := snap.Counter("gr_bufferpool_accesses_total", Labels{"result": "hit"})
+	miss := snap.Counter("gr_bufferpool_accesses_total", Labels{"result": "miss"})
+	if hit+miss == 0 {
+		t.Fatalf("buffer-pool accesses = %d, want > 0 after queries", hit+miss)
+	}
+	if r := snap.Gauge("gr_bufferpool_resident_frames", nil); r == 0 {
+		t.Fatalf("resident frames = %d, want > 0", r)
+	}
+	if b := snap.Gauge("gr_bufferpool_memory_bytes", nil); b <= 0 {
+		t.Fatalf("memory bytes = %d, want > 0", b)
+	}
+}
+
 func TestMetricsConstraintChecks(t *testing.T) {
 	db := openMem(t, "mxcons.gr")
 	defer db.Close()

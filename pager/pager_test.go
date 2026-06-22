@@ -105,6 +105,69 @@ func TestPagerPinningNeverEvicts(t *testing.T) {
 	p.Unpin(pinned)
 }
 
+// TestPoolStatsCountsHitsAndMisses proves the pool stats track the lookup outcomes the
+// buffer-pool metrics expose: a read of a page already resident is a hit, and the first
+// read of a page in a fresh pool faults it from disk as a miss that leaves one resident
+// frame. The two cases run on two pagers over one committed file so the cold read is
+// unambiguous: the second pager starts with an empty pool.
+func TestPoolStatsCountsHitsAndMisses(t *testing.T) {
+	fsys := vfs.NewMem()
+	p, err := Open(fsys, "stats.gr", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := p.AllocPage(format.PageTypeData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := f.ID()
+	copy(f.Data, fill(p.PageSize(), 0x5A))
+	p.MarkDirty(f)
+	p.Unpin(f)
+	if err := p.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The freshly allocated page is still resident, so reading it back is a hit.
+	before := p.PoolStats()
+	rf, err := p.ReadPage(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Unpin(rf)
+	if s := p.PoolStats(); s.Hits != before.Hits+1 || s.Misses != before.Misses {
+		t.Fatalf("after resident read = %+v, want one more hit than %+v", s, before)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh pager over the same file starts with an empty pool, so the first read of
+	// the page faults it from disk: a miss that leaves exactly one resident frame.
+	p2, err := Open(fsys, "stats.gr", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p2.Close()
+
+	rf2, err := p2.ReadPage(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2.Unpin(rf2)
+	s := p2.PoolStats()
+	if s.Hits != 0 || s.Misses != 1 {
+		t.Fatalf("cold read stats = %+v, want 0 hits and 1 miss", s)
+	}
+	if s.Resident != 1 {
+		t.Fatalf("resident frames = %d, want 1", s.Resident)
+	}
+	if want := int(p2.PageSize()); s.Bytes != want {
+		t.Fatalf("memory bytes = %d, want one page (%d)", s.Bytes, want)
+	}
+}
+
 // TestPagerConcurrentReads exercises the read path the way morsel-parallel
 // execution will: many goroutines reading pages at once against one committed
 // pager, a mix of pool hits (the same hot page) and cold faults (pages a small

@@ -31,6 +31,7 @@ func (p *Pager) ReadPage(id format.PageID) (*Frame, error) {
 	if f, ok := p.pool[id]; ok {
 		f.pin++
 		f.ref = true
+		p.hits++
 		p.mu.Unlock()
 		return f, nil
 	}
@@ -56,10 +57,12 @@ func (p *Pager) ReadPage(id format.PageID) (*Frame, error) {
 	if f, ok := p.pool[id]; ok {
 		f.pin++
 		f.ref = true
+		p.hits++
 		return f, nil
 	}
 	f := &Frame{id: id, Data: buf, pin: 1, ref: true}
 	p.admit(f)
+	p.misses++
 	return f, nil
 }
 
@@ -141,6 +144,32 @@ func (p *Pager) evict() {
 			p.hand = 0
 		}
 		return
+	}
+}
+
+// PoolStats is a point-in-time view of the buffer pool's lookup outcomes and resident population
+// (doc 20 §4.1), the numbers the buffer-pool metrics expose. Hits and Misses are cumulative since
+// open; Resident is the frames currently holding a page and Bytes the memory they occupy. The four
+// are read together under the pool lock so the hit rate and the fill level are consistent.
+type PoolStats struct {
+	Hits     uint64
+	Misses   uint64
+	Resident int
+	Bytes    int
+}
+
+// PoolStats returns the buffer pool's cumulative hit and miss counts and its current resident
+// population in one lock acquisition (doc 20 §4.1). It takes only the pool lock, a leaf below the
+// engine lock, so the metrics snapshot path reads it without risk of the deadlock an engine-lock
+// read would invite behind a long-held write transaction.
+func (p *Pager) PoolStats() PoolStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return PoolStats{
+		Hits:     p.hits,
+		Misses:   p.misses,
+		Resident: len(p.pool),
+		Bytes:    len(p.pool) * int(p.pageSize),
 	}
 }
 

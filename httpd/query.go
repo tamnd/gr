@@ -89,23 +89,34 @@ func (s *server) handleQuery(w http.ResponseWriter, r *http.Request) {
 // read or write path itself. The returned release closes the result and, for a read
 // transaction, rolls it back.
 func (s *server) run(ctx context.Context, req queryRequest) (*gr.Result, func(), error) {
+	// Pass the in-flight gate before executing, so a query that finds it full sheds as
+	// a retryable transient (doc 18 §8.8). The slot is held until the returned release
+	// runs, which the handler defers until the result is fully sent, so the bound covers
+	// the query while it streams, not only at submission. A nil gate admits at once.
+	slot, err := s.admission.Acquire(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	if strings.EqualFold(req.AccessMode, "READ") {
 		tx, err := s.db.Begin(ctx, gr.Read)
 		if err != nil {
+			slot()
 			return nil, nil, err
 		}
 		res, err := tx.Run(ctx, req.Statement, gr.Params(req.Parameters))
 		if err != nil {
 			_ = tx.Rollback()
+			slot()
 			return nil, nil, err
 		}
-		return res, func() { _ = res.Close(); _ = tx.Rollback() }, nil
+		return res, func() { _ = res.Close(); _ = tx.Rollback(); slot() }, nil
 	}
 	res, err := s.db.Run(ctx, req.Statement, gr.Params(req.Parameters))
 	if err != nil {
+		slot()
 		return nil, nil, err
 	}
-	return res, func() { _ = res.Close() }, nil
+	return res, func() { _ = res.Close(); slot() }, nil
 }
 
 // bufferedResponse renders the whole result as one JSON document (doc 18 §9.3). It

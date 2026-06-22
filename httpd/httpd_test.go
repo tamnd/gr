@@ -3,11 +3,13 @@ package httpd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tamnd/gr"
 	"github.com/tamnd/gr/vfs"
@@ -337,5 +339,41 @@ func TestInvalidJSON(t *testing.T) {
 	rec := post(t, h, `{not json`)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+// TestQueryAdmissionShed confirms the HTTP surface sheds a query as a retryable transient
+// when the shared in-flight gate is full (doc 18 §8.8). The one slot is claimed directly,
+// so the request finds the gate full and gets a 503 with a transient code.
+func TestQueryAdmissionShed(t *testing.T) {
+	gate := gr.NewAdmission(1, 10*time.Millisecond)
+	release, err := gate.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("pre-acquire: %v", err)
+	}
+	defer release()
+	h := Handler(newTestDB(t), Options{Admission: gate})
+	rec := post(t, h, `{"statement":"RETURN 1 AS n"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	body := decode(t, rec.Body.Bytes())
+	errsAny, ok := body["errors"].([]any)
+	if !ok || len(errsAny) == 0 {
+		t.Fatalf("no errors in response: %v", body)
+	}
+	first := errsAny[0].(map[string]any)
+	if first["code"] != "Neo.TransientError.General.TransientError" {
+		t.Errorf("code = %v, want transient", first["code"])
+	}
+}
+
+// TestQueryAdmissionAdmits confirms a configured gate with a free slot lets a query
+// through, so the gate is not an unconditional block.
+func TestQueryAdmissionAdmits(t *testing.T) {
+	h := Handler(newTestDB(t), Options{Admission: gr.NewAdmission(4, 0)})
+	rec := post(t, h, `{"statement":"RETURN 1 AS n"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
 }

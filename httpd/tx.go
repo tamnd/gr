@@ -183,7 +183,15 @@ type txBeginRequest struct {
 // the response shape (doc 18 §9.5). It stops at the first error and returns it, so the
 // caller can roll the whole transaction back, the Neo4j behavior where a statement
 // error aborts the transaction.
-func runStatements(ctx context.Context, tx *gr.Tx, stmts []statement, intAsString bool) ([]map[string]any, error) {
+func runStatements(ctx context.Context, tx *gr.Tx, stmts []statement, intAsString bool, adm *gr.Admission) ([]map[string]any, error) {
+	// Pass the in-flight gate before running the batch, so a transaction's statements
+	// shed under overload like an auto-commit query (doc 18 §8.8). The statements buffer
+	// here, so the slot is held for the batch and released when it returns.
+	slot, err := adm.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer slot()
 	results := make([]map[string]any, 0, len(stmts))
 	for _, st := range stmts {
 		res, err := tx.Run(ctx, st.Statement, gr.Params(st.Parameters))
@@ -257,7 +265,7 @@ func (s *server) handleTxBegin(w http.ResponseWriter, r *http.Request, name stri
 		s.writeError(w, status, ae)
 		return
 	}
-	results, err := runStatements(ctx, tx, req.Statements, wantStringInts(r))
+	results, err := runStatements(ctx, tx, req.Statements, wantStringInts(r), s.admission)
 	if err != nil {
 		_ = tx.Rollback()
 		status, ae := mapError(err)
@@ -312,7 +320,7 @@ func (s *server) handleTxRun(w http.ResponseWriter, r *http.Request, id string) 
 	ctx, cancel := s.withTimeout(r.Context(), req.MaxExecutionTime)
 	defer cancel()
 
-	results, err := runStatements(ctx, e.tx, req.Statements, wantStringInts(r))
+	results, err := runStatements(ctx, e.tx, req.Statements, wantStringInts(r), s.admission)
 	if err != nil {
 		s.txns.remove(id)
 		_ = e.tx.Rollback()
@@ -355,7 +363,7 @@ func (s *server) handleTxCommit(w http.ResponseWriter, r *http.Request, id strin
 	ctx, cancel := s.withTimeout(r.Context(), req.MaxExecutionTime)
 	defer cancel()
 
-	results, err := runStatements(ctx, e.tx, req.Statements, wantStringInts(r))
+	results, err := runStatements(ctx, e.tx, req.Statements, wantStringInts(r), s.admission)
 	if err != nil {
 		s.txns.remove(id)
 		_ = e.tx.Rollback()

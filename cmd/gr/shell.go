@@ -41,6 +41,8 @@ type shell struct {
 
 	tx *gr.Tx // the open explicit transaction, nil outside one
 
+	in *bufio.Scanner // the active input scanner, set while a repl or script reads
+
 	code    int  // accumulated worst exit code
 	quitNow bool // set by .quit/.exit
 }
@@ -247,6 +249,7 @@ func writeCounts(s gr.Summary) string {
 func (s *shell) runScript(r io.Reader) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	s.in = sc
 	var buf strings.Builder
 	for sc.Scan() {
 		line := sc.Text()
@@ -289,6 +292,7 @@ func (s *shell) repl(r io.Reader) {
 	}
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	s.in = sc
 	var buf strings.Builder
 	for {
 		fmt.Fprint(s.errw, s.prompt(buf.Len() > 0))

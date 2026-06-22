@@ -260,6 +260,13 @@ func (db *DB) syncWalMetrics() {
 			m.walFsyncDuration.Observe(d)
 		}
 	}
+	if c := m.commitsTotal; c != nil {
+		commits := db.eng.CommitsTotal()
+		if commits > m.lastCommits {
+			c.Add(commits - m.lastCommits)
+			m.lastCommits = commits
+		}
+	}
 }
 
 // syncMvccGCMetrics mirrors the engine's cumulative version-GC totals into the registry at snapshot
@@ -637,6 +644,15 @@ type queryMetrics struct {
 	lastWalFsync     uint64
 	lastWalFsyncErr  uint64
 
+	// commitsTotal holds gr_commits_total, the write transactions that reached their durability point
+	// (doc 20 §5.3): the amortization numerator that, divided by gr_wal_fsync_total, gives the
+	// commits-per-fsync ratio the group-commit payoff is read from. The engine owns the authoritative
+	// cumulative count, bumped under its write lock at each durable commit; the sync step mirrors it
+	// delta-style under walMu beside the fsync counters it pairs with, and lastCommits holds the last
+	// mirrored value.
+	commitsTotal *metric.Counter
+	lastCommits  uint64
+
 	// gcRuns holds gr_mvcc_gc_runs_total and gcReclaimed gr_mvcc_gc_reclaimed_total keyed by element
 	// (doc 20 §5.1). The engine owns the authoritative cumulative totals, bumped under its lock when
 	// GC runs at checkpoint; the sync step mirrors them here delta-style, the same bridge the
@@ -826,6 +842,8 @@ func newQueryMetrics() *queryMetrics {
 		"WAL fsyncs that returned an error, any nonzero value a durability alarm", "fsyncs", nil)
 	m.walFsyncDuration = reg.Histogram("gr_wal_fsync_seconds",
 		"Wall-clock duration of a WAL fsync, the true commit cost", "seconds", queryLatencyBuckets, nil)
+	m.commitsTotal = reg.Counter("gr_commits_total",
+		"Write transactions committed durably, the fsync-amortization numerator", "commits", nil)
 	m.gcRuns = reg.Counter("gr_mvcc_gc_runs_total",
 		"Version-GC passes executed", "runs", nil)
 	m.gcReclaimed = make(map[string]*metric.Counter, len(metricMvccElements))

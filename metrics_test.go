@@ -1069,6 +1069,43 @@ func TestMetricsWalFsync(t *testing.T) {
 	}
 }
 
+func TestMetricsCommits(t *testing.T) {
+	db := openMem(t, "mxcommits.gr")
+	defer db.Close()
+
+	// Opening commits the catalog, so the commit counter starts non-zero; measure the delta.
+	base := db.Metrics().Counter("gr_commits_total", nil)
+
+	for i := 0; i < 50; i++ {
+		mustExec(t, db, "CREATE (:Person {note: 'value'})", nil)
+	}
+
+	// Each create is one autocommit write transaction that reaches its durability point, so the
+	// counter advances by exactly fifty. Schema interning commits the pager on its own path, which is
+	// not a transaction commit, so it does not inflate the count.
+	snap := db.Metrics()
+	if c := snap.Counter("gr_commits_total", nil); c != base+50 {
+		t.Fatalf("commits after fifty creates = %d, want %d", c, base+50)
+	}
+	// The amortization numerator pairs with the fsync count: in the inline-commit design every durable
+	// commit fsyncs once, so the commit count does not run ahead of the fsync count.
+	if commits, fsync := snap.Counter("gr_commits_total", nil), snap.Counter("gr_wal_fsync_total", nil); commits > fsync {
+		t.Fatalf("commits %d ran ahead of fsyncs %d, want commits <= fsyncs without batching", commits, fsync)
+	}
+
+	// A read transaction is not a durable commit, so it does not move the counter.
+	rtx, err := db.Begin(context.Background(), Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rtx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if c := db.Metrics().Counter("gr_commits_total", nil); c != base+50 {
+		t.Fatalf("commits after a read transaction = %d, want it to hold at %d", c, base+50)
+	}
+}
+
 func TestMetricsCheckpoint(t *testing.T) {
 	db := openMem(t, "mxcheckpoint.gr")
 	defer db.Close()

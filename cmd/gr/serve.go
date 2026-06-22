@@ -40,7 +40,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	name := fs.String("name", "neo4j", "database name in the URL path")
 	readonly := fs.Bool("readonly", false, "open the database read-only")
 	var users userList
-	fs.Var(&users, "user", "name:password for HTTP auth (repeatable); none means auth is off")
+	fs.Var(&users, "user", "name:password[:roles] for HTTP auth (repeatable); roles is a comma list of reader/editor/publisher/admin, default admin; none means auth is off")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: gr serve [flags] [database]")
 		fmt.Fprintln(stderr)
@@ -91,24 +91,50 @@ func openServeDB(path string, readonly bool) (*gr.DB, error) {
 }
 
 // buildAuth turns the --user flags into a credential provider, or returns nil when no
-// users were given so authentication is off. Each user gets the admin role, since the
-// fine-grained role model is enforced in a later slice; a name:password without a colon
-// is a usage error.
+// users were given so authentication is off. The flag is name:password[:roles], where
+// roles is a comma-separated list drawn from reader/editor/publisher/admin (doc 18
+// §10.6); with no roles field a user gets admin, so a single --user keeps full access.
+// A flag with no colon, or an empty name, is a usage error. Because the optional roles
+// field is the third colon-separated part, a password that itself contains a colon must
+// not be combined with an explicit roles field.
 func buildAuth(users userList) (httpd.AuthProvider, error) {
 	if len(users) == 0 {
 		return nil, nil
 	}
 	p := httpd.NewStaticProvider()
 	for _, u := range users {
-		name, pass, ok := strings.Cut(u, ":")
-		if !ok || name == "" {
-			return nil, fmt.Errorf("invalid --user %q, want name:password", u)
+		name, pass, roles, err := parseUser(u)
+		if err != nil {
+			return nil, err
 		}
-		if err := p.AddUser(name, pass, "admin"); err != nil {
+		if err := p.AddUser(name, pass, roles...); err != nil {
 			return nil, err
 		}
 	}
 	return p, nil
+}
+
+// parseUser splits a --user flag into its name, password, and roles (doc 18 §10.6). The
+// form is name:password with an optional :roles suffix; a missing roles suffix means the
+// admin role. The name and password are required, so a flag with no colon or an empty
+// name is a usage error.
+func parseUser(u string) (name, pass string, roles []string, err error) {
+	parts := strings.SplitN(u, ":", 3)
+	if len(parts) < 2 || parts[0] == "" {
+		return "", "", nil, fmt.Errorf("invalid --user %q, want name:password[:roles]", u)
+	}
+	name, pass = parts[0], parts[1]
+	if len(parts) == 3 && parts[2] != "" {
+		for _, role := range strings.Split(parts[2], ",") {
+			if role = strings.TrimSpace(role); role != "" {
+				roles = append(roles, role)
+			}
+		}
+	}
+	if len(roles) == 0 {
+		roles = []string{"admin"}
+	}
+	return name, pass, roles, nil
 }
 
 // describeDB names the database for the startup banner.

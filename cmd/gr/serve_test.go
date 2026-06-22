@@ -87,6 +87,40 @@ func TestServeWithAuth(t *testing.T) {
 	}
 }
 
+// TestServeUserRoles confirms --user grants the roles named in its third field, so a
+// reader is refused a write while an editor is allowed one, and a roleless --user
+// defaults to admin (full access).
+func TestServeUserRoles(t *testing.T) {
+	listen := func(addr string, handler http.Handler) error {
+		send := func(user, statement string) int {
+			body := `{"statement":"` + statement + `"}`
+			req := httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2", strings.NewReader(body))
+			req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(user+":pw")))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			return rec.Code
+		}
+		if code := send("reader", "CREATE (:T)"); code != http.StatusForbidden {
+			t.Errorf("reader write = %d, want 403", code)
+		}
+		if code := send("reader", "RETURN 1"); code != http.StatusOK {
+			t.Errorf("reader read = %d, want 200", code)
+		}
+		if code := send("writer", "CREATE (:T)"); code != http.StatusOK {
+			t.Errorf("editor write = %d, want 200", code)
+		}
+		if code := send("boss", "CREATE INDEX FOR (p:T) ON (p.x)"); code != http.StatusOK {
+			t.Errorf("default-admin schema = %d, want 200", code)
+		}
+		return nil
+	}
+	var out, errw bytes.Buffer
+	args := []string{"--user", "reader:pw:reader", "--user", "writer:pw:editor", "--user", "boss:pw"}
+	if code := runServe(args, &out, &errw, listen); code != exitOK {
+		t.Fatalf("code = %d, stderr = %s", code, errw.String())
+	}
+}
+
 // TestServeBadUser rejects a malformed --user as a usage error.
 func TestServeBadUser(t *testing.T) {
 	listen := func(addr string, h http.Handler) error { return nil }

@@ -710,6 +710,58 @@ func internName(tx engine.Tx, kind catalog.Kind, name string) error {
 	return err
 }
 
+// Kind classifies a statement by what it does (doc 18 §5.7, §10.6): a read, a write,
+// or a schema change. It is computed from the parsed statement without executing it, so
+// a caller (an authorization layer, a router) can decide what to allow before any side
+// effect happens.
+type Kind int
+
+const (
+	// ReadStatement reads the graph and changes nothing. An EXPLAIN of any statement
+	// is a read, since EXPLAIN never executes the underlying statement.
+	ReadStatement Kind = iota
+	// WriteStatement changes graph data (CREATE, MERGE, SET, REMOVE, DELETE, FOREACH).
+	WriteStatement
+	// SchemaStatement changes the schema (CREATE/DROP INDEX or CONSTRAINT).
+	SchemaStatement
+)
+
+// String names the kind for diagnostics.
+func (k Kind) String() string {
+	switch k {
+	case WriteStatement:
+		return "write"
+	case SchemaStatement:
+		return "schema"
+	default:
+		return "read"
+	}
+}
+
+// StatementKind parses a statement and reports whether it reads, writes, or changes
+// schema, without executing it (doc 18 §10.6). It is the classifier an authorization
+// layer checks a principal's roles against before execution, so a forbidden write is
+// refused before it can have any effect. An unparseable statement returns the parse
+// error, so a caller can let the normal execution path surface it as a syntax error.
+// An EXPLAIN classifies as a read regardless of the underlying statement, because
+// EXPLAIN produces only the plan and never executes.
+func (db *DB) StatementKind(cypher string) (Kind, error) {
+	q, err := parse.Parse(cypher)
+	if err != nil {
+		return ReadStatement, err
+	}
+	switch {
+	case q.Explain:
+		return ReadStatement, nil
+	case q.Schema != nil:
+		return SchemaStatement, nil
+	case queryHasWrites(q):
+		return WriteStatement, nil
+	default:
+		return ReadStatement, nil
+	}
+}
+
 // queryHasWrites reports whether a statement contains any write clause, so Query
 // can reject one and run it where it belongs (Exec, over a write transaction).
 func queryHasWrites(q *ast.Query) bool {

@@ -50,6 +50,10 @@ func (s *server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.authorize(w, r, req.Statement) {
+		return
+	}
+
 	ctx := r.Context()
 	if req.MaxExecutionTime > 0 {
 		var cancel context.CancelFunc

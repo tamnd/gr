@@ -14,6 +14,7 @@ package pager
 
 import (
 	"errors"
+	"sync"
 
 	"github.com/tamnd/gr/format"
 	"github.com/tamnd/gr/vfs"
@@ -69,6 +70,17 @@ type Pager struct {
 	sync     wal.SyncLevel
 	readOnly bool
 
+	// mu guards the buffer pool (pool, clock, hand) and the per-frame pin and ref
+	// fields against concurrent readers. A write transaction holds the engine's
+	// exclusive lock so it never races a reader, but morsel-parallel execution
+	// runs many reader goroutines against one snapshot, and each ReadPage/Unpin
+	// mutates the shared pool and a frame's pin count, so the read path needs its
+	// own lock below the engine's shared read lock. It is taken only by the leaf
+	// methods (ReadPage, Unpin) and the admit/evict helpers they call; the
+	// write-path helpers (AllocPage, FreePage, popFree, reuse) run under the
+	// engine write lock and reach the pool only through those leaf methods, so
+	// they never hold mu themselves and cannot re-enter it.
+	mu       sync.Mutex
 	pool     map[format.PageID]*Frame
 	clock    []*Frame
 	hand     int

@@ -27,17 +27,36 @@ func verifyPage(buf []byte) bool {
 // is special: it carries the file Header rather than the generic page header and
 // checksum, so it is not checksum-validated here.
 func (p *Pager) ReadPage(id format.PageID) (*Frame, error) {
+	p.mu.Lock()
 	if f, ok := p.pool[id]; ok {
 		f.pin++
 		f.ref = true
+		p.mu.Unlock()
 		return f, nil
 	}
+	p.mu.Unlock()
+
+	// Fault the page in from disk without holding the lock, so a slow read does
+	// not serialize every other reader. ReadAt is safe for concurrent use (it is
+	// a pread under the hood), so two readers faulting different pages proceed in
+	// parallel.
 	buf := make([]byte, p.pageSize)
 	if _, err := p.db.ReadAt(buf, int64(id)*int64(p.pageSize)); err != nil {
 		return nil, err
 	}
 	if id != 0 && !verifyPage(buf) {
 		return nil, ErrBadChecksum
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Another reader may have faulted the same page in while this one read it from
+	// disk; if so, pin the resident frame and drop the duplicate buffer so the pool
+	// never holds two frames for one page.
+	if f, ok := p.pool[id]; ok {
+		f.pin++
+		f.ref = true
+		return f, nil
 	}
 	f := &Frame{id: id, Data: buf, pin: 1, ref: true}
 	p.admit(f)
@@ -64,7 +83,9 @@ func (p *Pager) AllocPage(t format.PageType) (*Frame, error) {
 	buf := make([]byte, p.pageSize)
 	format.WriteHeader(buf, format.PageHeader{Type: t})
 	f := &Frame{id: id, Data: buf, pin: 1, dirty: true, ref: true}
+	p.mu.Lock()
 	p.admit(f)
+	p.mu.Unlock()
 	return f, nil
 }
 
@@ -74,13 +95,15 @@ func (p *Pager) MarkDirty(f *Frame) { f.dirty = true }
 
 // Unpin releases one pin on a frame, making it eligible for eviction once clean.
 func (p *Pager) Unpin(f *Frame) {
+	p.mu.Lock()
 	if f.pin > 0 {
 		f.pin--
 	}
+	p.mu.Unlock()
 }
 
 // admit inserts a frame into the pool and the clock ring, evicting first if the
-// pool is over capacity.
+// pool is over capacity. The caller must hold p.mu.
 func (p *Pager) admit(f *Frame) {
 	if len(p.pool) >= p.maxPool {
 		p.evict()
@@ -94,6 +117,7 @@ func (p *Pager) admit(f *Frame) {
 // dirty frame is also skipped because it has uncommitted contents — at most one
 // transaction's worth of dirty pages can pile up, so the pool simply grows past
 // its soft cap rather than lose data. If nothing is evictable the pool grows.
+// The caller must hold p.mu.
 func (p *Pager) evict() {
 	if len(p.clock) == 0 {
 		return

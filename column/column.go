@@ -24,6 +24,8 @@
 package column
 
 import (
+	"sync"
+
 	"github.com/tamnd/gr/format"
 	"github.com/tamnd/gr/pager"
 	"github.com/tamnd/gr/store"
@@ -70,6 +72,13 @@ type Columns struct {
 	secs   *store.Sections
 	dirSec store.Section
 	dir    *store.Vector
+	// colsMu guards the cols cache against concurrent readers. A read of a
+	// property (Get, GetDelta) opens the key's column on a cache miss and installs
+	// it here, so morsel-parallel readers sharing one snapshot race on the map
+	// without a lock. The write path (Set, Remove, Free) runs under the engine's
+	// exclusive lock so it never races a reader, but it reaches the cache only
+	// through openColumn, which takes the lock itself, so writers are covered too.
+	colsMu sync.Mutex
 	cols   map[uint32]*column
 }
 
@@ -168,6 +177,14 @@ func (c *Columns) openColumn(key uint32) (*column, error) {
 		return nil, err
 	}
 	col := &column{idx: idx, vals: vals}
+	// Drop the lock across the vector opens above (they do their own IO through
+	// the safe pager), then install under the lock with a double-check so a peer
+	// that opened the same column first wins and this caller drops its duplicate.
+	c.colsMu.Lock()
+	defer c.colsMu.Unlock()
+	if existing, ok := c.cols[key]; ok {
+		return existing, nil
+	}
 	c.cols[key] = col
 	return col, nil
 }
@@ -176,7 +193,10 @@ func (c *Columns) openColumn(key uint32) (*column, error) {
 // token up to and including it if the directory does not yet reach that far.
 // Property-key tokens are dense, so this usually creates just the one column.
 func (c *Columns) ensureColumn(key uint32) (*column, error) {
-	if col, ok := c.cols[key]; ok {
+	c.colsMu.Lock()
+	col, ok := c.cols[key]
+	c.colsMu.Unlock()
+	if ok {
 		return col, nil
 	}
 	if int(key) < c.dir.Count() {

@@ -294,6 +294,66 @@ func TestMetricsExecuteDuration(t *testing.T) {
 	}
 }
 
+// TestMetricsPlanCacheLookups confirms gr_plan_cache_lookups_total splits a cold compile from a
+// warm hit and that gr_plan_cache_entries tracks the resident plan count (doc 20 §3.2).
+func TestMetricsPlanCacheLookups(t *testing.T) {
+	db, err := Open("mcl.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const q = "MATCH (p:Person) RETURN p"
+	r1, err := db.Run(context.Background(), q, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainResult(t, r1)
+	r2, err := db.Run(context.Background(), q, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainResult(t, r2)
+
+	snap := db.Metrics()
+	if hit := snap.Counter("gr_plan_cache_lookups_total", Labels{"result": "hit"}); hit != 1 {
+		t.Errorf("cache hits = %d, want 1", hit)
+	}
+	if miss := snap.Counter("gr_plan_cache_lookups_total", Labels{"result": "miss"}); miss != 1 {
+		t.Errorf("cache misses = %d, want 1", miss)
+	}
+	if e := snap.Gauge("gr_plan_cache_entries", nil); e != 1 {
+		t.Errorf("resident plans = %d, want 1", e)
+	}
+}
+
+// TestMetricsPlanCacheEviction confirms a plan cache too small for the query variety records a
+// capacity eviction (doc 20 §3.2): with room for one plan, a second distinct shape evicts the
+// first.
+func TestMetricsPlanCacheEviction(t *testing.T) {
+	db, err := Open("mce.gr", Options{VFS: vfs.NewMem(), PlanCacheSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for _, q := range []string{"MATCH (a:A) RETURN a", "MATCH (b:B) RETURN b"} {
+		res, err := db.Run(context.Background(), q, nil)
+		if err != nil {
+			t.Fatalf("run %q: %v", q, err)
+		}
+		drainResult(t, res)
+	}
+
+	snap := db.Metrics()
+	if ev := snap.Counter("gr_plan_cache_evictions_total", Labels{"reason": "capacity"}); ev != 1 {
+		t.Errorf("capacity evictions = %d, want 1", ev)
+	}
+	if e := snap.Gauge("gr_plan_cache_entries", nil); e != 1 {
+		t.Errorf("resident plans = %d, want 1 (cache holds one)", e)
+	}
+}
+
 // TestMetricsAlwaysOn confirms the registry exists on a plain Open with no logging configured,
 // so the metrics plane is always on (doc 20 §1.2).
 func TestMetricsAlwaysOn(t *testing.T) {

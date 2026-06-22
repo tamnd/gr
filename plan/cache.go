@@ -57,6 +57,12 @@ type Cache struct {
 	max     int
 	ll      *list.List // most-recently-used at the front
 	entries map[Key]*list.Element
+
+	// OnEvict, if set, is called once for each plan the cache drops, with the reason it left
+	// (doc 20 §3.2). The cache drives only the capacity reason, the LRU eviction under size
+	// pressure; it is the seam db.Metrics counts gr_plan_cache_evictions_total on. It is called
+	// while the cache lock is held, so it must not re-enter the cache, only record.
+	OnEvict func(reason string)
 }
 
 // cacheNode is the value stored in each list element: its key (so eviction can
@@ -127,6 +133,9 @@ func (c *Cache) evict() {
 	}
 	c.ll.Remove(el)
 	delete(c.entries, el.Value.(*cacheNode).key)
+	if c.OnEvict != nil {
+		c.OnEvict("capacity")
+	}
 }
 
 // Len returns the number of cached entries.

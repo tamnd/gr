@@ -97,6 +97,24 @@ var metricQueryStatuses = []string{"ok", "error", "timeout", "killed"}
 // write path does not cache.
 var metricPlanCache = []string{"hit", "miss"}
 
+// metricCacheResults is the bounded domain of the result label on gr_plan_cache_lookups_total
+// (doc 20 §3.2): whether a plan-cache lookup found a usable plan (hit) or had to compile one
+// (miss). The hit rate, hit / (hit + miss), is the headline plan-cache efficiency.
+var metricCacheResults = []string{"hit", "miss"}
+
+// metricCacheEvictReasons is the bounded domain of the reason label on
+// gr_plan_cache_evictions_total (doc 20 §3.2): why a plan left the cache. capacity is the LRU
+// eviction under size pressure, the one the cache itself drives; the schema_change, stats_change,
+// and manual reasons wait on the hooks that produce them (a catalog-version flush, an explicit
+// clear), so they are registered here but not yet incremented.
+var metricCacheEvictReasons = []string{"capacity", "schema_change", "stats_change", "manual"}
+
+// metricCacheInvalidCauses is the bounded domain of the cause label on
+// gr_plan_cache_invalidations_total (doc 20 §3.2): why a cached plan was rebuilt for coherence.
+// stats_refresh is the drift re-plan, where a cache hit's basis has moved far enough that the
+// plan is recompiled; the ddl and constraint causes wait on their hooks.
+var metricCacheInvalidCauses = []string{"ddl", "stats_refresh", "constraint"}
+
 // metricErrorClasses is the bounded domain of the class label on gr_query_errors_total (doc 20
 // §3.1): the cause an error falls into. The metric is a sub-view of
 // gr_queries_total{status="error"} broken out by cause, plus the syntax errors that fail before
@@ -117,6 +135,10 @@ type queryMetrics struct {
 	scanned  *metric.Histogram                     // gr_query_rows_scanned (scan and expand work)
 	plan     map[string]*metric.Histogram          // gr_query_plan_duration_seconds by [cache]
 	execute  map[string]*metric.Histogram          // gr_query_execute_duration_seconds by [kind]
+
+	cacheLookups       map[string]*metric.Counter // gr_plan_cache_lookups_total by [result]
+	cacheEvictions     map[string]*metric.Counter // gr_plan_cache_evictions_total by [reason]
+	cacheInvalidations map[string]*metric.Counter // gr_plan_cache_invalidations_total by [cause]
 }
 
 // newQueryMetrics builds the registry and pre-resolves every query-metric handle (doc 20
@@ -132,6 +154,22 @@ func newQueryMetrics() *queryMetrics {
 		errors:   make(map[string]*metric.Counter, len(metricErrorClasses)),
 		plan:     make(map[string]*metric.Histogram, len(metricPlanCache)),
 		execute:  make(map[string]*metric.Histogram, len(metricQueryKinds)),
+
+		cacheLookups:       make(map[string]*metric.Counter, len(metricCacheResults)),
+		cacheEvictions:     make(map[string]*metric.Counter, len(metricCacheEvictReasons)),
+		cacheInvalidations: make(map[string]*metric.Counter, len(metricCacheInvalidCauses)),
+	}
+	for _, r := range metricCacheResults {
+		m.cacheLookups[r] = reg.Counter("gr_plan_cache_lookups_total",
+			"Plan-cache lookups by result", "lookups", metric.Labels{"result": r})
+	}
+	for _, r := range metricCacheEvictReasons {
+		m.cacheEvictions[r] = reg.Counter("gr_plan_cache_evictions_total",
+			"Plans evicted from the cache, by reason", "evictions", metric.Labels{"reason": r})
+	}
+	for _, c := range metricCacheInvalidCauses {
+		m.cacheInvalidations[c] = reg.Counter("gr_plan_cache_invalidations_total",
+			"Cached plans invalidated for coherence, by cause", "invalidations", metric.Labels{"cause": c})
 	}
 	for _, c := range metricErrorClasses {
 		m.errors[c] = reg.Counter("gr_query_errors_total",
@@ -198,6 +236,33 @@ func (m *queryMetrics) recordPlan(cache string, d time.Duration) {
 func (m *queryMetrics) recordExecute(kind string, d time.Duration) {
 	if h := m.execute[kind]; h != nil {
 		h.Observe(d.Seconds())
+	}
+}
+
+// recordCacheLookup counts one plan-cache lookup by its result (doc 20 §3.2): hit when the cache
+// served a usable plan, miss when the plan had to be compiled. The hit rate read off this counter
+// is the plan-cache efficiency an operator watches; a hit rate that falls while capacity
+// evictions rise is the cache-too-small signature (§16.3).
+func (m *queryMetrics) recordCacheLookup(result string) {
+	if c := m.cacheLookups[result]; c != nil {
+		c.Inc()
+	}
+}
+
+// recordCacheEviction counts one plan leaving the cache by reason (doc 20 §3.2). The cache drives
+// the capacity reason directly through its eviction hook.
+func (m *queryMetrics) recordCacheEviction(reason string) {
+	if c := m.cacheEvictions[reason]; c != nil {
+		c.Inc()
+	}
+}
+
+// recordCacheInvalidation counts one cached plan rebuilt for coherence by cause (doc 20 §3.2).
+// The drift re-plan is the stats_refresh cause: a cache hit whose cardinality basis has moved far
+// enough that the plan is recompiled on the live statistics.
+func (m *queryMetrics) recordCacheInvalidation(cause string) {
+	if c := m.cacheInvalidations[cause]; c != nil {
+		c.Inc()
 	}
 }
 

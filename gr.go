@@ -206,6 +206,11 @@ func Open(path string, opt Options) (*DB, error) {
 		events:      opt.EventLog,
 		metrics:     newQueryMetrics(),
 	}
+	// Wire the plan-cache metrics to the cache now both exist (doc 20 §3.2): the eviction hook
+	// counts LRU drops, and a computed gauge reads the resident plan count at snapshot time.
+	db.cache.OnEvict = func(reason string) { db.metrics.recordCacheEviction(reason) }
+	db.metrics.reg.ComputedGauge("gr_plan_cache_entries",
+		"Cached plans currently resident", "plans", nil, func() int64 { return int64(db.cache.Len()) })
 	// The open event reports the file's real geometry and whether this open recovered a
 	// committed WAL prefix after a crash (doc 20 §11.3). StorageInfo reads the header the
 	// engine just mounted, so the format version and page size are the file's own.
@@ -1152,9 +1157,18 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 	start := time.Now()
 	key := plan.Key{Text: plan.NormalizeText(cypher), Catalog: db.eng.CatalogVersion()}
 	st := engineStats{db.eng}
-	if entry, ok := db.cache.Get(key); ok && !plan.Drifted(entry.Stats, st, db.drift()) {
+	cached, ok := db.cache.Get(key)
+	if ok && !plan.Drifted(cached.Stats, st, db.drift()) {
+		db.metrics.recordCacheLookup("hit")
 		db.metrics.recordPlan("hit", time.Since(start))
-		return entry, nil
+		return cached, nil
+	}
+	// Either the cache had no plan for this text or the plan it had has drifted off its
+	// cardinality basis: both recompile, so both count as a lookup miss, and a present-but-drifted
+	// entry also counts as a coherence invalidation that the recompile resolves (doc 20 §3.2).
+	db.metrics.recordCacheLookup("miss")
+	if ok {
+		db.metrics.recordCacheInvalidation("stats_refresh")
 	}
 	q, err := parse.Parse(cypher)
 	if err != nil {

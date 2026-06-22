@@ -235,6 +235,9 @@ func (p *Pager) Commit() error {
 			return err
 		}
 	}
+	// Count the images written back, the page write-back volume the checkpoint metrics attribute to a
+	// fold (doc 20 §5.4). Every commit checkpoints its frames straight into the file here.
+	p.pagesWritten.Add(uint64(len(frames)))
 	if err := p.db.Truncate(int64(p.header.PageCount) * int64(p.pageSize)); err != nil {
 		return err
 	}

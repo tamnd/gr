@@ -15,6 +15,7 @@ package pager
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 
 	"github.com/tamnd/gr/format"
 	"github.com/tamnd/gr/vfs"
@@ -94,6 +95,12 @@ type Pager struct {
 	// already uses, and the pager never reaches up into the metric registry.
 	hits   uint64
 	misses uint64
+
+	// pagesWritten is the cumulative count of page images Commit has copied into the database file
+	// since open, the write-back volume the checkpoint metrics attribute to a fold (doc 20 §5.4). Each
+	// Commit adds the frames it wrote, including the header frame. It is an atomic so a reader can load
+	// it without the pool lock; the engine reads it around its checkpoint to mirror the fold's writes.
+	pagesWritten atomic.Uint64
 
 	headerDirty bool
 	closed      bool
@@ -291,6 +298,11 @@ func (p *Pager) PageSize() uint32 { return p.pageSize }
 // means the previous process crashed between a commit's fsync and its checkpoint.
 // It feeds the open event's recovered flag (doc 20 §11.3).
 func (p *Pager) Recovered() bool { return p.recovered }
+
+// PagesWritten returns the cumulative count of page images Commit has copied into the database file
+// since open (doc 20 §5.4). The engine reads it around a checkpoint to attribute the fold's write-back
+// volume; it is a lock-free atomic load, so it never contends the pool lock.
+func (p *Pager) PagesWritten() uint64 { return p.pagesWritten.Load() }
 
 // PayloadSize returns usable payload bytes per page.
 func (p *Pager) PayloadSize() int { return format.PayloadSize(p.pageSize) }

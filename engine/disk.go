@@ -112,6 +112,12 @@ type DiskEngine struct {
 	// gr_checkpoint_delta_folded_total delta-style, read off the snapshot path as a lock-free atomic.
 	ckptDeltaFoldedTotal atomic.Uint64
 
+	// ckptPagesWrittenTotal counts the page images checkpoints have written back to the database file,
+	// bumped under the engine lock by the pager's write-back delta across each checkpoint's commits
+	// (doc 20 §5.4). It is the authoritative cumulative count the metrics path mirrors into
+	// gr_checkpoint_pages_written_total delta-style, read off the snapshot path as a lock-free atomic.
+	ckptPagesWrittenTotal atomic.Uint64
+
 	// gcRunsTotal counts version-GC passes, and gcReclaimedNode and gcReclaimedRel the pre-images
 	// each pass dropped, split by element, all bumped under the engine lock when GC runs at
 	// checkpoint (doc 20 §5.1). They are the authoritative cumulative counts the metrics path mirrors
@@ -211,6 +217,12 @@ func (e *DiskEngine) CheckpointSegmentsTotal() (node, rel uint64) {
 // metrics path mirrors it into gr_checkpoint_delta_folded_total delta-style, so this never takes the
 // engine lock and is safe off the snapshot path.
 func (e *DiskEngine) CheckpointDeltaFoldedTotal() uint64 { return e.ckptDeltaFoldedTotal.Load() }
+
+// CheckpointPagesWrittenTotal returns the cumulative count of page images checkpoints have written back
+// to the database file (doc 20 §5.4), read lock-free from the atomic each checkpoint bumps. The metrics
+// path mirrors it into gr_checkpoint_pages_written_total delta-style, so this never takes the engine
+// lock and is safe off the snapshot path.
+func (e *DiskEngine) CheckpointPagesWrittenTotal() uint64 { return e.ckptPagesWrittenTotal.Load() }
 
 // VersionsResident returns the number of element versions the MVCC overlay still holds beyond the
 // current committed version (doc 20 §5.1), for the gr_mvcc_versions_resident gauge. It reads the
@@ -595,6 +607,9 @@ func (e *DiskEngine) Begin(write bool) (Tx, error) {
 func (e *DiskEngine) Checkpoint() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// Capture the pager's cumulative write-back count before the fold, so the difference after the
+	// checkpoint's commits is exactly the pages this checkpoint wrote back to the file (doc 20 §5.4).
+	pagesBefore := e.p.PagesWritten()
 	// Capture the staged adjacency delta before the fold drains it, so the metrics path can mirror the
 	// edge work this checkpoint absorbed (doc 20 §5.4). The fold clears the delta to empty, so reading
 	// it after would always be zero; we hold the engine lock, so no writer is appending concurrently.
@@ -656,6 +671,9 @@ func (e *DiskEngine) Checkpoint() error {
 	if _, err := e.commitPager(); err != nil {
 		return err
 	}
+	// The checkpoint's commits are done, so the pager's write-back count has advanced by exactly the
+	// pages this checkpoint wrote back to the file; record the delta for the metrics path (doc 20 §5.4).
+	e.ckptPagesWrittenTotal.Add(e.p.PagesWritten() - pagesBefore)
 	gcStart := time.Now()
 	gc := e.ov.GC(e.oracle.Watermark())
 	gcDur := time.Since(gcStart).Seconds()

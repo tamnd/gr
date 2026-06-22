@@ -885,6 +885,30 @@ func TestMetricsColcacheAccesses(t *testing.T) {
 	}
 }
 
+func TestMetricsFileSizeBytes(t *testing.T) {
+	db := openMem(t, "mxfilesize.gr")
+	defer db.Close()
+
+	// A freshly opened database holds a header and its initial store pages, so the file
+	// has a size, and that size is a whole number of pages.
+	base := db.Metrics().Gauge("gr_file_size_bytes", nil)
+	if base <= 0 {
+		t.Fatalf("file size after open = %d, want > 0", base)
+	}
+	if ps := int64(db.PageSize()); base%ps != 0 {
+		t.Fatalf("file size = %d, want a multiple of the page size %d", base, ps)
+	}
+
+	// Writing enough nodes allocates new pages, so the file grows after the commits.
+	for i := 0; i < 200; i++ {
+		mustExec(t, db, "CREATE (:Person {note: 'a longer value to push the file past its initial pages'})", nil)
+	}
+	grown := db.Metrics().Gauge("gr_file_size_bytes", nil)
+	if grown <= base {
+		t.Fatalf("file size after writes = %d, want > %d", grown, base)
+	}
+}
+
 func TestMetricsBufferPoolAccesses(t *testing.T) {
 	db := openMem(t, "mxbufpool.gr")
 	defer db.Close()

@@ -342,6 +342,35 @@ type ExpandCount struct {
 	Col   string
 }
 
+// ProductCount is the factorized count of two or more independent expands that
+// fan out from the same source node (doc 11 §7, §8; ADR-8): the recommendation
+// shape MATCH (a)-[:R1]->(b), (a)-[:R2]->(c) RETURN count(*). The naive plan
+// builds the cross-product of the two fan-outs, one row per (b, c) pair; the
+// factorized count never materializes the product. Because the legs leave the
+// source along disjoint relationship types, no edge can match two legs and no
+// relationship-uniqueness couples them, so the rows the pattern would produce for
+// one source is exactly the product of the source's per-leg degrees, and the
+// whole count is the sum of that product over the source rows. Input is the
+// shared source rows (the anchor scan), From the shared source variable, Legs the
+// independent expands counted, and Col the output column. It only stands in when
+// every leg is plain (no target-label, no expand-into, no variable length), the
+// legs' type sets are all known and pairwise disjoint, and the input binds no
+// relationship the legs would have to stay distinct from.
+type ProductCount struct {
+	Input Op
+	From  string
+	Legs  []ProductLeg
+	Col   string
+}
+
+// ProductLeg is one independent expand of a ProductCount: the relationship type
+// set and direction whose degree from the shared source is one factor of the
+// per-source product.
+type ProductLeg struct {
+	Types []bind.NameRef
+	Dir   ast.Direction
+}
+
 // Join combines two row streams. On lists the shared variable names the rows
 // must agree on; an empty On is a cartesian product.
 type Join struct {
@@ -416,6 +445,7 @@ func (*ShortestPath) op()  {}
 func (*Project) op()       {}
 func (*Aggregate) op()     {}
 func (*ExpandCount) op()   {}
+func (*ProductCount) op()  {}
 func (*Join) op()          {}
 func (*Optional) op()      {}
 func (*Unwind) op()        {}
@@ -498,6 +528,8 @@ func outputVars(o Op) map[string]bool {
 		}
 		return s
 	case *ExpandCount:
+		return map[string]bool{x.Col: true}
+	case *ProductCount:
 		return map[string]bool{x.Col: true}
 	case *Join:
 		s := outputVars(x.Left)
@@ -612,6 +644,8 @@ func nodeLabel(o Op) string {
 		return "Aggregate" + distinct(x.Distinct) + " by[" + colList(x.GroupKeys) + "] agg[" + colList(x.Aggs) + "]"
 	case *ExpandCount:
 		return "ExpandCount " + x.Col + " = count " + expandCountLabel(x)
+	case *ProductCount:
+		return "ProductCount " + x.Col + " = count " + productCountLabel(x)
 	case *Join:
 		return "Join on[" + strings.Join(x.On, ",") + "]"
 	case *Optional:
@@ -665,6 +699,8 @@ func nodeChildren(o Op) []Op {
 	case *Aggregate:
 		return []Op{x.Input}
 	case *ExpandCount:
+		return []Op{x.Input}
+	case *ProductCount:
 		return []Op{x.Input}
 	case *Join:
 		return []Op{x.Left, x.Right}
@@ -749,6 +785,30 @@ func expandCountLabel(x *ExpandCount) string {
 		left = "<-"
 	}
 	return x.From + " " + left + "[" + x.Rel + typeSuffix(x.Types) + "]" + right
+}
+
+// productCountLabel renders a ProductCount as the shared source followed by each
+// independent leg's arrow, "a (-[#1]-> & -[#2]->)", so a factorized product count
+// reads as the fan-outs it multiplies without naming the rows it never builds.
+func productCountLabel(x *ProductCount) string {
+	legs := make([]string, len(x.Legs))
+	for i, l := range x.Legs {
+		left, right := "-", "-"
+		switch l.Dir {
+		case ast.DirOut:
+			right = "->"
+		case ast.DirIn:
+			left = "<-"
+		}
+		legs[i] = left + "[" + typeSuffixTrim(l.Types) + "]" + right
+	}
+	return x.From + " (" + strings.Join(legs, " & ") + ")"
+}
+
+// typeSuffixTrim is typeSuffix without the leading colon spacer, for rendering a
+// leg's type set inside the bracket of a ProductCount leg.
+func typeSuffixTrim(types []bind.NameRef) string {
+	return strings.TrimPrefix(typeSuffix(types), ":")
 }
 
 // intersectLabel renders an Intersect: the apex variable with its labels, then the

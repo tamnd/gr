@@ -123,6 +123,8 @@ func Columns(root plan.Op) []string {
 		return append(colNames(x.GroupKeys), colNames(x.Aggs)...)
 	case *plan.ExpandCount:
 		return []string{x.Col}
+	case *plan.ProductCount:
+		return []string{x.Col}
 	case *plan.Sort:
 		return Columns(x.Input)
 	case *plan.Skip:
@@ -284,6 +286,15 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 			return nil, nil, err
 		}
 		return &expandCountOp{spec: x, input: input, peers: inPeers}, nil, nil
+	case *plan.ProductCount:
+		// The product folds in only over an input that binds no relationship (the
+		// rewrite's guard), so there are no peers to thread and the input compiles in
+		// a fresh pattern scope.
+		input, err := compile(x.Input)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &productCountOp{spec: x, input: input}, nil, nil
 	case *plan.Unwind:
 		var input operator
 		if x.Input != nil {

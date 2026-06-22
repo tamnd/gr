@@ -195,6 +195,77 @@ func TestFactorizeCountGuards(t *testing.T) {
 	}
 }
 
+// findProductCount returns the single ProductCount in a plan, or nil when there is
+// none, so a rewrite test can assert the product operator is present or absent
+// without depending on the printed plan.
+func findProductCount(o Op) *ProductCount {
+	if pc, ok := o.(*ProductCount); ok {
+		return pc
+	}
+	for _, c := range nodeChildren(o) {
+		if pc := findProductCount(c); pc != nil {
+			return pc
+		}
+	}
+	return nil
+}
+
+// TestFactorizeProductFires checks a grouping-free count(*) over two independent
+// expands from a shared anchor with disjoint types folds into a ProductCount, the
+// count of the cross-product without building it. The two legs leave a along KNOWS
+// and ACTED_IN, disjoint types, so the rewrite is sound: it carries both legs and the
+// anchor variable, and leaves no Expand or ExpandCount behind.
+func TestFactorizeProductFires(t *testing.T) {
+	b := bound(t, "MATCH (a:Person)-[:KNOWS]->(b), (a)-[:ACTED_IN]->(c) RETURN count(*)")
+	pc := findProductCount(Plan(b))
+	if pc == nil {
+		t.Fatalf("count(*) over a shared anchor did not factorize to a product:\n%s", String(Plan(b)))
+	}
+	if pc.From != "a" {
+		t.Fatalf("ProductCount From = %q, want a", pc.From)
+	}
+	if len(pc.Legs) != 2 {
+		t.Fatalf("ProductCount has %d legs, want 2", len(pc.Legs))
+	}
+	toks := []engine.Token{pc.Legs[0].Types[0].Token, pc.Legs[1].Types[0].Token}
+	if !(toks[0] == 1 && toks[1] == 2) && !(toks[0] == 2 && toks[1] == 1) {
+		t.Fatalf("ProductCount leg types = %v, want {KNOWS(#1), ACTED_IN(#2)}", toks)
+	}
+	if e := findFirstExpand(Plan(b)); e != nil {
+		t.Fatalf("plan still has an Expand after factorizing the product: %+v", e)
+	}
+	if ec := findExpandCount(Plan(b)); ec != nil {
+		t.Fatalf("plan still has an ExpandCount, want a ProductCount: %+v", ec)
+	}
+}
+
+// TestFactorizeProductGuards pins the shapes the product rewrite must leave as a
+// plain ExpandCount, never folding into a ProductCount: a chained two-hop (the second
+// expand leaves b, not the shared anchor a) is not independent fan-out, two legs of
+// the same type could share an edge so the count is not a clean product, and a
+// pattern that binds a relationship variable on the input could couple a leg through
+// relationship-uniqueness. Each must keep an ExpandCount and grow no ProductCount.
+func TestFactorizeProductGuards(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"chained", "MATCH (a:Person)-[:KNOWS]->(b)-[:ACTED_IN]->(c) RETURN count(*)"},
+		{"same-type", "MATCH (a:Person)-[:KNOWS]->(b), (a)-[:KNOWS]->(c) RETURN count(*)"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b := bound(t, c.src)
+			if pc := findProductCount(Plan(b)); pc != nil {
+				t.Fatalf("%s factorized to a product but should not have:\n%s", c.name, String(Plan(b)))
+			}
+			if ec := findExpandCount(Plan(b)); ec == nil {
+				t.Fatalf("%s lost its ExpandCount:\n%s", c.name, String(Plan(b)))
+			}
+		})
+	}
+}
+
 func TestBuildFriendsOfFriends(t *testing.T) {
 	b := bound(t, "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN c.name AS name")
 	want := `Project c.name AS name

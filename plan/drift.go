@@ -57,6 +57,10 @@ func collectStats(o Op, st Statistics, snap *StatsSnapshot) {
 		recordLabels(x.ToLabels, st, snap)
 	case *ExpandCount:
 		recordTypes(x.Types, st, snap)
+	case *ProductCount:
+		for _, l := range x.Legs {
+			recordTypes(l.Types, st, snap)
+		}
 	case *Intersect:
 		recordTypes(x.Legs[0].Types, st, snap)
 		recordTypes(x.Legs[1].Types, st, snap)

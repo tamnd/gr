@@ -321,6 +321,80 @@ func TestFactorizedCountEmpty(t *testing.T) {
 	}
 }
 
+// productGraph builds a graph where one anchor has two disjoint-typed fan-outs, the
+// shape the product count factorizes. Alice KNOWS Bob and Carol (two edges) and
+// LIKES Dan (one edge); Bob KNOWS Carol but LIKES nobody. So the cross-product
+// (a)-[:KNOWS]->(b), (a)-[:LIKES]->(c) has 2*1 = 2 rows at Alice and zero elsewhere.
+func productGraph(t *testing.T) *engine.MemEngine {
+	t.Helper()
+	e := engine.NewMemEngine()
+	tx, err := e.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk := func(name string) engine.NodeID {
+		id, err := tx.CreateNode([]engine.Token{lblPerson})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx.SetNodeProperty(id, keyName, value.String(name))
+		return id
+	}
+	a, b, c, d := mk("Alice"), mk("Bob"), mk("Carol"), mk("Dan")
+	rel := func(s, dst engine.NodeID, typ engine.Token) {
+		if _, err := tx.CreateRel(s, dst, typ); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rel(a, b, typKnows)
+	rel(a, c, typKnows)
+	rel(b, c, typKnows)
+	rel(a, d, typLikes)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
+// TestFactorizedProductMatchesEnumeration checks the factorized product count over
+// two independent fan-outs from a shared anchor produces the same tally as
+// enumerating the cross-product and counting the rows. The count query factorizes
+// into a ProductCount; the enumeration returns variables so it keeps the naive join
+// path, and the two must agree at 2 (Alice's two KNOWS times her one LIKES).
+func TestFactorizedProductMatchesEnumeration(t *testing.T) {
+	e := productGraph(t)
+	got := countOf(t, e, "MATCH (a:Person)-[:KNOWS]->(b), (a)-[:LIKES]->(c) RETURN count(*)")
+	rows, _ := run(t, e, "MATCH (a:Person)-[:KNOWS]->(b), (a)-[:LIKES]->(c) RETURN a.name AS a, b.name AS b, c.name AS c", nil)
+	if got != int64(len(rows)) {
+		t.Fatalf("factorized product = %d, enumeration = %d", got, len(rows))
+	}
+	if got != 2 {
+		t.Fatalf("product count = %d, want 2", got)
+	}
+}
+
+// TestFactorizedProductEmpty checks a product over a source with no nodes still emits
+// one tally row carrying zero, the empty-group rule. There are no City nodes, so the
+// product's input is empty.
+func TestFactorizedProductEmpty(t *testing.T) {
+	e := productGraph(t)
+	if got := countOf(t, e, "MATCH (a:City)-[:KNOWS]->(b), (a)-[:LIKES]->(c) RETURN count(*)"); got != 0 {
+		t.Fatalf("product over empty source = %d, want 0", got)
+	}
+}
+
+// TestFactorizedProductZeroLeg checks a source whose one leg has degree zero
+// contributes nothing to the product, so an anchor that has KNOWS edges but no LIKES
+// edge adds zero. Bob KNOWS Carol but LIKES nobody, so only Alice contributes.
+func TestFactorizedProductZeroLeg(t *testing.T) {
+	e := productGraph(t)
+	got := countOf(t, e, "MATCH (a:Person)-[:KNOWS]->(b), (a)-[:LIKES]->(c) RETURN count(*)")
+	rows, _ := run(t, e, "MATCH (a:Person)-[:KNOWS]->(b), (a)-[:LIKES]->(c) RETURN a.name AS a", nil)
+	if got != int64(len(rows)) {
+		t.Fatalf("product = %d, enumeration = %d", got, len(rows))
+	}
+}
+
 func TestPropertyConstraint(t *testing.T) {
 	e, _ := graph(t)
 	rows, _ := run(t, e, `MATCH (n:Person {name: "Bob"}) RETURN n.age AS age`, nil)

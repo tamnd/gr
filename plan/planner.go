@@ -342,6 +342,10 @@ func mapChildren(o Op, f func(Op) Op) Op {
 			Input: f(x.Input), From: x.From, Rel: x.Rel,
 			Types: x.Types, Dir: x.Dir, Col: x.Col,
 		}
+	case *ProductCount:
+		return &ProductCount{
+			Input: f(x.Input), From: x.From, Legs: x.Legs, Col: x.Col,
+		}
 	case *Join:
 		return &Join{Left: f(x.Left), Right: f(x.Right), On: x.On}
 	case *Optional:

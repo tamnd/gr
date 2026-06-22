@@ -304,5 +304,15 @@ func (p *Pager) Recovered() bool { return p.recovered }
 // volume; it is a lock-free atomic load, so it never contends the pool lock.
 func (p *Pager) PagesWritten() uint64 { return p.pagesWritten.Load() }
 
+// WALStats returns the write-ahead log's cumulative write counters and current size (doc 20 §5.2), or
+// a zero value on a read-only pager that has no writable WAL. The WAL's own accessor is a lock-free
+// atomic load, so this never takes the pool lock or the engine lock and is safe off the snapshot path.
+func (p *Pager) WALStats() wal.Stats {
+	if p.wal == nil {
+		return wal.Stats{}
+	}
+	return p.wal.Stats()
+}
+
 // PayloadSize returns usable payload bytes per page.
 func (p *Pager) PayloadSize() int { return format.PayloadSize(p.pageSize) }

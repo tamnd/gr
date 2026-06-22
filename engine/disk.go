@@ -22,6 +22,7 @@ import (
 	"github.com/tamnd/gr/store"
 	"github.com/tamnd/gr/value"
 	"github.com/tamnd/gr/vfs"
+	"github.com/tamnd/gr/wal"
 )
 
 // ErrDetachRequired is returned when deleting a node that still has relationships.
@@ -709,6 +710,12 @@ func (e *DiskEngine) PageSize() uint32 { return e.p.PageSize() }
 // engine lock, so the metrics snapshot path calls it freely even while a write transaction holds
 // the engine lock.
 func (e *DiskEngine) BufferPoolStats() pager.PoolStats { return e.p.PoolStats() }
+
+// WALStats returns the write-ahead log's cumulative write counters and current size (doc 20 §5.2), the
+// numbers the WAL metrics expose. It reads the WAL's own lock-free atomics through the pager, never the
+// engine lock, so the metrics snapshot path calls it freely even while a write transaction holds the
+// engine lock.
+func (e *DiskEngine) WALStats() wal.Stats { return e.p.WALStats() }
 
 // Close releases the engine and its pager.
 func (e *DiskEngine) Close() error {

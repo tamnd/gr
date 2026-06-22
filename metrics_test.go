@@ -992,6 +992,48 @@ func TestMetricsUnifiedCacheMemory(t *testing.T) {
 	}
 }
 
+func TestMetricsWalWrites(t *testing.T) {
+	db := openMem(t, "mxwal.gr")
+	defer db.Close()
+
+	// Opening the database commits its initial catalog, so the WAL counters start non-zero; measure
+	// against that baseline rather than zero.
+	base := db.Metrics()
+	baseBytes := base.Counter("gr_wal_bytes_written_total", nil)
+	baseCommit := base.Counter("gr_wal_frames_written_total", Labels{"kind": "commit"})
+	basePage := base.Counter("gr_wal_frames_written_total", Labels{"kind": "page"})
+
+	for i := 0; i < 50; i++ {
+		mustExec(t, db, "CREATE (:Person {note: 'value'})", nil)
+	}
+
+	snap := db.Metrics()
+	if c := snap.Counter("gr_wal_bytes_written_total", nil); c <= baseBytes {
+		t.Fatalf("wal bytes after fifty commits = %d, want > %d", c, baseBytes)
+	}
+	// Each committed transaction writes a commit frame, and the data pages it dirties are page frames.
+	if c := snap.Counter("gr_wal_frames_written_total", Labels{"kind": "commit"}); c <= baseCommit {
+		t.Fatalf("commit frames after fifty commits = %d, want > %d", c, baseCommit)
+	}
+	if c := snap.Counter("gr_wal_frames_written_total", Labels{"kind": "page"}); c <= basePage {
+		t.Fatalf("page frames after fifty commits = %d, want > %d", c, basePage)
+	}
+	// The WAL holds its header on disk between transactions, so the size gauge is non-zero. In the
+	// inline-checkpoint design each commit resets the WAL, so it oscillates back to the header size.
+	if g := snap.Gauge("gr_wal_size_bytes", nil); g <= 0 {
+		t.Fatalf("wal size = %d, want > 0 (at least the header)", g)
+	}
+
+	// More commits advance the cumulative byte counter further.
+	bytes := snap.Counter("gr_wal_bytes_written_total", nil)
+	for i := 0; i < 50; i++ {
+		mustExec(t, db, "CREATE (:Person {note: 'more'})", nil)
+	}
+	if more := db.Metrics().Counter("gr_wal_bytes_written_total", nil); more <= bytes {
+		t.Fatalf("wal bytes after more commits = %d, want > %d", more, bytes)
+	}
+}
+
 func TestMetricsCheckpoint(t *testing.T) {
 	db := openMem(t, "mxcheckpoint.gr")
 	defer db.Close()

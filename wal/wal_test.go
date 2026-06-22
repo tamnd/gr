@@ -33,6 +33,50 @@ func openWAL(t *testing.T, fsys vfs.VFS) (*WAL, vfs.File) {
 	return w, f
 }
 
+func TestWALStats(t *testing.T) {
+	fsys := vfs.NewMem()
+	w, _ := openWAL(t, fsys)
+
+	// A fresh WAL has its header on disk and nothing appended.
+	st := w.Stats()
+	if st.BytesWritten != 0 || st.FramesPage != 0 || st.FramesCommit != 0 {
+		t.Fatalf("fresh stats = %+v, want all-zero counters", st)
+	}
+	if st.SizeBytes != walHeaderSize {
+		t.Fatalf("fresh size = %d, want header size %d", st.SizeBytes, walHeaderSize)
+	}
+
+	// A commit batch of two frames: the last is the commit frame, the first a page frame.
+	if _, err := w.Append([]Frame{
+		{PageID: 1, Image: page(0x11)},
+		{PageID: 0, Image: page(0x00)},
+	}, true, 2); err != nil {
+		t.Fatal(err)
+	}
+	st = w.Stats()
+	if st.FramesPage != 1 || st.FramesCommit != 1 {
+		t.Fatalf("after a two-frame commit, frames = page %d commit %d, want 1 and 1", st.FramesPage, st.FramesCommit)
+	}
+	if want := uint64(2 * w.frameSize()); st.BytesWritten != want {
+		t.Fatalf("bytes written = %d, want %d (two frames)", st.BytesWritten, want)
+	}
+	if want := uint64(walHeaderSize) + uint64(2*w.frameSize()); st.SizeBytes != want {
+		t.Fatalf("size after append = %d, want %d", st.SizeBytes, want)
+	}
+
+	// Reset truncates the WAL back to the header, so the size falls but the cumulative counters hold.
+	if err := w.Reset(123); err != nil {
+		t.Fatal(err)
+	}
+	st = w.Stats()
+	if st.SizeBytes != walHeaderSize {
+		t.Fatalf("size after reset = %d, want header size %d", st.SizeBytes, walHeaderSize)
+	}
+	if st.BytesWritten == 0 || st.FramesCommit == 0 {
+		t.Fatalf("cumulative counters reset to %+v, want them to hold across a reset", st)
+	}
+}
+
 func TestWALAppendAndRecover(t *testing.T) {
 	fsys := vfs.NewMem()
 	w, f := openWAL(t, fsys)

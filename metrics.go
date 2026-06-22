@@ -54,6 +54,7 @@ func (db *DB) Metrics() MetricsSnapshot {
 	db.syncColcacheMetrics()
 	db.syncBufferPoolMetrics()
 	db.syncCacheMemoryMetrics()
+	db.syncCheckpointMetrics()
 	return db.metrics.reg.Snapshot()
 }
 
@@ -174,6 +175,32 @@ func (db *DB) syncCacheMemoryMetrics() {
 	}
 	if m.cacheBudgetUsed != nil {
 		m.cacheBudgetUsed.Set(bufferpool + column)
+	}
+}
+
+// syncCheckpointMetrics mirrors the engine's cumulative segment-rewrite counts into the registry at
+// snapshot time (doc 20 §5.4): it advances gr_checkpoint_segments_rewritten_total{store} by the
+// segments the node and rel folds have rewritten since the last sync. The engine owns the
+// authoritative counts, bumped under its lock at each checkpoint, so the checkpoint path never
+// touches the registry for this; the bridge runs only on a scrape. The delta add keeps the counter
+// monotonic, and checkpointSegMu serializes two concurrent scrapes so neither double-counts. Reading
+// the totals is a lock-free atomic load, never the engine lock, so a long-held write transaction
+// cannot deadlock a snapshot.
+func (db *DB) syncCheckpointMetrics() {
+	if db.eng == nil {
+		return
+	}
+	node, rel := db.eng.CheckpointSegmentsTotal()
+	m := db.metrics
+	m.checkpointSegMu.Lock()
+	defer m.checkpointSegMu.Unlock()
+	if c := m.checkpointSegments["node"]; c != nil && node > m.lastCkptNodeSeg {
+		c.Add(node - m.lastCkptNodeSeg)
+		m.lastCkptNodeSeg = node
+	}
+	if c := m.checkpointSegments["rel"]; c != nil && rel > m.lastCkptRelSeg {
+		c.Add(rel - m.lastCkptRelSeg)
+		m.lastCkptRelSeg = rel
 	}
 }
 
@@ -346,6 +373,12 @@ var metricColcacheResults = []string{"hit", "miss"}
 // present, and they begin incrementing once the automatic checkpoint scheduler lands (doc 05 §6.3).
 var metricCheckpointTriggers = []string{"wal_threshold", "timer", "manual", "close"}
 
+// metricCheckpointStores is the bounded domain of the store label on
+// gr_checkpoint_segments_rewritten_total (doc 20 §5.4): the two segmented column stores a fold
+// rewrites, the node property store and the rel property store. The label separates the two so an
+// operator sees which store dominates the fold's write amplification.
+var metricCheckpointStores = []string{"node", "rel"}
+
 // metricCacheNames is the bounded domain of the cache label on gr_cache_memory_bytes (doc 20
 // §4.5): the caches that account their resident bytes today, the buffer pool of raw pages and the
 // column cache of decoded property blocks. The full §4.5 domain also names the adjacency, plan,
@@ -447,6 +480,16 @@ type queryMetrics struct {
 	checkpointTotal    map[string]*metric.Counter
 	checkpointDuration *metric.Histogram
 	checkpointLast     *metric.Gauge
+
+	// checkpointSegments holds gr_checkpoint_segments_rewritten_total keyed by store (node, rel), the
+	// fold's write amplification (doc 20 §5.4). The engine owns the authoritative cumulative counts,
+	// bumped under its lock at each checkpoint; the sync step mirrors them here delta-style, the same
+	// bridge the cache hit counters use. checkpointSegMu serializes two concurrent scrapes so neither
+	// double-counts, and lastCkptNodeSeg and lastCkptRelSeg hold the last mirrored cumulative values.
+	checkpointSegments map[string]*metric.Counter
+	checkpointSegMu    sync.Mutex
+	lastCkptNodeSeg    uint64
+	lastCkptRelSeg     uint64
 
 	// indexEntryGauges records which index names already have a gr_index_entries computed gauge, so
 	// the sync registers each at most once. The value is unused, only the key (the index name)
@@ -597,6 +640,11 @@ func newQueryMetrics() *queryMetrics {
 		"Wall-clock duration of a checkpoint", "seconds", txDurationBuckets, nil)
 	m.checkpointLast = reg.Gauge("gr_checkpoint_last_timestamp_seconds",
 		"Wall-clock time of the last successful checkpoint", "unix-seconds", nil)
+	m.checkpointSegments = make(map[string]*metric.Counter, len(metricCheckpointStores))
+	for _, store := range metricCheckpointStores {
+		m.checkpointSegments[store] = reg.Counter("gr_checkpoint_segments_rewritten_total",
+			"Column segments rewritten by a fold, by store", "segments", metric.Labels{"store": store})
+	}
 	for _, r := range metricAuthResults {
 		m.authAttempts[r] = reg.Counter("gr_auth_attempts_total",
 			"Authentication attempts, by result", "attempts", metric.Labels{"result": r})

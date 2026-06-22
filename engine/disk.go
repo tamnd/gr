@@ -96,6 +96,15 @@ type DiskEngine struct {
 	// write lock where no reader runs, which the metrics snapshot path must not do itself.
 	freelistPages atomic.Uint64
 
+	// ckptNodeSegmentsTotal and ckptRelSegmentsTotal hold the cumulative count of column segments the
+	// node and rel folds have rewritten across every checkpoint, bumped under the engine lock at the
+	// end of each checkpoint by the new store's directory count, since a fold rewrites the whole
+	// segmented base (doc 20 §5.4). They are the authoritative cumulative counts; the metrics path
+	// mirrors them into gr_checkpoint_segments_rewritten_total{store} delta-style, the same bridge the
+	// cache hit counters use, so reading them is a lock-free atomic load off the snapshot path.
+	ckptNodeSegmentsTotal atomic.Uint64
+	ckptRelSegmentsTotal  atomic.Uint64
+
 	// bc fronts the segmented-base read with decoded segments, so a repeated point
 	// read in a segment does not re-decode it (doc 14 §4). It is an in-memory cache,
 	// never a source of truth: every cached segment carries the checkpoint epoch it
@@ -165,6 +174,14 @@ func (e *DiskEngine) publishFreelistPages() {
 // atomic publishFreelistPages maintains (doc 20 §4.2). It never takes the engine lock, so the
 // metrics snapshot path calls it freely even while a write transaction holds the lock.
 func (e *DiskEngine) FreelistPages() int64 { return int64(e.freelistPages.Load()) }
+
+// CheckpointSegmentsTotal returns the cumulative count of column segments the node and rel folds
+// have rewritten across every checkpoint (doc 20 §5.4), read lock-free from the atomics each
+// checkpoint bumps. The metrics path mirrors these into gr_checkpoint_segments_rewritten_total
+// delta-style, so this never takes the engine lock and is safe off the snapshot path.
+func (e *DiskEngine) CheckpointSegmentsTotal() (node, rel uint64) {
+	return e.ckptNodeSegmentsTotal.Load(), e.ckptRelSegmentsTotal.Load()
+}
 
 // load (re)builds the store handles over the current pager state, creating the
 // stores when fresh and opening them otherwise. It is also used to rebuild state
@@ -524,6 +541,11 @@ func (e *DiskEngine) Checkpoint() error {
 		return err
 	}
 	e.nseg, e.rseg = newNseg, newRseg
+	// A fold rewrites the whole segmented base, so the new store's directory count is the
+	// segments this checkpoint rewrote; add them to the cumulative totals the metrics path
+	// mirrors (doc 20 §5.4). Done under the engine lock the checkpoint already holds.
+	e.ckptNodeSegmentsTotal.Add(uint64(newNseg.DirCount()))
+	e.ckptRelSegmentsTotal.Add(uint64(newRseg.DirCount()))
 	// The new base has a fresh segment layout, so every entry cached against the old
 	// base is now stale; bumping the epoch makes a read at it miss them all (doc 14
 	// §4.7). The folds above ran against the old base at the old epoch, so their

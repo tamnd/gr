@@ -1028,6 +1028,40 @@ func TestMetricsCheckpoint(t *testing.T) {
 	}
 }
 
+func TestMetricsCheckpointSegments(t *testing.T) {
+	db := openMem(t, "mxckptseg.gr")
+	defer db.Close()
+
+	// Before any checkpoint the fold has rewritten nothing.
+	if c := db.Metrics().Counter("gr_checkpoint_segments_rewritten_total", Labels{"store": "node"}); c != 0 {
+		t.Fatalf("node segments before any checkpoint = %d, want 0", c)
+	}
+
+	// Node and rel properties give both folds real columns to rewrite into segments.
+	for i := 0; i < 50; i++ {
+		mustExec(t, db, "CREATE (:Person {note: 'value'})", nil)
+	}
+	mustExec(t, db, "MATCH (a:Person), (b:Person) WITH a, b LIMIT 20 CREATE (a)-[:KNOWS {since: 2020}]->(b)", nil)
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+
+	snap := db.Metrics()
+	node := snap.Counter("gr_checkpoint_segments_rewritten_total", Labels{"store": "node"})
+	if node == 0 {
+		t.Fatalf("node segments after a checkpoint = %d, want > 0", node)
+	}
+	rel := snap.Counter("gr_checkpoint_segments_rewritten_total", Labels{"store": "rel"})
+	if rel == 0 {
+		t.Fatalf("rel segments after a checkpoint = %d, want > 0", rel)
+	}
+
+	// A second checkpoint folds again, so the cumulative counter advances past the first.
+	mustExec(t, db, "MATCH (p:Person) SET p.note = 'changed'", nil)
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+	if again := db.Metrics().Counter("gr_checkpoint_segments_rewritten_total", Labels{"store": "node"}); again <= node {
+		t.Fatalf("node segments after a second checkpoint = %d, want > %d", again, node)
+	}
+}
+
 func TestMetricsConstraintChecks(t *testing.T) {
 	db := openMem(t, "mxcons.gr")
 	defer db.Close()

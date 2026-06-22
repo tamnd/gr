@@ -2,14 +2,23 @@ package main
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,18 +29,56 @@ import (
 	"github.com/tamnd/gr/vfs"
 )
 
+// writeTestCert generates a throwaway self-signed ECDSA certificate and key, writes them
+// to temp files in PEM form, and returns their paths. It gives the TLS tests real material
+// to load without checking a fixture into the tree.
+func writeTestCert(t *testing.T) (certPath, keyPath string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "gr-test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		DNSNames:     []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certPath = filepath.Join(dir, "cert.pem")
+	keyPath = filepath.Join(dir, "key.pem")
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certPath, keyPath
+}
+
 // noBolt is the Bolt-listener stub for the tests that do not enable --bolt. It is never
 // called, since the serve command only reaches the Bolt path when --bolt is set.
-func noBolt(addr string, h bolt.Handler) (io.Closer, error) {
+func noBolt(ln *bolt.Listener) (io.Closer, error) {
 	return io.NopCloser(nil), nil
 }
 
-// captureBolt returns a Bolt-listener stub that records the address and handler it is
-// given and a noop closer, so a test can drive the handler in-process without a port.
-func captureBolt(addr *string, h *bolt.Handler) func(string, bolt.Handler) (io.Closer, error) {
-	return func(a string, handler bolt.Handler) (io.Closer, error) {
-		*addr = a
-		*h = handler
+// captureBolt returns a Bolt-listener stub that records the configured listener and a
+// noop closer, so a test can inspect its address, handler, and TLS posture and drive the
+// handler in-process without a port.
+func captureBolt(ln **bolt.Listener) func(*bolt.Listener) (io.Closer, error) {
+	return func(l *bolt.Listener) (io.Closer, error) {
+		*ln = l
 		return io.NopCloser(nil), nil
 	}
 }
@@ -316,12 +363,12 @@ func TestServeListenError(t *testing.T) {
 // captured handler is driven in-process inside the HTTP listen stub, where the database is
 // still open.
 func TestServeBolt(t *testing.T) {
-	var boltAddr string
-	var h bolt.Handler
+	var ln *bolt.Listener
 	listen := func(addr string, handler http.Handler) error {
-		if h == nil {
+		if ln == nil || ln.Server == nil || ln.Server.Handler == nil {
 			t.Fatal("Bolt handler not captured before HTTP listen")
 		}
+		h := ln.Server.Handler
 		tx, err := h.Begin(map[string]any{}, bolt.Auth{})
 		if err != nil {
 			t.Fatalf("bolt begin: %v", err)
@@ -344,12 +391,15 @@ func TestServeBolt(t *testing.T) {
 		return nil
 	}
 	var out, errw bytes.Buffer
-	code := runServe([]string{"--bolt"}, &out, &errw, listen, captureBolt(&boltAddr, &h))
+	code := runServe([]string{"--bolt"}, &out, &errw, listen, captureBolt(&ln))
 	if code != exitOK {
 		t.Fatalf("code = %d, stderr = %s", code, errw.String())
 	}
-	if boltAddr != defaultBoltAddr {
-		t.Errorf("bolt addr = %q, want %q", boltAddr, defaultBoltAddr)
+	if ln.Addr != defaultBoltAddr {
+		t.Errorf("bolt addr = %q, want %q", ln.Addr, defaultBoltAddr)
+	}
+	if ln.TLSMode != bolt.TLSDisabled {
+		t.Errorf("default TLS mode = %v, want disabled", ln.TLSMode)
 	}
 	if !strings.Contains(errw.String(), "serving Bolt") {
 		t.Errorf("startup banner did not announce Bolt: %s", errw.String())
@@ -358,16 +408,15 @@ func TestServeBolt(t *testing.T) {
 
 // TestServeBoltAddr confirms --bolt-addr overrides the Bolt listen address.
 func TestServeBoltAddr(t *testing.T) {
-	var boltAddr string
-	var h bolt.Handler
+	var ln *bolt.Listener
 	listen := func(addr string, handler http.Handler) error { return nil }
 	var out, errw bytes.Buffer
-	code := runServe([]string{"--bolt", "--bolt-addr", "127.0.0.1:9100"}, &out, &errw, listen, captureBolt(&boltAddr, &h))
+	code := runServe([]string{"--bolt", "--bolt-addr", "127.0.0.1:9100"}, &out, &errw, listen, captureBolt(&ln))
 	if code != exitOK {
 		t.Fatalf("code = %d, stderr = %s", code, errw.String())
 	}
-	if boltAddr != "127.0.0.1:9100" {
-		t.Errorf("bolt addr = %q, want 127.0.0.1:9100", boltAddr)
+	if ln.Addr != "127.0.0.1:9100" {
+		t.Errorf("bolt addr = %q, want 127.0.0.1:9100", ln.Addr)
 	}
 }
 
@@ -375,9 +424,9 @@ func TestServeBoltAddr(t *testing.T) {
 // through the same provider as HTTP: good credentials pass, a wrong password fails, and
 // the none scheme is rejected.
 func TestServeBoltAuth(t *testing.T) {
-	var boltAddr string
-	var h bolt.Handler
+	var ln *bolt.Listener
 	listen := func(addr string, handler http.Handler) error {
+		h := ln.Server.Handler
 		if _, err := h.Authenticate("basic", "alice", "secret"); err != nil {
 			t.Errorf("valid credentials rejected over Bolt: %v", err)
 		}
@@ -390,20 +439,92 @@ func TestServeBoltAuth(t *testing.T) {
 		return nil
 	}
 	var out, errw bytes.Buffer
-	code := runServe([]string{"--user", "alice:secret", "--bolt"}, &out, &errw, listen, captureBolt(&boltAddr, &h))
+	code := runServe([]string{"--user", "alice:secret", "--bolt"}, &out, &errw, listen, captureBolt(&ln))
 	if code != exitOK {
 		t.Fatalf("code = %d, stderr = %s", code, errw.String())
+	}
+}
+
+// TestServeBoltTLS confirms --bolt-tls with a certificate and key configures the listener
+// for the requested posture and loads the certificate with the hardening defaults.
+func TestServeBoltTLS(t *testing.T) {
+	certPath, keyPath := writeTestCert(t)
+	var ln *bolt.Listener
+	listen := func(addr string, handler http.Handler) error { return nil }
+	var out, errw bytes.Buffer
+	args := []string{"--bolt", "--bolt-tls", "required", "--tls-cert", certPath, "--tls-key", keyPath}
+	code := runServe(args, &out, &errw, listen, captureBolt(&ln))
+	if code != exitOK {
+		t.Fatalf("code = %d, stderr = %s", code, errw.String())
+	}
+	if ln.TLSMode != bolt.TLSRequired {
+		t.Errorf("TLS mode = %v, want required", ln.TLSMode)
+	}
+	if ln.TLSConfig == nil {
+		t.Fatal("TLS config not loaded")
+	}
+	if ln.TLSConfig.MinVersion != tls.VersionTLS12 {
+		t.Errorf("min version = %x, want TLS 1.2", ln.TLSConfig.MinVersion)
+	}
+	if len(ln.TLSConfig.Certificates) != 1 {
+		t.Errorf("certificates = %d, want 1", len(ln.TLSConfig.Certificates))
+	}
+	if !strings.Contains(errw.String(), "TLS required") {
+		t.Errorf("banner did not announce TLS posture: %s", errw.String())
+	}
+}
+
+// TestServeBoltTLSOptional confirms the optional posture also loads a certificate, since
+// it serves TLS to clients that offer a ClientHello.
+func TestServeBoltTLSOptional(t *testing.T) {
+	certPath, keyPath := writeTestCert(t)
+	var ln *bolt.Listener
+	listen := func(addr string, handler http.Handler) error { return nil }
+	var out, errw bytes.Buffer
+	args := []string{"--bolt", "--bolt-tls", "optional", "--tls-cert", certPath, "--tls-key", keyPath}
+	code := runServe(args, &out, &errw, listen, captureBolt(&ln))
+	if code != exitOK {
+		t.Fatalf("code = %d, stderr = %s", code, errw.String())
+	}
+	if ln.TLSMode != bolt.TLSOptional {
+		t.Errorf("TLS mode = %v, want optional", ln.TLSMode)
+	}
+	if ln.TLSConfig == nil {
+		t.Fatal("optional posture did not load a certificate")
+	}
+}
+
+// TestServeBoltTLSMissingCert rejects an encrypted posture with no certificate material.
+func TestServeBoltTLSMissingCert(t *testing.T) {
+	listen := func(addr string, handler http.Handler) error { return nil }
+	var out, errw bytes.Buffer
+	code := runServe([]string{"--bolt", "--bolt-tls", "required"}, &out, &errw, listen, captureBolt(new(*bolt.Listener)))
+	if code != exitUsage {
+		t.Errorf("code = %d, want exitUsage", code)
+	}
+	if !strings.Contains(errw.String(), "tls-cert") {
+		t.Errorf("error did not name the missing flag: %s", errw.String())
+	}
+}
+
+// TestServeBoltTLSInvalidMode rejects an unknown posture.
+func TestServeBoltTLSInvalidMode(t *testing.T) {
+	listen := func(addr string, handler http.Handler) error { return nil }
+	var out, errw bytes.Buffer
+	code := runServe([]string{"--bolt", "--bolt-tls", "maybe"}, &out, &errw, listen, captureBolt(new(*bolt.Listener)))
+	if code != exitUsage {
+		t.Errorf("code = %d, want exitUsage", code)
 	}
 }
 
 // TestServeBoltError surfaces a Bolt listener bind failure as the I/O exit code.
 func TestServeBoltError(t *testing.T) {
 	listen := func(addr string, h http.Handler) error { return nil }
-	boltListen := func(addr string, h bolt.Handler) (io.Closer, error) {
+	boltServe := func(ln *bolt.Listener) (io.Closer, error) {
 		return nil, errors.New("bind failed")
 	}
 	var out, errw bytes.Buffer
-	if code := runServe([]string{"--bolt"}, &out, &errw, listen, boltListen); code != exitIO {
+	if code := runServe([]string{"--bolt"}, &out, &errw, listen, boltServe); code != exitIO {
 		t.Errorf("code = %d, want exitIO", code)
 	}
 }
@@ -416,7 +537,8 @@ func TestStartBolt(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	closer, err := startBolt("127.0.0.1:0", db.BoltHandler())
+	ln := &bolt.Listener{Server: &bolt.Server{Handler: db.BoltHandler()}, Addr: "127.0.0.1:0"}
+	closer, err := startBolt(ln)
 	if err != nil {
 		t.Fatalf("start bolt: %v", err)
 	}

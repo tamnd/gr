@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -42,9 +43,11 @@ const defaultBoltAddr = ":7687"
 // database name in the URL path) do not overlap the shell's.
 //
 // listen is injected so a test can substitute a stub for net/http's ListenAndServe;
-// the real entry point passes http.ListenAndServe. boltListen is the matching seam for
-// the Bolt listener; the real entry point passes startBolt, a test passes a stub.
-func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, h http.Handler) error, boltListen func(addr string, h bolt.Handler) (io.Closer, error)) int {
+// the real entry point passes http.ListenAndServe. boltServe is the matching seam for
+// the Bolt listener; serve builds the fully configured listener (address, TLS posture)
+// and boltServe runs it, so a test can inspect the configuration without binding a port.
+// The real entry point passes startBolt, a test passes a stub.
+func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, h http.Handler) error, boltServe func(ln *bolt.Listener) (io.Closer, error)) int {
 	fs := flag.NewFlagSet("gr serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	addr := fs.String("addr", defaultServeAddr, "address to listen on")
@@ -52,6 +55,9 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	readonly := fs.Bool("readonly", false, "open the database read-only")
 	boltEnabled := fs.Bool("bolt", false, "also serve the Bolt protocol so Neo4j drivers can connect")
 	boltAddr := fs.String("bolt-addr", defaultBoltAddr, "address the Bolt listener binds when --bolt is set")
+	boltTLS := fs.String("bolt-tls", "disabled", "Bolt transport security: disabled (plaintext), optional (sniff TLS or plaintext), or required (TLS only); optional and required need --tls-cert and --tls-key")
+	tlsCert := fs.String("tls-cert", "", "path to the PEM certificate chain for TLS listeners")
+	tlsKey := fs.String("tls-key", "", "path to the PEM private key for TLS listeners")
 	var users userList
 	fs.Var(&users, "user", "name:password[:roles] for HTTP auth (repeatable); roles is a comma list of reader/editor/publisher/admin, default admin; none means auth is off")
 	authStore := fs.Bool("auth-store", false, "authenticate against the database's own credential store (the users created with CreateUser), not an in-memory --user list")
@@ -104,14 +110,25 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	// the same provider as HTTP, so a deployment configures it once (doc 18 §10.4). The
 	// listener runs in the background; closing it on exit drains its connections.
 	if *boltEnabled {
+		mode, tlsConf, err := boltTLSPosture(*boltTLS, *tlsCert, *tlsKey)
+		if err != nil {
+			fmt.Fprintln(stderr, "gr:", err)
+			return exitUsage
+		}
 		bh := db.BoltHandler(boltAuthOptions(auth)...)
-		closer, err := boltListen(*boltAddr, bh)
+		ln := &bolt.Listener{
+			Server:    &bolt.Server{Handler: bh},
+			Addr:      *boltAddr,
+			TLSMode:   mode,
+			TLSConfig: tlsConf,
+		}
+		closer, err := boltServe(ln)
 		if err != nil {
 			fmt.Fprintln(stderr, "gr:", err)
 			return exitIO
 		}
 		defer func() { _ = closer.Close() }()
-		fmt.Fprintf(stderr, "gr serving Bolt on %s\n", *boltAddr)
+		fmt.Fprintf(stderr, "gr serving Bolt on %s (TLS %s)\n", *boltAddr, *boltTLS)
 	}
 
 	// Reap transactions whose client vanished, so a dead HTTP client cannot pin the
@@ -300,17 +317,70 @@ func boltAuthFunc(auth httpd.AuthProvider) func(scheme, principal, credentials s
 	}
 }
 
-// startBolt binds the Bolt listen address and serves the protocol in the background,
-// returning the listener so the caller can close it on shutdown. It is the real
-// boltListen the serve command injects; a test substitutes a stub.
-func startBolt(addr string, h bolt.Handler) (io.Closer, error) {
+// startBolt binds the configured listener's address and serves the protocol in the
+// background, returning a closer so the caller can drain it on shutdown. Binding here
+// rather than inside Serve surfaces an address-in-use error synchronously, so serve can
+// report it and exit instead of failing silently on a background goroutine. It is the
+// real boltServe the serve command injects; a test substitutes a stub.
+func startBolt(ln *bolt.Listener) (io.Closer, error) {
+	addr := ln.Addr
+	if addr == "" {
+		addr = defaultBoltAddr
+	}
 	netLn, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	ln := &bolt.Listener{Server: &bolt.Server{Handler: h}}
 	go func() { _ = ln.Serve(netLn) }()
 	return boltCloser{ln}, nil
+}
+
+// boltTLSPosture turns the --bolt-tls flag into a listener TLS mode and, for the encrypted
+// postures, the loaded server configuration (doc 18 §11.1). The disabled posture serves
+// plaintext and ignores any certificate material; optional and required both need a
+// certificate and key, since optional still serves TLS when a client offers a ClientHello.
+func boltTLSPosture(mode, certPath, keyPath string) (bolt.TLSMode, *tls.Config, error) {
+	switch mode {
+	case "disabled", "":
+		return bolt.TLSDisabled, nil, nil
+	case "optional", "required":
+		conf, err := loadServerTLS(certPath, keyPath)
+		if err != nil {
+			return bolt.TLSDisabled, nil, err
+		}
+		if mode == "optional" {
+			return bolt.TLSOptional, conf, nil
+		}
+		return bolt.TLSRequired, conf, nil
+	default:
+		return bolt.TLSDisabled, nil, fmt.Errorf("invalid --bolt-tls %q, want disabled, optional, or required", mode)
+	}
+}
+
+// loadServerTLS loads the certificate chain and private key and returns a server
+// configuration with the hardening defaults of doc 18 §11.3: TLS 1.2 minimum with 1.3
+// preferred, and AEAD cipher suites only (no CBC, RC4, or export ciphers). The cipher
+// list applies to TLS 1.2; TLS 1.3 negotiates its own AEAD suites regardless.
+func loadServerTLS(certPath, keyPath string) (*tls.Config, error) {
+	if certPath == "" || keyPath == "" {
+		return nil, errors.New("TLS needs both --tls-cert and --tls-key")
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load TLS certificate: %w", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		},
+	}, nil
 }
 
 // boltCloser shuts a Bolt listener down with a short drain deadline when the serve

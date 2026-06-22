@@ -163,15 +163,22 @@ func (o *shortestPathOp) searchAll(row eval.Row, src, dst engine.NodeID, forbidd
 
 // searchBidi runs a bidirectional BFS for a single shortest path. It grows a
 // forward frontier from the source and a backward frontier from the target (the
-// backward search walks the reverse direction), expanding whichever side has the
-// smaller explored depth so the two frontiers stay balanced and meet near the
-// middle. A node settled on both sides is a meeting point; the shortest distance
-// is the smallest forward-plus-backward depth over all meeting points.
+// backward search walks the reverse direction), expanding whichever side is
+// cheaper to expand next, measured by the total degree of its frontier nodes, so
+// the search grows the smaller frontier and meets near the middle. A node settled
+// on both sides is a meeting point; the shortest distance is the smallest
+// forward-plus-backward depth over all meeting points.
 //
-// Balanced-by-depth expansion is what makes the stop rule sound: a shortest path
-// of length L has a midpoint reachable at forward depth floor(L/2) and backward
-// depth ceil(L/2), so once both sides reach those depths the meeting is found,
-// and no unfound meeting can have a smaller combined depth than the current sum.
+// The stop rule fdepth+bdepth >= best is sound for any alternation, not only a
+// balanced one. Each side completes whole levels, so after fdepth forward levels
+// and bdepth backward levels every node within fdepth of the source and within
+// bdepth of the target has its exact distance. A shortest path of length L has a
+// node at forward distance k for every k in 0..L, and the node at k=fdepth then
+// sits at backward distance L-fdepth; once fdepth+bdepth >= L that node is settled
+// on both sides, so the meeting on the optimal path is found and best <= L. Thus
+// when fdepth+bdepth reaches best no shorter path can remain unfound, whatever
+// order the two sides were expanded in. Expanding the cheaper side just minimizes
+// the work to reach that point; it does not change which paths are found.
 //
 // The result is one shortest path. Any walk whose length equals the shortest
 // distance is necessarily simple (a repeated node would let it be shortened below
@@ -206,8 +213,22 @@ func (o *shortestPathOp) searchBidi(row eval.Row, src, dst engine.NodeID, forbid
 		if o.max >= 0 && fdepth+bdepth >= o.max {
 			break // a longer path would exceed the hop bound
 		}
-		// Expand the shallower, non-empty side to keep the frontiers balanced.
-		forward := len(ff) > 0 && (len(bf) == 0 || fdepth <= bdepth)
+		// Expand the cheaper, non-empty side: the one whose frontier has the smaller
+		// total degree, so the search grows the smaller of the two frontiers. The
+		// engine's degree is O(1) per node, so scoring both frontiers is far cheaper
+		// than the expand it steers. With one side empty, expand the other.
+		forward := len(ff) > 0
+		if forward && len(bf) > 0 {
+			fc, err := o.frontierCost(ff, dir)
+			if err != nil {
+				return err
+			}
+			bc, err := o.frontierCost(bf, rev)
+			if err != nil {
+				return err
+			}
+			forward = fc <= bc
+		}
 		if forward {
 			var nf []engine.NodeID
 			for _, n := range ff {
@@ -290,6 +311,24 @@ func (o *shortestPathOp) searchBidi(row eval.Row, src, dst engine.NodeID, forbid
 	}
 	o.emitForward(row, nodes, rels)
 	return nil
+}
+
+// frontierCost sums the degree of a frontier's nodes along a direction, the
+// number of edges expanding that frontier one level would traverse. It steers the
+// bidirectional search toward the cheaper side. The relationship token is the
+// resolved single type or the wildcard for a multi-type or untyped pattern, so the
+// sum is an upper bound when an allow-set filters the expand, which is fine for a
+// heuristic that only has to order two sides.
+func (o *shortestPathOp) frontierCost(front []engine.NodeID, dir engine.Direction) (int64, error) {
+	var sum int64
+	for _, n := range front {
+		d, err := o.ctx.Tx.Degree(n, o.relTok, dir)
+		if err != nil {
+			return 0, err
+		}
+		sum += d
+	}
+	return sum, nil
 }
 
 // reverseDir flips an expand direction for the backward half of a bidirectional

@@ -339,6 +339,13 @@ var metricBufferpoolResults = []string{"hit", "miss"}
 // database that has only ever hit still exposes the miss series at zero.
 var metricColcacheResults = []string{"hit", "miss"}
 
+// metricCheckpointTriggers is the bounded domain of the trigger label on gr_checkpoint_total (doc
+// 20 §5.4): what drove a checkpoint. manual is the PRAGMA wal_checkpoint a caller runs by hand, the
+// only trigger wired today; wal_threshold (the WAL grew past its limit), timer (the periodic
+// scheduler), and close (a checkpoint on a clean shutdown) are pre-registered so the series are
+// present, and they begin incrementing once the automatic checkpoint scheduler lands (doc 05 §6.3).
+var metricCheckpointTriggers = []string{"wal_threshold", "timer", "manual", "close"}
+
 // metricCacheNames is the bounded domain of the cache label on gr_cache_memory_bytes (doc 20
 // §4.5): the caches that account their resident bytes today, the buffer pool of raw pages and the
 // column cache of decoded property blocks. The full §4.5 domain also names the adjacency, plan,
@@ -430,6 +437,16 @@ type queryMetrics struct {
 	// total budget gauge, gr_cache_budget_bytes, waits on the cache-budget config (doc 14 §11.2).
 	cacheMemory     map[string]*metric.Gauge
 	cacheBudgetUsed *metric.Gauge
+
+	// checkpointTotal holds gr_checkpoint_total keyed by trigger, checkpointDuration the
+	// gr_checkpoint_duration_seconds histogram, and checkpointLast the
+	// gr_checkpoint_last_timestamp_seconds gauge (doc 20 §5.4). The checkpoint runs under the engine
+	// write lock, so these are recorded directly on the checkpoint path, not mirrored at snapshot
+	// time. The per-checkpoint work counters (pages written, delta edges folded, segments rewritten)
+	// wait on the fold returning those counts.
+	checkpointTotal    map[string]*metric.Counter
+	checkpointDuration *metric.Histogram
+	checkpointLast     *metric.Gauge
 
 	// indexEntryGauges records which index names already have a gr_index_entries computed gauge, so
 	// the sync registers each at most once. The value is unused, only the key (the index name)
@@ -571,6 +588,15 @@ func newQueryMetrics() *queryMetrics {
 	}
 	m.cacheBudgetUsed = reg.Gauge("gr_cache_budget_used_bytes",
 		"Sum of all caches' resident memory, against the cache budget", "bytes", nil)
+	m.checkpointTotal = make(map[string]*metric.Counter, len(metricCheckpointTriggers))
+	for _, trigger := range metricCheckpointTriggers {
+		m.checkpointTotal[trigger] = reg.Counter("gr_checkpoint_total",
+			"Checkpoints run, by trigger", "checkpoints", metric.Labels{"trigger": trigger})
+	}
+	m.checkpointDuration = reg.Histogram("gr_checkpoint_duration_seconds",
+		"Wall-clock duration of a checkpoint", "seconds", txDurationBuckets, nil)
+	m.checkpointLast = reg.Gauge("gr_checkpoint_last_timestamp_seconds",
+		"Wall-clock time of the last successful checkpoint", "unix-seconds", nil)
 	for _, r := range metricAuthResults {
 		m.authAttempts[r] = reg.Counter("gr_auth_attempts_total",
 			"Authentication attempts, by result", "attempts", metric.Labels{"result": r})
@@ -739,6 +765,24 @@ func (m *queryMetrics) recordQueued(wait time.Duration) {
 	}
 	if m.queueWait != nil {
 		m.queueWait.Observe(wait.Seconds())
+	}
+}
+
+// recordCheckpoint records one finished checkpoint (doc 20 §5.4): it counts it under its trigger,
+// observes its wall-clock duration, and stamps the last-checkpoint timestamp. atUnix is the
+// completion time in unix seconds, so the staleness of gr_checkpoint_last_timestamp_seconds is how
+// long since a checkpoint last finished, the signal that checkpoint has stalled (§17.4). The
+// checkpoint runs under the engine write lock, so this is called once on the checkpoint path with no
+// extra synchronization.
+func (m *queryMetrics) recordCheckpoint(trigger string, d time.Duration, atUnix int64) {
+	if c := m.checkpointTotal[trigger]; c != nil {
+		c.Inc()
+	}
+	if m.checkpointDuration != nil {
+		m.checkpointDuration.Observe(d.Seconds())
+	}
+	if m.checkpointLast != nil {
+		m.checkpointLast.Set(atUnix)
 	}
 }
 

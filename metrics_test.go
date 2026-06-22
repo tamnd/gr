@@ -1127,6 +1127,37 @@ func TestMetricsMvccGC(t *testing.T) {
 	}
 }
 
+func TestMetricsGCDuration(t *testing.T) {
+	db := openMem(t, "mxgcdur.gr")
+	defer db.Close()
+
+	// No GC pass has run, so the duration histogram has observed nothing.
+	if h := db.Metrics().Histogram("gr_mvcc_gc_duration_seconds", nil); h.Count != 0 {
+		t.Fatalf("gc duration observations before any checkpoint = %d, want 0", h.Count)
+	}
+
+	mustExec(t, db, "CREATE (:Counter {n: 0})", nil)
+	for i := 0; i < 15; i++ {
+		mustExec(t, db, "MATCH (c:Counter) SET c.n = c.n + 1", nil)
+	}
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+
+	// The checkpoint ran one GC pass, so the next scrape drains exactly one buffered duration.
+	if h := db.Metrics().Histogram("gr_mvcc_gc_duration_seconds", nil); h.Count != 1 {
+		t.Fatalf("gc duration observations after one checkpoint = %d, want 1", h.Count)
+	}
+	// A second scrape with no further GC must not re-observe the drained duration.
+	if h := db.Metrics().Histogram("gr_mvcc_gc_duration_seconds", nil); h.Count != 1 {
+		t.Fatalf("gc duration observations on a second scrape = %d, want 1 (no re-observe)", h.Count)
+	}
+
+	// A second checkpoint runs GC again, so the histogram observes a second pass.
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+	if h := db.Metrics().Histogram("gr_mvcc_gc_duration_seconds", nil); h.Count != 2 {
+		t.Fatalf("gc duration observations after a second checkpoint = %d, want 2", h.Count)
+	}
+}
+
 func TestMetricsWatermarkLag(t *testing.T) {
 	db := openMem(t, "mxlag.gr")
 	defer db.Close()

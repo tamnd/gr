@@ -92,13 +92,18 @@ type joinOp struct {
 	table map[string][]eval.Row
 	built bool
 
+	// grace is non-nil once the build side has grown past the memory budget and the
+	// join has spilled its partitions to disk (spilljoin.go). When it is set, next
+	// pulls from it instead of probing the in-memory table.
+	grace *graceJoin
+
 	cur     eval.Row
 	matches []eval.Row
 	mpos    int
 }
 
 func (o *joinOp) open(ctx *Ctx) error {
-	o.ctx, o.table, o.built = ctx, nil, false
+	o.ctx, o.table, o.built, o.grace = ctx, nil, false, nil
 	o.cur, o.matches, o.mpos = nil, nil, 0
 	if err := o.right.open(ctx); err != nil {
 		return err
@@ -106,8 +111,16 @@ func (o *joinOp) open(ctx *Ctx) error {
 	return o.left.open(ctx)
 }
 
+// build reads the whole build (right) side. While the budget allows it the rows go
+// into the in-memory hash table, the fast path. If the table grows past the budget
+// (and spilling is configured and the join has a key to partition on), the join
+// switches to a grace hash join: it moves the buffered rows and the rest of the
+// build side into partition temp files, then partitions the entire probe (left)
+// side too, leaving next to iterate the partitions.
 func (o *joinOp) build() error {
 	o.table = map[string][]eval.Row{}
+	var bytes int64
+	canSpill := o.ctx.spillEnabled() && len(o.on) > 0
 	for {
 		row, ok, err := o.right.next()
 		if err != nil {
@@ -116,10 +129,57 @@ func (o *joinOp) build() error {
 		if !ok {
 			break
 		}
+		if o.grace == nil && canSpill && bytes > o.ctx.MemBudget {
+			if err := o.spill(); err != nil {
+				return err
+			}
+		}
+		if o.grace != nil {
+			if err := o.grace.partitionRight(row); err != nil {
+				return err
+			}
+			continue
+		}
 		k := rowKey(row, o.on)
 		o.table[k] = append(o.table[k], row)
+		bytes += rowSize(row)
+	}
+	if o.grace != nil {
+		for {
+			left, ok, err := o.left.next()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				break
+			}
+			if err := o.grace.partitionLeft(left); err != nil {
+				return err
+			}
+		}
+		o.grace.start()
 	}
 	o.built = true
+	return nil
+}
+
+// spill creates the grace join and moves the rows buffered so far into its
+// partition files, after which build routes the remaining build-side rows there too.
+func (o *joinOp) spill() error {
+	g, err := newGraceJoin(o.ctx, o.on)
+	if err != nil {
+		return err
+	}
+	for _, rows := range o.table {
+		for _, r := range rows {
+			if err := g.partitionRight(r); err != nil {
+				g.cleanup()
+				return err
+			}
+		}
+	}
+	o.table = nil
+	o.grace = g
 	return nil
 }
 
@@ -128,6 +188,9 @@ func (o *joinOp) next() (eval.Row, bool, error) {
 		if err := o.build(); err != nil {
 			return nil, false, err
 		}
+	}
+	if o.grace != nil {
+		return o.grace.next()
 	}
 	for {
 		for o.mpos < len(o.matches) {
@@ -146,6 +209,9 @@ func (o *joinOp) next() (eval.Row, bool, error) {
 }
 
 func (o *joinOp) close() error {
+	if o.grace != nil {
+		o.grace.cleanup()
+	}
 	err := o.left.close()
 	if rerr := o.right.close(); err == nil {
 		err = rerr

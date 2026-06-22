@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"errors"
+	"sync"
 	"testing"
 
 	"github.com/tamnd/gr/catalog"
@@ -8,6 +10,13 @@ import (
 	"github.com/tamnd/gr/value"
 	"github.com/tamnd/gr/vfs"
 	"github.com/tamnd/gr/wal"
+)
+
+// Sentinels for the concurrent-expand test (a callback cannot call t.Fatal from a
+// worker goroutine, so it returns one of these and the main goroutine reports it).
+var (
+	errUnexpectedNeighbor = errors.New("expand returned a neighbor not in the graph")
+	errWrongDegree        = errors.New("expand returned the wrong neighbor count")
 )
 
 func openDisk(t *testing.T, fsys vfs.VFS, path string) *DiskEngine {
@@ -143,6 +152,80 @@ func TestDiskAbort(t *testing.T) {
 	wx.Commit()
 	if c != b {
 		t.Fatalf("post-abort allocation = %d, want reused %d", c, b)
+	}
+}
+
+// TestDiskConcurrentExpand drives the read stack the way morsel-parallel
+// execution will: many goroutines expanding nodes at once against one read
+// transaction (one snapshot). This exercises the whole concurrent read path,
+// the engine's shared read lock, the buffer pool's pin and pool map, and the
+// adjacency base cache that openBase fills lazily on first expand of a slot.
+// Before those caches were guarded a concurrent expand of two cold slots was a
+// fatal concurrent map write; here every goroutine must read the correct
+// neighbor and the race detector must stay clean.
+func TestDiskConcurrentExpand(t *testing.T) {
+	fsys := vfs.NewMem()
+	e := openDisk(t, fsys, "concurrent.gr")
+	defer e.Close()
+
+	knows, _ := e.Intern(catalog.KindRelType, "KNOWS")
+	person, _ := e.Intern(catalog.KindLabel, "Person")
+
+	// A star: one hub points at many spokes, so every expand of the hub returns
+	// the same large run and the readers contend on the same cached base.
+	const spokes = 64
+	tx, _ := e.Begin(true)
+	hub, _ := tx.CreateNode([]Token{person})
+	want := map[NodeID]bool{}
+	for i := 0; i < spokes; i++ {
+		s, _ := tx.CreateNode([]Token{person})
+		if _, err := tx.CreateRel(hub, s, knows); err != nil {
+			t.Fatal(err)
+		}
+		want[s] = true
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	rx, _ := e.Begin(false)
+	defer rx.Abort()
+
+	const workers = 16
+	const iters = 200
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				var got int
+				err := rx.Expand(hub, knows, Outgoing, func(n Neighbor) error {
+					if !want[n.Node] {
+						return errUnexpectedNeighbor
+					}
+					got++
+					return nil
+				})
+				if err != nil {
+					errs <- err
+					return
+				}
+				if got != spokes {
+					errs <- errWrongDegree
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
 }
 

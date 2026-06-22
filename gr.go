@@ -236,6 +236,13 @@ func Open(path string, opt Options) (*DB, error) {
 	// reclaim (doc 20 §4.2).
 	db.metrics.reg.ComputedGauge("gr_freelist_pages",
 		"Pages on the free list, reusable space", "pages", nil, func() int64 { return db.eng.FreelistPages() })
+	// The version-store size is a computed gauge reading the overlay's retained pre-image count (doc
+	// 20 §5.1). It reads the overlay's own lock, never the engine lock, so the snapshot stays off the
+	// write lock; a value that climbs under a read-heavy-plus-write load is the long-reader pinning
+	// history GC cannot reclaim (§16.4).
+	db.metrics.reg.ComputedGauge("gr_mvcc_versions_resident",
+		"Element versions held beyond the current committed version, the version-store size", "versions", nil,
+		func() int64 { return db.eng.VersionsResident() })
 	// The open event reports the file's real geometry and whether this open recovered a
 	// committed WAL prefix after a crash (doc 20 §11.3). StorageInfo reads the header the
 	// engine just mounted, so the format version and page size are the file's own.

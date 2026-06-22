@@ -183,6 +183,13 @@ func (e *DiskEngine) CheckpointSegmentsTotal() (node, rel uint64) {
 	return e.ckptNodeSegmentsTotal.Load(), e.ckptRelSegmentsTotal.Load()
 }
 
+// VersionsResident returns the number of element versions the MVCC overlay still holds beyond the
+// current committed version (doc 20 §5.1), for the gr_mvcc_versions_resident gauge. It reads the
+// overlay's own lock, never the engine lock, so the metrics snapshot path calls it freely even while
+// a write transaction holds the engine lock; the write path takes the engine lock then the overlay
+// lock, so there is no inversion.
+func (e *DiskEngine) VersionsResident() int64 { return int64(e.ov.Len()) }
+
 // load (re)builds the store handles over the current pager state, creating the
 // stores when fresh and opening them otherwise. It is also used to rebuild state
 // after a rollback. It does not touch the oracle or overlay, which outlive a

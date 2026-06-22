@@ -38,6 +38,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return runDumpCmd(args[1:], stdout, stderr)
 		case "load":
 			return runLoadCmd(args[1:], stdin, stdout, stderr)
+		case "export":
+			return runExportCmd(args[1:], stdout, stderr)
 		case "info":
 			return runInfoCmd(args[1:], stdout, stderr)
 		case "backup":
@@ -197,6 +199,7 @@ Usage:
   gr serve [flags] [database]
   gr dump  [flags] database
   gr load  [flags] database
+  gr export database --nodes|--rels|--query ... --to file
   gr info  database
   gr backup source dest
   gr restore dest source

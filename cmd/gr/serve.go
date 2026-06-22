@@ -60,6 +60,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	tlsCert := fs.String("tls-cert", "", "path to the PEM certificate chain for TLS listeners")
 	tlsKey := fs.String("tls-key", "", "path to the PEM private key for TLS listeners")
 	maxInFlight := fs.Int("max-in-flight", 0, "bound on queries executing at once across all connections; 0 means unlimited")
+	queryMaxTime := fs.Duration("query-max-time", 0, "server-wide wall-clock cap on a single query; a query that runs longer is cancelled and reported as timed out; 0 means no cap")
 	var users userList
 	fs.Var(&users, "user", "name:password[:roles] for HTTP auth (repeatable); roles is a comma list of reader/editor/publisher/admin, default admin; none means auth is off")
 	authStore := fs.Bool("auth-store", false, "authenticate against the database's own credential store (the users created with CreateUser), not an in-memory --user list")
@@ -109,7 +110,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	// across the whole process rather than per surface (doc 18 §8.8). A zero limit
 	// returns a nil gate, which admits every query.
 	admission := gr.NewAdmission(*maxInFlight, 0)
-	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL, Impersonation: *impersonation, Admission: admission})
+	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL, Impersonation: *impersonation, Admission: admission, QueryMaxTime: *queryMaxTime})
 	defer srv.Close()
 	fmt.Fprintf(stderr, "gr serving %s on %s (database %q, TLS %s)\n", describeDB(path), *addr, *name, *httpTLS)
 	if auth == nil {
@@ -126,7 +127,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 			fmt.Fprintln(stderr, "gr:", err)
 			return exitUsage
 		}
-		bh := db.BoltHandler(append(boltAuthOptions(auth), gr.WithBoltAdmission(admission))...)
+		bh := db.BoltHandler(append(boltAuthOptions(auth), gr.WithBoltAdmission(admission), gr.WithBoltQueryMaxTime(*queryMaxTime))...)
 		ln := &bolt.Listener{
 			Server:    &bolt.Server{Handler: bh},
 			Addr:      *boltAddr,

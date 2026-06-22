@@ -29,6 +29,9 @@ type server struct {
 	// admission is the shared in-flight-query gate (doc 18 §8.8); nil leaves queries
 	// ungated.
 	admission *gr.Admission
+	// queryMaxTime is the server-wide wall-clock cap on a single query (doc 18 §8.6);
+	// zero leaves queries uncapped except for any per-request maxExecutionTime.
+	queryMaxTime time.Duration
 	// impersonation enables the imp_user/impersonatedUser request field (doc 18 §10.5).
 	// It is off by default, so a deployment opts into impersonation explicitly.
 	impersonation bool
@@ -59,6 +62,12 @@ type Options struct {
 	// when the same gate is also given to the Bolt handler. Nil leaves the HTTP path
 	// ungated.
 	Admission *gr.Admission
+	// QueryMaxTime is a server-wide wall-clock cap on a single query (doc 18 §8.6). When
+	// set, a query runs under the smaller of this cap and any per-request maxExecutionTime,
+	// and a query that runs longer is cancelled and reported as a timed out transaction.
+	// Pass the same value to the Bolt handler so both surfaces enforce one cap. Zero leaves
+	// queries uncapped except for a per-request maxExecutionTime.
+	QueryMaxTime time.Duration
 	// now overrides the clock for tests; nil uses time.Now.
 	now func() time.Time
 }
@@ -89,7 +98,7 @@ func New(db *gr.DB, opts Options) *Server {
 	if clock == nil {
 		clock = time.Now
 	}
-	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics(), admission: opts.Admission, impersonation: opts.Impersonation}
+	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics(), admission: opts.Admission, queryMaxTime: opts.QueryMaxTime, impersonation: opts.Impersonation}
 	if opts.Auth != nil {
 		ttl := opts.TokenCacheTTL
 		if ttl == 0 {

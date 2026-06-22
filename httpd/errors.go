@@ -1,6 +1,7 @@
 package httpd
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -49,6 +50,13 @@ func mapError(err error) (int, apiError) {
 		return http.StatusServiceUnavailable, apiError{
 			Code:    "Neo.DatabaseError.General.UnknownError",
 			Message: err.Error(),
+		}
+	case errors.Is(err, context.DeadlineExceeded):
+		// The query ran past its deadline (the per-request maxExecutionTime or the
+		// server-wide cap, doc 18 §8.6). A timed out transaction is a client error.
+		return http.StatusGatewayTimeout, apiError{
+			Code:    "Neo.ClientError.Transaction.TransactionTimedOut",
+			Message: "query exceeded the time limit",
 		}
 	}
 	msg := strings.ToLower(err.Error())

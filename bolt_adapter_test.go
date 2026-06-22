@@ -427,3 +427,47 @@ func TestBoltAdapterAdmission(t *testing.T) {
 	cur2.Close()
 	tx2.Commit()
 }
+
+// TestBoltAdapterQueryMaxTime confirms the wall-clock cap times a query out on the Bolt
+// path. A sub-nanosecond cap means the deadline has already passed when the engine checks
+// its context, so Run reports a timed out transaction as a Bolt status error.
+func TestBoltAdapterQueryMaxTime(t *testing.T) {
+	db := boltDB(t)
+	h := db.BoltHandler(WithBoltQueryMaxTime(time.Nanosecond))
+	tx, err := h.Begin(map[string]any{}, bolt.Auth{})
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	_, err = tx.Run("RETURN 1 AS n", nil)
+	var se *bolt.StatusError
+	if !errors.As(err, &se) {
+		t.Fatalf("capped run err = %v, want StatusError", err)
+	}
+	if se.Code != "Neo.ClientError.Transaction.TransactionTimedOut" {
+		t.Errorf("capped run code = %q, want TransactionTimedOut", se.Code)
+	}
+}
+
+// TestBoltAdapterQueryMaxTimeAdmits confirms a generous cap does not interfere with a
+// normal query, and that the cursor closes cleanly with the cap's cancel wired in.
+func TestBoltAdapterQueryMaxTimeAdmits(t *testing.T) {
+	db := boltDB(t)
+	h := db.BoltHandler(WithBoltQueryMaxTime(time.Minute))
+	tx, err := h.Begin(map[string]any{}, bolt.Auth{})
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	cur, err := tx.Run("RETURN 1 AS n", nil)
+	if err != nil {
+		t.Fatalf("run under generous cap: %v", err)
+	}
+	if _, ok, err := cur.Next(); err != nil || !ok {
+		t.Fatalf("next = (%v, %v), want a row", ok, err)
+	}
+	if err := cur.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}

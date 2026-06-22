@@ -421,10 +421,18 @@ func (s *server) checkAcquire(w http.ResponseWriter, code int) bool {
 	return false
 }
 
-// withTimeout wraps a context in the request's maxExecutionTime when one is set.
+// withTimeout wraps a context in the effective query deadline: the request's
+// maxExecutionTime, the server-wide cap (doc 18 §8.6), or the smaller of the two when both
+// are set. A query that runs past the deadline is cancelled, and the engine's
+// context-deadline error maps to a timed out transaction. With neither set the context is
+// only cancellable, so it ends when the request does.
 func (s *server) withTimeout(parent context.Context, ms int) (context.Context, context.CancelFunc) {
-	if ms > 0 {
-		return context.WithTimeout(parent, time.Duration(ms)*time.Millisecond)
+	d := time.Duration(ms) * time.Millisecond
+	if s.queryMaxTime > 0 && (d <= 0 || s.queryMaxTime < d) {
+		d = s.queryMaxTime
+	}
+	if d > 0 {
+		return context.WithTimeout(parent, d)
 	}
 	return context.WithCancel(parent)
 }

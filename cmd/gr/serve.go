@@ -42,6 +42,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	readonly := fs.Bool("readonly", false, "open the database read-only")
 	var users userList
 	fs.Var(&users, "user", "name:password[:roles] for HTTP auth (repeatable); roles is a comma list of reader/editor/publisher/admin, default admin; none means auth is off")
+	authStore := fs.Bool("auth-store", false, "authenticate against the database's own credential store (the users created with CreateUser), not an in-memory --user list")
 	var jwt jwtOptions
 	fs.StringVar(&jwt.hmacSecret, "jwt-hmac-secret", "", "HS256 shared secret for bearer-token (JWT) auth; selects the JWT provider")
 	fs.StringVar(&jwt.pubKeyPath, "jwt-pubkey", "", "path to a PEM RSA or ECDSA public key for RS256/ES256 bearer-token auth")
@@ -69,7 +70,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	}
 	defer func() { _ = db.Close() }()
 
-	auth, err := buildAuth(users, jwt)
+	auth, err := buildAuth(db, users, jwt, *authStore)
 	if err != nil {
 		fmt.Fprintln(stderr, "gr:", err)
 		return exitUsage
@@ -78,7 +79,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	defer srv.Close()
 	fmt.Fprintf(stderr, "gr serving %s on %s (database %q)\n", describeDB(path), *addr, *name)
 	if auth == nil {
-		fmt.Fprintln(stderr, "gr: WARNING authentication is off, every request is anonymous; pass --user to require auth")
+		fmt.Fprintln(stderr, "gr: WARNING authentication is off, every request is anonymous; pass --user or --auth-store to require auth")
 	}
 
 	// Reap transactions whose client vanished, so a dead HTTP client cannot pin the
@@ -141,15 +142,28 @@ func (o jwtOptions) set() bool {
 }
 
 // buildAuth turns the auth flags into a credential provider, or returns nil when none were
-// given so authentication is off. The --user flags select the static basic-credential
-// provider (name:password[:roles], roles a comma list of reader/editor/publisher/admin,
-// default admin so a single --user keeps full access). The --jwt-* flags select the JWT
-// bearer provider instead; the two are mutually exclusive, since the server runs one
-// provider at a time (doc 18 §10.7).
-func buildAuth(users userList, jwt jwtOptions) (httpd.AuthProvider, error) {
+// given so authentication is off. The --auth-store flag selects the database's own
+// persistent credential store (the users created with CreateUser, doc 18 §10.3). The
+// --user flags select the static basic-credential provider (name:password[:roles], roles a
+// comma list of reader/editor/publisher/admin, default admin so a single --user keeps full
+// access). The --jwt-* flags select the JWT bearer provider instead. The three are mutually
+// exclusive, since the server runs one provider at a time (doc 18 §10.7).
+func buildAuth(db *gr.DB, users userList, jwt jwtOptions, authStore bool) (httpd.AuthProvider, error) {
+	selected := 0
+	if authStore {
+		selected++
+	}
+	if len(users) > 0 {
+		selected++
+	}
+	if jwt.set() {
+		selected++
+	}
 	switch {
-	case jwt.set() && len(users) > 0:
-		return nil, fmt.Errorf("choose one auth provider: --user (basic) or --jwt-* (bearer), not both")
+	case selected > 1:
+		return nil, fmt.Errorf("choose one auth provider: --auth-store, --user (basic), or --jwt-* (bearer), not more than one")
+	case authStore:
+		return httpd.NewDBProvider(db), nil
 	case jwt.set():
 		return buildJWT(jwt)
 	case len(users) > 0:

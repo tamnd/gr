@@ -8,9 +8,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tamnd/gr"
 )
 
 // TestServeBuildsHandler confirms gr serve opens the database, builds a handler, and
@@ -186,6 +189,61 @@ func TestServeAuthConflict(t *testing.T) {
 	listen := func(addr string, h http.Handler) error { return nil }
 	var out, errw bytes.Buffer
 	args := []string{"--user", "alice:secret", "--jwt-hmac-secret", "x"}
+	if code := runServe(args, &out, &errw, listen); code != exitUsage {
+		t.Errorf("code = %d, want exitUsage", code)
+	}
+}
+
+// TestServeAuthStore confirms --auth-store authenticates against the database's own
+// credential store: a user created in the file before serving authenticates over HTTP,
+// and an uncredentialed request is refused.
+func TestServeAuthStore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "served.gr")
+	db, err := gr.Open(path, gr.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateUser("ada", "s3cret", gr.RoleEditor); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	listen := func(addr string, handler http.Handler) error {
+		send := func(authz, statement string) int {
+			req := httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2", strings.NewReader(`{"statement":"`+statement+`"}`))
+			if authz != "" {
+				req.Header.Set("Authorization", authz)
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			return rec.Code
+		}
+		if code := send("", "RETURN 1"); code != http.StatusUnauthorized {
+			t.Errorf("no-credential query = %d, want 401", code)
+		}
+		cred := base64.StdEncoding.EncodeToString([]byte("ada:s3cret"))
+		if code := send("Basic "+cred, "CREATE (:T)"); code != http.StatusOK {
+			t.Errorf("editor write = %d, want 200", code)
+		}
+		bad := base64.StdEncoding.EncodeToString([]byte("ada:wrong"))
+		if code := send("Basic "+bad, "RETURN 1"); code != http.StatusUnauthorized {
+			t.Errorf("wrong password = %d, want 401", code)
+		}
+		return nil
+	}
+	var out, errw bytes.Buffer
+	if code := runServe([]string{"--auth-store", path}, &out, &errw, listen); code != exitOK {
+		t.Fatalf("code = %d, stderr = %s", code, errw.String())
+	}
+}
+
+// TestServeAuthStoreConflict rejects mixing --auth-store with --user as a usage error.
+func TestServeAuthStoreConflict(t *testing.T) {
+	listen := func(addr string, h http.Handler) error { return nil }
+	var out, errw bytes.Buffer
+	args := []string{"--auth-store", "--user", "alice:secret"}
 	if code := runServe(args, &out, &errw, listen); code != exitUsage {
 		t.Errorf("code = %d, want exitUsage", code)
 	}

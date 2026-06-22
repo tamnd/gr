@@ -106,29 +106,13 @@ type storedUser struct {
 // the database's reserved system area (doc 08, with ALTER USER / CREATE USER) is a
 // later slice, so this provider is configured in code at startup for now.
 type StaticProvider struct {
+	lockout
 	mu    sync.RWMutex
 	users map[string]storedUser
 	// dummy is a throwaway hash compared against when the named user does not exist,
 	// so a missing user takes the same time as a wrong password and the lookup does
 	// not leak which usernames exist through timing.
 	dummy []byte
-
-	// amu guards the lockout state, separate from mu so a flood of failed attempts
-	// does not contend with credential reads.
-	amu        sync.Mutex
-	attempts   map[string]*attempt
-	maxFailed  int           // failures before lockout; 0 disables lockout
-	lockoutDur time.Duration // how long a locked principal stays locked
-	// now is the clock, overridable in tests so lockout expiry is driven without sleeping.
-	now func() time.Time
-}
-
-// attempt is a principal's lockout state (doc 18 §10.3): the consecutive-failure count
-// and, once locked, the time the lock lifts. This is process state, not persisted, so a
-// restart clears lockouts.
-type attempt struct {
-	failed int
-	until  time.Time
 }
 
 // NewStaticProvider returns an empty credential store with the default lockout policy
@@ -136,12 +120,9 @@ type attempt struct {
 func NewStaticProvider() *StaticProvider {
 	dummy, _ := derive("", make([]byte, 16))
 	return &StaticProvider{
-		users:      make(map[string]storedUser),
-		dummy:      dummy,
-		attempts:   make(map[string]*attempt),
-		maxFailed:  defaultMaxFailedAttempts,
-		lockoutDur: defaultLockoutDuration,
-		now:        time.Now,
+		lockout: newLockout(),
+		users:   make(map[string]storedUser),
+		dummy:   dummy,
 	}
 }
 
@@ -149,10 +130,7 @@ func NewStaticProvider() *StaticProvider {
 // after maxFailed consecutive failures for dur, and a maxFailed of 0 disables lockout. It
 // returns the provider so a caller can chain it after NewStaticProvider.
 func (p *StaticProvider) SetLockout(maxFailed int, dur time.Duration) *StaticProvider {
-	p.amu.Lock()
-	p.maxFailed = maxFailed
-	p.lockoutDur = dur
-	p.amu.Unlock()
+	p.setPolicy(maxFailed, dur)
 	return p
 }
 
@@ -212,53 +190,6 @@ func (p *StaticProvider) Authenticate(ctx context.Context, scheme, principal str
 	// A success resets the principal's failed-attempt counter (doc 18 §10.3).
 	p.recordSuccess(principal)
 	return &Principal{Name: principal, Roles: append([]string(nil), u.roles...)}, nil
-}
-
-// locked reports whether a principal is currently within its lockout window (doc 18
-// §10.3). With lockout disabled (maxFailed == 0) it is always false.
-func (p *StaticProvider) locked(principal string) bool {
-	p.amu.Lock()
-	defer p.amu.Unlock()
-	if p.maxFailed <= 0 {
-		return false
-	}
-	a, ok := p.attempts[principal]
-	if !ok || a.until.IsZero() {
-		return false
-	}
-	return p.now().Before(a.until)
-}
-
-// recordFailure counts a failed attempt and locks the principal once it reaches the
-// threshold (doc 18 §10.3). When a previous lock has already expired the counter restarts,
-// so a principal gets a fresh window of attempts after a lockout lifts rather than being
-// re-locked by a single late failure.
-func (p *StaticProvider) recordFailure(principal string) {
-	p.amu.Lock()
-	defer p.amu.Unlock()
-	if p.maxFailed <= 0 {
-		return
-	}
-	a := p.attempts[principal]
-	if a == nil {
-		a = &attempt{}
-		p.attempts[principal] = a
-	}
-	if !a.until.IsZero() && !p.now().Before(a.until) {
-		a.failed = 0
-		a.until = time.Time{}
-	}
-	a.failed++
-	if a.failed >= p.maxFailed {
-		a.until = p.now().Add(p.lockoutDur)
-	}
-}
-
-// recordSuccess clears a principal's lockout state after a successful authentication.
-func (p *StaticProvider) recordSuccess(principal string) {
-	p.amu.Lock()
-	delete(p.attempts, principal)
-	p.amu.Unlock()
 }
 
 // Schemes reports that the built-in store verifies only the basic scheme.

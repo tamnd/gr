@@ -2,6 +2,8 @@ package gr
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"strconv"
 	"sync/atomic"
@@ -74,6 +76,15 @@ func WithBoltRateLimiter(r *RateLimiter) BoltOption {
 	return func(h *boltHandler) { h.limiter = r }
 }
 
+// WithBoltQueryLog gives the handler a shared structured query log (doc 20 §10). Each
+// statement is recorded through it, by its level and slow threshold, with parameters
+// redacted by the log's policy. Passing the same log to the HTTP surface makes both
+// transports feed one query stream that reads identically. A nil log, or no option, records
+// nothing, the embedded-friendly default.
+func WithBoltQueryLog(l *QueryLog) BoltOption {
+	return func(h *boltHandler) { h.qlog = l }
+}
+
 // BoltHandler returns a bolt.Handler that runs Cypher over the database for a Bolt
 // server (doc 18 §5). Pass it to a bolt.Server, which a bolt.Listener serves over
 // TCP:
@@ -102,7 +113,18 @@ type boltHandler struct {
 	admission    *Admission
 	limiter      *RateLimiter
 	queryMaxTime time.Duration
+	qlog         *QueryLog
+	now          func() time.Time // clock for query-log timing; nil uses time.Now
 	bookmark     atomic.Uint64
+}
+
+// clock returns the handler's current time for query-log timing, falling back to time.Now
+// when no clock seam is set, so a directly-constructed handler works without configuration.
+func (h *boltHandler) clock() time.Time {
+	if h.now != nil {
+		return h.now()
+	}
+	return time.Now()
 }
 
 // queryContext builds the context a statement runs under, applying the wall-clock cap when
@@ -200,7 +222,9 @@ type boltTx struct {
 
 // Run executes a query and returns a cursor over its rows (doc 18 §5.6).
 func (t *boltTx) Run(query string, params map[string]value.Value) (bolt.Cursor, error) {
+	started := t.h.clock()
 	kind, kindErr := t.db.StatementKind(query)
+	p := boltParams(params)
 
 	// Authorize the statement against the connection's roles before any side effect
 	// (doc 18 §10.6), the same role model the HTTP surface enforces. With auth off
@@ -208,10 +232,12 @@ func (t *boltTx) Run(query string, params map[string]value.Value) (bolt.Cursor, 
 	// reports it as a syntax error rather than a misleading forbidden error.
 	if t.h.requireAuth && kindErr == nil {
 		if boltRoleLevel(t.roles) < boltKindLevel(kind) {
-			return nil, &bolt.StatusError{
+			err := &bolt.StatusError{
 				Code:    "Neo.ClientError.Security.Forbidden",
 				Message: "this account is not allowed to run " + kind.String() + " statements",
 			}
+			t.logQuery(started, query, p, kind, kindErr, err, 0)
+			return nil, err
 		}
 	}
 
@@ -220,13 +246,13 @@ func (t *boltTx) Run(query string, params map[string]value.Value) (bolt.Cursor, 
 	// a retryable transient, the same call the HTTP surface makes. A nil limiter allows
 	// every query.
 	if ok, _ := t.h.limiter.Allow(boltRateKey(t.principal)); !ok {
-		return nil, &bolt.StatusError{
+		err := &bolt.StatusError{
 			Code:    "Neo.TransientError.General.TransientError",
 			Message: "query rate limit exceeded, retry shortly",
 		}
+		t.logQuery(started, query, p, kind, kindErr, err, 0)
+		return nil, err
 	}
-
-	p := boltParams(params)
 
 	// Pass the in-flight-query gate before executing, so a query that finds the gate
 	// full sheds as a retryable transient rather than the server queueing without bound
@@ -235,7 +261,9 @@ func (t *boltTx) Run(query string, params map[string]value.Value) (bolt.Cursor, 
 	// being submitted. A disabled gate admits immediately with a no-op release.
 	release, err := t.h.admission.Acquire(context.Background())
 	if err != nil {
-		return nil, boltAdmitErr(err)
+		be := boltAdmitErr(err)
+		t.logQuery(started, query, p, kind, kindErr, err, 0)
+		return nil, be
 	}
 
 	// Run the statement under the wall-clock cap when one is configured (doc 18 §8.6).
@@ -243,6 +271,11 @@ func (t *boltTx) Run(query string, params map[string]value.Value) (bolt.Cursor, 
 	// release, so a query that streams past the deadline is cut off too. An uncapped
 	// handler returns a plain cancellable context.
 	ctx, cancel := t.h.queryContext()
+
+	// The cursor records the query through the shared log when it closes, once the row
+	// count and the final status are known (doc 20 §10). The skeleton carries the facts
+	// fixed at submission; Close fills the duration, rows, and outcome.
+	rec := t.queryRecord(started, query, p, kind, kindErr)
 
 	// Schema, administrative, and pragma statements auto-commit and cannot run
 	// inside the held transaction (doc 18 §5.6); route them through the
@@ -252,10 +285,11 @@ func (t *boltTx) Run(query string, params map[string]value.Value) (bolt.Cursor, 
 		if err != nil {
 			cancel()
 			release()
+			t.logQuery(started, query, p, kind, kindErr, err, 0)
 			return nil, boltErr(err)
 		}
 		t.standalone = true
-		return &boltCursor{res: res, kind: kind, release: release, cancel: cancel}, nil
+		return &boltCursor{res: res, kind: kind, release: release, cancel: cancel, rec: rec}, nil
 	}
 
 	// Open the engine transaction on the first read/write statement, choosing the
@@ -269,6 +303,7 @@ func (t *boltTx) Run(query string, params map[string]value.Value) (bolt.Cursor, 
 		if err != nil {
 			cancel()
 			release()
+			t.logQuery(started, query, p, kind, kindErr, err, 0)
 			return nil, boltErr(err)
 		}
 		t.tx = tx
@@ -277,9 +312,89 @@ func (t *boltTx) Run(query string, params map[string]value.Value) (bolt.Cursor, 
 	if err != nil {
 		cancel()
 		release()
+		t.logQuery(started, query, p, kind, kindErr, err, 0)
 		return nil, boltErr(err)
 	}
-	return &boltCursor{res: res, kind: kind, release: release, cancel: cancel}, nil
+	return &boltCursor{res: res, kind: kind, release: release, cancel: cancel, rec: rec}, nil
+}
+
+// queryRecord builds the query-log skeleton a cursor carries until it closes (doc 20 §10):
+// the facts fixed when a query is submitted. It returns nil when no query log is configured,
+// so the cursor skips recording. Close fills the duration, row count, and final status.
+func (t *boltTx) queryRecord(started time.Time, query string, p Params, kind Kind, kindErr error) *boltPendingRecord {
+	if t.h.qlog == nil {
+		return nil
+	}
+	k := ""
+	if kindErr == nil {
+		k = kind.String()
+	}
+	return &boltPendingRecord{
+		qlog:    t.h.qlog,
+		clock:   t.h.clock,
+		started: started,
+		user:    boltUser(t.principal),
+		query:   query,
+		params:  map[string]any(p),
+		kind:    k,
+	}
+}
+
+// logQuery records a query that failed before a cursor was created (doc 20 §10): an
+// authorization refusal, a throttle, a shed, or a run error. A nil log is a no-op. The
+// status follows the error, so a deadline reads as a timeout and anything else as an error.
+func (t *boltTx) logQuery(started time.Time, query string, p Params, kind Kind, kindErr error, qerr error, rows int) {
+	if t.h.qlog == nil {
+		return
+	}
+	k := ""
+	if kindErr == nil {
+		k = kind.String()
+	}
+	t.h.qlog.Record(QueryRecord{
+		StartedAt:    started,
+		QueryID:      boltQueryID(),
+		User:         boltUser(t.principal),
+		Cypher:       query,
+		Params:       map[string]any(p),
+		Kind:         k,
+		Status:       queryStatus(qerr),
+		Err:          qerr,
+		Duration:     t.h.clock().Sub(started),
+		RowsReturned: rows,
+	})
+}
+
+// boltPendingRecord is the query-log skeleton a cursor carries from Run to Close (doc 20
+// §10). It holds what is known at submission; the cursor fills the rest as it streams and
+// emits one entry on Close.
+type boltPendingRecord struct {
+	qlog    *QueryLog
+	clock   func() time.Time
+	started time.Time
+	user    string
+	query   string
+	params  map[string]any
+	kind    string
+}
+
+// boltUser names the user for a query-log entry: the connection's principal, or "anonymous"
+// when the connection is unauthenticated.
+func boltUser(principal string) string {
+	if principal == "" {
+		return "anonymous"
+	}
+	return principal
+}
+
+// boltQueryID returns an unguessable per-query id for the query log, a random 128-bit token
+// hex-encoded, so an entry can be correlated without exposing a sequential counter.
+func boltQueryID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // boltAdmitErr maps an admission-gate failure to a Bolt status (doc 18 §8.9). A full gate
@@ -346,6 +461,11 @@ type boltCursor struct {
 	kind    Kind
 	release func()
 	cancel  context.CancelFunc
+
+	// query-log state, emitted on Close (doc 20 §10). rec is nil when no log is configured.
+	rec    *boltPendingRecord
+	rows   int
+	rawErr error // the unmapped streaming error, for the logged status
 }
 
 func (c *boltCursor) Fields() []string { return c.res.Columns() }
@@ -353,11 +473,16 @@ func (c *boltCursor) Fields() []string { return c.res.Columns() }
 // Next returns the next row, mapping a streaming fault to a Bolt status (doc 18 §12). The
 // wall-clock cap can fire while a query streams, so the deadline surfaces here rather than
 // at Run; routing the error through boltErr reports it as a timed out transaction instead
-// of a generic database error.
+// of a generic database error. The raw error is kept for the query-log status, and a
+// returned row is counted so the log records the rows actually streamed.
 func (c *boltCursor) Next() ([]value.Value, bool, error) {
 	row, ok, err := c.res.Row()
 	if err != nil {
+		c.rawErr = err
 		return nil, false, boltErr(err)
+	}
+	if ok {
+		c.rows++
 	}
 	return row, ok, nil
 }
@@ -375,6 +500,24 @@ func (c *boltCursor) Close() error {
 	if c.release != nil {
 		c.release()
 		c.release = nil
+	}
+	// Record the query now that the row count and the final status are known (doc 20 §10).
+	// The status follows the streaming error, so a query that hit the wall-clock cap mid
+	// stream reads as a timeout. The skeleton is cleared so a second Close does not log twice.
+	if c.rec != nil {
+		c.rec.qlog.Record(QueryRecord{
+			StartedAt:    c.rec.started,
+			QueryID:      boltQueryID(),
+			User:         c.rec.user,
+			Cypher:       c.rec.query,
+			Params:       c.rec.params,
+			Kind:         c.rec.kind,
+			Status:       queryStatus(c.rawErr),
+			Err:          c.rawErr,
+			Duration:     c.rec.clock().Sub(c.rec.started),
+			RowsReturned: c.rows,
+		})
+		c.rec = nil
 	}
 	return err
 }

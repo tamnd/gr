@@ -103,6 +103,30 @@ func (db *DB) BoltHandler(opts ...BoltOption) bolt.Handler {
 	return h
 }
 
+// BoltObserver returns a bolt.Observer that feeds the database's metric registry the Bolt
+// session and protocol counters (doc 20 §3.3): sessions opened and closed, their lifetimes,
+// the messages dispatched, the protocol errors, and the authentication outcomes. Set it on the
+// bolt.Server alongside the handler:
+//
+//	srv := &bolt.Server{Handler: db.BoltHandler(), Observer: db.BoltObserver()}
+//
+// An embedded database that runs no Bolt server never calls it, so leaving the server's Observer
+// nil simply records nothing.
+func (db *DB) BoltObserver() bolt.Observer {
+	return boltObserver{m: db.metrics}
+}
+
+// boltObserver adapts the query-metric registry to bolt.Observer (doc 20 §3.3). The bolt package
+// defines the interface and must not import this one, so the implementation lives here where it can
+// reach db.metrics. Every method is one registry update keyed by the protocol name "bolt".
+type boltObserver struct{ m *queryMetrics }
+
+func (o boltObserver) SessionOpen()                   { o.m.sessionOpen("bolt") }
+func (o boltObserver) SessionClose(dur time.Duration) { o.m.sessionClose("bolt", dur) }
+func (o boltObserver) Message(msgType string)         { o.m.recordBoltMessage(msgType) }
+func (o boltObserver) Error(code string)              { o.m.recordBoltError(code) }
+func (o boltObserver) Auth(ok bool)                   { o.m.recordAuth(ok) }
+
 // boltHandler is the engine seam a Bolt session drives (doc 18 §5). It
 // authenticates against the credential store and opens a transaction per Bolt
 // transaction. The bookmark counter is a process-local commit sequence, the

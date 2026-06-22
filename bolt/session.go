@@ -5,10 +5,30 @@ import (
 	"fmt"
 	"io"
 	"sync/atomic"
+	"time"
 
 	"github.com/tamnd/gr/pack"
 	"github.com/tamnd/gr/value"
 )
+
+// Observer receives Bolt protocol events for the server-altitude metric catalogue (doc 20 §3.3).
+// The session calls these as it runs, so an implementation only counts; it does no protocol work.
+// A nil Observer on the Server disables the reporting, the default and the embedded case. The bolt
+// package stays free of the metric registry by reporting through this seam, which the adapter
+// satisfies against the database metrics.
+type Observer interface {
+	// SessionOpen reports a Bolt connection that completed its handshake and began its message loop.
+	SessionOpen()
+	// SessionClose reports that connection ending, having lived dur.
+	SessionClose(dur time.Duration)
+	// Message reports one protocol message dispatched, by uppercase type (RUN, PULL, and the rest).
+	Message(msgType string)
+	// Error reports one Bolt-level error sent to the client, by status code: a handshake failure,
+	// a protocol violation, or an auth failure.
+	Error(code string)
+	// Auth reports one authentication attempt, ok true when it succeeded.
+	Auth(ok bool)
+}
 
 // The Neo4j status codes the session emits itself (doc 18 §12). Codes for query
 // faults come from the handler via StatusError.
@@ -108,6 +128,8 @@ type Server struct {
 	MaxMessage int
 	// ChunkSize sets the outbound chunk payload size; 0 uses the framing default.
 	ChunkSize int
+	// Observer receives protocol events for the metric catalogue; nil disables reporting.
+	Observer Observer
 
 	conns atomic.Int64
 }
@@ -175,6 +197,11 @@ type session struct {
 func (s *Server) Serve(conn io.ReadWriter) error {
 	version, err := Handshake(conn)
 	if err != nil {
+		// A handshake that never reaches a session is still a Bolt-level error worth counting,
+		// the protocol-problem signal an operator separates from query problems (doc 20 §3.3).
+		if s.Observer != nil {
+			s.Observer.Error("handshake")
+		}
 		return err
 	}
 	sess := &session{
@@ -186,7 +213,71 @@ func (s *Server) Serve(conn io.ReadWriter) error {
 		state:   stateNegotiation,
 		connID:  fmt.Sprintf("bolt-%d", s.conns.Add(1)),
 	}
+	if s.Observer != nil {
+		s.Observer.SessionOpen()
+		start := monotonic()
+		defer func() { s.Observer.SessionClose(monotonic().Sub(start)) }()
+	}
 	return sess.loop()
+}
+
+// monotonic is time.Now isolated so the one time dependency is named in one place.
+func monotonic() time.Time { return time.Now() }
+
+// obsMessage, obsError, and obsAuth report a protocol event to the server's observer when one is
+// set (doc 20 §3.3); with none they are a nil check and nothing more.
+func (s *session) obsMessage(msgType string) {
+	if s.srv.Observer != nil {
+		s.srv.Observer.Message(msgType)
+	}
+}
+
+func (s *session) obsError(code string) {
+	if s.srv.Observer != nil {
+		s.srv.Observer.Error(code)
+	}
+}
+
+func (s *session) obsAuth(ok bool) {
+	if s.srv.Observer != nil {
+		s.srv.Observer.Auth(ok)
+	}
+}
+
+// requestName is the Bolt message name an observer labels a message count with, the uppercase tag
+// the protocol spec gives each request signature. An unknown request falls back to a generic label
+// so a future message type still counts rather than dropping out of the metric.
+func requestName(req Request) string {
+	switch req.(type) {
+	case Hello:
+		return "HELLO"
+	case Logon:
+		return "LOGON"
+	case Logoff:
+		return "LOGOFF"
+	case Goodbye:
+		return "GOODBYE"
+	case Reset:
+		return "RESET"
+	case Run:
+		return "RUN"
+	case Begin:
+		return "BEGIN"
+	case Commit:
+		return "COMMIT"
+	case Rollback:
+		return "ROLLBACK"
+	case Pull:
+		return "PULL"
+	case Discard:
+		return "DISCARD"
+	case Route:
+		return "ROUTE"
+	case Telemetry:
+		return "TELEMETRY"
+	default:
+		return "OTHER"
+	}
 }
 
 // loop reads and dispatches messages until the connection ends.
@@ -200,6 +291,7 @@ func (s *session) loop() error {
 			}
 			// A framing fault (oversize, truncation): best-effort FAILURE, then
 			// close (doc 18 §13.4).
+			s.obsError(codeInvalidFormat)
 			_ = s.send(Failure(codeInvalidFormat, err.Error()))
 			s.cleanup()
 			return err
@@ -211,6 +303,7 @@ func (s *session) loop() error {
 			}
 			continue
 		}
+		s.obsMessage(requestName(req))
 		done, lerr := s.dispatch(req)
 		if lerr != nil {
 			return lerr
@@ -312,8 +405,10 @@ func (s *session) handleHello(h Hello) error {
 	if pre51 {
 		scheme, principal, credentials := authFields(h.Extra)
 		auth, err := s.srv.Handler.Authenticate(scheme, principal, credentials)
+		s.obsAuth(err == nil)
 		if err != nil {
 			// A failed legacy HELLO leaves the connection unusable (doc 18 §5.4).
+			s.obsError(codeUnauthorized)
 			_ = s.send(Failure(codeUnauthorized, err.Error()))
 			s.state = stateDefunct
 			return nil
@@ -330,9 +425,11 @@ func (s *session) handleHello(h Hello) error {
 func (s *session) handleLogon(l Logon) error {
 	scheme, principal, credentials := authFields(l.Auth)
 	auth, err := s.srv.Handler.Authenticate(scheme, principal, credentials)
+	s.obsAuth(err == nil)
 	if err != nil {
 		// The connection stays in AUTHENTICATION so the driver can retry
 		// (doc 18 §5.5).
+		s.obsError(codeUnauthorized)
 		return s.send(Failure(codeUnauthorized, err.Error()))
 	}
 	s.auth = auth
@@ -578,6 +675,7 @@ func (s *session) cleanup() {
 // §12).
 func (s *session) fail(code, message string) error {
 	s.state = stateFailed
+	s.obsError(code)
 	return s.send(Failure(code, message))
 }
 

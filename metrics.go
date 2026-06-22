@@ -150,6 +150,20 @@ var txDurationBuckets = []float64{
 // a query classifies into a kind and so never reach gr_queries_total at all.
 var metricErrorClasses = []string{"syntax", "semantic", "constraint", "conflict", "resource", "internal"}
 
+// sessionDurationBuckets covers a connection's lifetime, gr_session_duration_seconds (doc 20
+// §3.3). A session lives far longer than a query, from a sub-second health probe that connects and
+// disconnects to a pooled connection held open for hours, so the buckets run from a millisecond out
+// to an hour rather than reusing the query latency scale.
+var sessionDurationBuckets = []float64{
+	0.001, 0.01, 0.1, 1, 10, 60, 300, 900, 1800, 3600,
+}
+
+// metricAuthResults is the bounded domain of the result label on gr_auth_attempts_total (doc 20
+// §3.3): whether an authentication attempt succeeded or failed. Both are pre-registered so a server
+// that has only ever seen successes still exposes the failure series at zero, the shape an alert on
+// a sudden failure rate needs present from the start.
+var metricAuthResults = []string{"success", "failure"}
+
 // queryMetrics holds the pre-resolved handles for the query throughput, latency, and in-flight
 // metrics (doc 20 §3.1). Resolving every (kind, status) handle once at open keeps the record
 // path off the registry lock: recording a finished query is a couple of map reads and an
@@ -185,6 +199,20 @@ type queryMetrics struct {
 	factorized         *metric.Counter   // gr_factorized_total
 	factorizationRatio *metric.Histogram // gr_factorization_ratio
 
+	authAttempts map[string]*metric.Counter // gr_auth_attempts_total by [result]
+
+	// sessionHandles caches the per-protocol session metric handles, keyed by protocol string
+	// (bolt, http). A protocol's handles are registered on its first session and loaded lock-free
+	// after, the same pattern the expand handles use. The key space is the set of wire protocols the
+	// server speaks, two at most, so the cache stays tiny.
+	sessionHandles sync.Map // string protocol -> *sessionHandles
+	// boltMessages caches the per-type message counter, keyed by uppercase message name, and
+	// boltErrors the per-code error counter. Both label domains are the protocol's own vocabulary, a
+	// dozen message types and a handful of status codes, so a sync.Map of resolved handles bounds the
+	// registry work to one resolution per distinct label seen.
+	boltMessages sync.Map // string type -> *metric.Counter
+	boltErrors   sync.Map // string code -> *metric.Counter
+
 	// relTypeName resolves a relationship-type token to its name for the expand metrics' type
 	// label. It is wired at Open once the engine exists; until then it is nil and an expand is
 	// attributed to the all-types bucket. The expand metrics are labelled by type, so a token
@@ -216,6 +244,16 @@ type expandHandles struct {
 	seconds   *metric.Histogram
 }
 
+// sessionHandles holds the three session metric series for one protocol: the open-connection gauge,
+// the lifetime counter, and the duration histogram. They are resolved together on a protocol's
+// first session since a connection that opens always later closes, so all three are touched over
+// one session's life.
+type sessionHandles struct {
+	open     *metric.Gauge
+	total    *metric.Counter
+	duration *metric.Histogram
+}
+
 // newQueryMetrics builds the registry and pre-resolves every query-metric handle (doc 20
 // §3.1). It is called once at Open, so the database always has a live registry and db.Metrics
 // never returns nil.
@@ -237,6 +275,12 @@ func newQueryMetrics() *queryMetrics {
 		txOpen:     make(map[string]*metric.Gauge, len(metricTxModes)),
 		txTotal:    make(map[string]map[string]*metric.Counter, len(metricTxModes)),
 		txDuration: make(map[string]*metric.Histogram, len(metricTxModes)),
+
+		authAttempts: make(map[string]*metric.Counter, len(metricAuthResults)),
+	}
+	for _, r := range metricAuthResults {
+		m.authAttempts[r] = reg.Counter("gr_auth_attempts_total",
+			"Authentication attempts, by result", "attempts", metric.Labels{"result": r})
 	}
 	for _, mode := range metricTxModes {
 		m.txOpen[mode] = reg.Gauge("gr_transactions_open",
@@ -685,6 +729,88 @@ func metricExpandDir(dir engine.Direction) string {
 		return "in"
 	default:
 		return "both"
+	}
+}
+
+// sessionOpen records a connection that finished its handshake (doc 20 §3.3): it bumps the
+// per-protocol open gauge and the lifetime counter. The pair lets a reader see both how many
+// connections are live now and how many have ever been served.
+func (m *queryMetrics) sessionOpen(protocol string) {
+	h := m.sessionHandlesFor(protocol)
+	h.open.Inc()
+	h.total.Inc()
+}
+
+// sessionClose records a connection ending after living dur (doc 20 §3.3): it drops the open gauge
+// back and observes the lifetime. open is symmetric with sessionOpen so the gauge tracks the true
+// live count even across protocols.
+func (m *queryMetrics) sessionClose(protocol string, dur time.Duration) {
+	h := m.sessionHandlesFor(protocol)
+	h.open.Dec()
+	h.duration.Observe(dur.Seconds())
+}
+
+// sessionHandlesFor returns the cached session handles for a protocol, registering them on the
+// first session of that protocol. The protocol label is the wire name, bolt or http.
+func (m *queryMetrics) sessionHandlesFor(protocol string) *sessionHandles {
+	if v, ok := m.sessionHandles.Load(protocol); ok {
+		return v.(*sessionHandles)
+	}
+	h := &sessionHandles{
+		open: m.reg.Gauge("gr_sessions_open",
+			"Currently open client sessions, by protocol", "sessions",
+			metric.Labels{"protocol": protocol}),
+		total: m.reg.Counter("gr_sessions_total",
+			"Client sessions opened, by protocol", "sessions",
+			metric.Labels{"protocol": protocol}),
+		duration: m.reg.Histogram("gr_session_duration_seconds",
+			"Session lifetime, handshake to disconnect, by protocol", "seconds",
+			sessionDurationBuckets, metric.Labels{"protocol": protocol}),
+	}
+	actual, _ := m.sessionHandles.LoadOrStore(protocol, h)
+	return actual.(*sessionHandles)
+}
+
+// recordBoltMessage counts one dispatched Bolt message by its uppercase type (doc 20 §3.3). The
+// per-type counter is resolved once and cached, so a steady stream of one message type costs a
+// sync.Map load and an atomic increment.
+func (m *queryMetrics) recordBoltMessage(msgType string) {
+	if v, ok := m.boltMessages.Load(msgType); ok {
+		v.(*metric.Counter).Inc()
+		return
+	}
+	c := m.reg.Counter("gr_bolt_messages_total",
+		"Bolt protocol messages dispatched, by message type", "messages",
+		metric.Labels{"type": msgType})
+	actual, _ := m.boltMessages.LoadOrStore(msgType, c)
+	actual.(*metric.Counter).Inc()
+}
+
+// recordBoltError counts one Bolt protocol error by its status code (doc 20 §3.3): a handshake
+// failure, a framing fault, a protocol misuse, or an auth rejection. These are connection-level
+// faults an operator separates from query errors, so they live on their own counter rather than
+// gr_query_errors_total.
+func (m *queryMetrics) recordBoltError(code string) {
+	if v, ok := m.boltErrors.Load(code); ok {
+		v.(*metric.Counter).Inc()
+		return
+	}
+	c := m.reg.Counter("gr_bolt_errors_total",
+		"Bolt protocol errors, by status code", "errors",
+		metric.Labels{"code": code})
+	actual, _ := m.boltErrors.LoadOrStore(code, c)
+	actual.(*metric.Counter).Inc()
+}
+
+// recordAuth counts one authentication attempt by result (doc 20 §3.3). Both result series are
+// pre-registered, so this is a map read and an atomic increment.
+func (m *queryMetrics) recordAuth(ok bool) {
+	result := "failure"
+	if ok {
+		result = "success"
+	}
+	if c := m.authAttempts[result]; c != nil {
+		c.Inc()
 	}
 }
 

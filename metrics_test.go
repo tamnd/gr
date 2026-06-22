@@ -697,3 +697,69 @@ func TestMetricsAlwaysOn(t *testing.T) {
 		t.Errorf("fresh counter = %d, want 0", got)
 	}
 }
+
+// TestMetricsBoltSession confirms the Bolt observer feeds the session and protocol metrics
+// (doc 20 §3.3): a session opens and closes, messages and an auth outcome are counted, and the
+// open gauge returns to zero when the session ends.
+func TestMetricsBoltSession(t *testing.T) {
+	db, err := Open("mbolt.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	obs := db.BoltObserver()
+	obs.SessionOpen()
+	obs.Auth(true)
+	obs.Message("HELLO")
+	obs.Message("RUN")
+	obs.Message("RUN")
+
+	snap := db.Metrics()
+	if g := snap.Gauge("gr_sessions_open", Labels{"protocol": "bolt"}); g != 1 {
+		t.Errorf("sessions_open = %d, want 1 while the session is live", g)
+	}
+	if c := snap.Counter("gr_sessions_total", Labels{"protocol": "bolt"}); c != 1 {
+		t.Errorf("sessions_total = %d, want 1", c)
+	}
+	if c := snap.Counter("gr_bolt_messages_total", Labels{"type": "RUN"}); c != 2 {
+		t.Errorf("RUN messages = %d, want 2", c)
+	}
+	if c := snap.Counter("gr_bolt_messages_total", Labels{"type": "HELLO"}); c != 1 {
+		t.Errorf("HELLO messages = %d, want 1", c)
+	}
+	if c := snap.Counter("gr_auth_attempts_total", Labels{"result": "success"}); c != 1 {
+		t.Errorf("auth success = %d, want 1", c)
+	}
+
+	obs.SessionClose(2 * time.Second)
+	snap = db.Metrics()
+	if g := snap.Gauge("gr_sessions_open", Labels{"protocol": "bolt"}); g != 0 {
+		t.Errorf("sessions_open = %d, want 0 after the session closed", g)
+	}
+	if h := snap.Histogram("gr_session_duration_seconds", Labels{"protocol": "bolt"}); h.Count != 1 {
+		t.Errorf("session duration count = %d, want 1", h.Count)
+	}
+}
+
+// TestMetricsBoltError confirms a reported protocol error and a failed auth land on their own
+// counters (doc 20 §3.3).
+func TestMetricsBoltError(t *testing.T) {
+	db, err := Open("mbolterr.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	obs := db.BoltObserver()
+	obs.Error("handshake")
+	obs.Auth(false)
+
+	snap := db.Metrics()
+	if c := snap.Counter("gr_bolt_errors_total", Labels{"code": "handshake"}); c != 1 {
+		t.Errorf("handshake errors = %d, want 1", c)
+	}
+	if c := snap.Counter("gr_auth_attempts_total", Labels{"result": "failure"}); c != 1 {
+		t.Errorf("auth failure = %d, want 1", c)
+	}
+}

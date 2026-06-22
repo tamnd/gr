@@ -127,6 +127,14 @@ type DiskEngine struct {
 	gcReclaimedNode atomic.Uint64
 	gcReclaimedRel  atomic.Uint64
 
+	// commitsTotal counts write transactions that reached their durability point, bumped under the
+	// engine lock when a write transaction's commit makes the pager durable (doc 20 §5.3). It is the
+	// amortization numerator: against gr_wal_fsync_total, rate(commits)/rate(fsync) is the commits-per-
+	// fsync ratio that shows the group-commit payoff, near one in the inline-commit design and rising
+	// once batching lands. It is the authoritative cumulative count the metrics path mirrors into
+	// gr_commits_total delta-style, read lock-free off the snapshot path.
+	commitsTotal atomic.Uint64
+
 	// gcDurMu guards gcDurations, the per-pass GC durations in seconds buffered since the metrics path
 	// last drained them (doc 20 §5.1). A histogram cannot be delta-mirrored from a cumulative pair the
 	// way the GC counts are, so each pass appends its duration here under the engine lock the checkpoint
@@ -255,6 +263,12 @@ func (e *DiskEngine) DrainGCDurations() []float64 {
 	e.gcDurations = nil
 	return out
 }
+
+// CommitsTotal returns the cumulative count of write transactions that reached their durability point
+// (doc 20 §5.3), the amortization numerator the metrics path mirrors into gr_commits_total. It is a
+// lock-free atomic load, never the engine lock, so the metrics snapshot path reads it freely even while
+// a write transaction holds the engine lock.
+func (e *DiskEngine) CommitsTotal() uint64 { return e.commitsTotal.Load() }
 
 // WatermarkLag returns the commit versions between the newest commit and the GC watermark (doc 20
 // §5.1), for the gr_mvcc_watermark_lag_versions gauge. It reads the oracle's own lock, never the
@@ -1421,6 +1435,10 @@ func (t *diskTx) Commit() error {
 	if err != nil {
 		return err
 	}
+	// This write transaction reached its durability point, so count it for the commit total, the
+	// amortization numerator against the WAL fsync count (doc 20 §5.3). It is bumped under the engine
+	// write lock this commit already holds; the metrics path reads it lock-free.
+	t.e.commitsTotal.Add(1)
 	// The pager commit may have grown or truncated the file and changed the free list, so refresh
 	// the published size and free-page count for their gauges while the write lock is still held
 	// (doc 20 §4.2).

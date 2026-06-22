@@ -3,6 +3,7 @@ package gr
 import (
 	"context"
 	"errors"
+	"io"
 	"time"
 
 	"github.com/tamnd/gr/ast"
@@ -44,6 +45,19 @@ const (
 // server renders the same registry as Prometheus text and expvar JSON.
 func (db *DB) Metrics() MetricsSnapshot {
 	return db.metrics.reg.Snapshot()
+}
+
+// WritePrometheus renders a metrics snapshot in the Prometheus text exposition format (doc 20
+// §7.5), re-exported so the server and an embedder render db.Metrics() without importing the
+// low-level metric package.
+func WritePrometheus(w io.Writer, snap MetricsSnapshot) error {
+	return metric.WritePrometheus(w, snap)
+}
+
+// WriteExpvar renders a metrics snapshot as the expvar JSON tree (doc 20 §7.6), the same
+// registry the Prometheus surface renders, for an operator on the Go expvar convention.
+func WriteExpvar(w io.Writer, snap MetricsSnapshot) error {
+	return metric.WriteExpvar(w, snap)
 }
 
 // queryLatencyBuckets is the bucket layout for gr_query_duration_seconds and the other query

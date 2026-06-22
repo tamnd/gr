@@ -135,6 +135,7 @@ func New(db *gr.DB, opts Options) *Server {
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/metrics", s.handleMetrics)
+	mux.HandleFunc("/debug/vars", s.handleVars)
 	mux.HandleFunc("/", s.route)
 	return &Server{s: s, mux: mux}
 }

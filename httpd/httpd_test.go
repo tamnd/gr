@@ -406,3 +406,39 @@ func TestQueryMaxTimeAdmits(t *testing.T) {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestQueryRateLimit confirms the per-principal rate limit refuses a query once a key has
+// spent its burst. With a tiny rate and a burst of one, the first anonymous query is
+// allowed and the immediate second is refused with 429, a Retry-After header, and a
+// transient code.
+func TestQueryRateLimit(t *testing.T) {
+	h := Handler(newTestDB(t), Options{RateLimiter: gr.NewRateLimiter(0.001, 1)})
+	if rec := post(t, h, `{"statement":"RETURN 1 AS n"}`); rec.Code != http.StatusOK {
+		t.Fatalf("first query status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	rec := post(t, h, `{"statement":"RETURN 1 AS n"}`)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second query status = %d, want 429: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("429 response missing Retry-After header")
+	}
+	body := decode(t, rec.Body.Bytes())
+	errsAny, ok := body["errors"].([]any)
+	if !ok || len(errsAny) == 0 {
+		t.Fatalf("no errors in response: %v", body)
+	}
+	if code := errsAny[0].(map[string]any)["code"]; code != "Neo.TransientError.General.TransientError" {
+		t.Errorf("code = %v, want transient", code)
+	}
+}
+
+// TestQueryRateLimitAdmits confirms a generous limit does not throttle a normal query.
+func TestQueryRateLimitAdmits(t *testing.T) {
+	h := Handler(newTestDB(t), Options{RateLimiter: gr.NewRateLimiter(1000, 1000)})
+	for i := 0; i < 5; i++ {
+		if rec := post(t, h, `{"statement":"RETURN 1 AS n"}`); rec.Code != http.StatusOK {
+			t.Fatalf("query %d status = %d, want 200: %s", i, rec.Code, rec.Body.String())
+		}
+	}
+}

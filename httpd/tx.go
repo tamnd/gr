@@ -252,6 +252,9 @@ func (s *server) handleTxBegin(w http.ResponseWriter, r *http.Request, name stri
 	if !s.authorizeStatements(w, r, req.Statements) {
 		return
 	}
+	if !s.rateLimit(w, r) {
+		return
+	}
 	ctx, cancel := s.withTimeout(r.Context(), req.MaxExecutionTime)
 	defer cancel()
 
@@ -313,6 +316,9 @@ func (s *server) handleTxRun(w http.ResponseWriter, r *http.Request, id string) 
 	if !s.authorizeStatements(w, r, req.Statements) {
 		return
 	}
+	if !s.rateLimit(w, r) {
+		return
+	}
 	e, code := s.txns.acquire(id, owner(r), s.now())
 	if !s.checkAcquire(w, code) {
 		return
@@ -354,6 +360,9 @@ func (s *server) handleTxCommit(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 	if !s.authorizeStatements(w, r, req.Statements) {
+		return
+	}
+	if !s.rateLimit(w, r) {
 		return
 	}
 	e, code := s.txns.acquire(id, owner(r), s.now())

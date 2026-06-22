@@ -32,6 +32,9 @@ type server struct {
 	// queryMaxTime is the server-wide wall-clock cap on a single query (doc 18 §8.6);
 	// zero leaves queries uncapped except for any per-request maxExecutionTime.
 	queryMaxTime time.Duration
+	// limiter is the shared per-principal query rate limiter (doc 18 §8.8); nil leaves
+	// queries unlimited.
+	limiter *gr.RateLimiter
 	// impersonation enables the imp_user/impersonatedUser request field (doc 18 §10.5).
 	// It is off by default, so a deployment opts into impersonation explicitly.
 	impersonation bool
@@ -68,6 +71,12 @@ type Options struct {
 	// Pass the same value to the Bolt handler so both surfaces enforce one cap. Zero leaves
 	// queries uncapped except for a per-request maxExecutionTime.
 	QueryMaxTime time.Duration
+	// RateLimiter is the shared per-principal query rate limiter (doc 18 §8.8). When set,
+	// every query charges one token against the request's principal (or its source address
+	// when anonymous), and a query that finds the budget spent is refused with 429 and a
+	// Retry-After hint. Pass the same limiter to the Bolt handler so the bound holds across
+	// both surfaces. Nil leaves the HTTP path unlimited.
+	RateLimiter *gr.RateLimiter
 	// now overrides the clock for tests; nil uses time.Now.
 	now func() time.Time
 }
@@ -98,7 +107,7 @@ func New(db *gr.DB, opts Options) *Server {
 	if clock == nil {
 		clock = time.Now
 	}
-	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics(), admission: opts.Admission, queryMaxTime: opts.QueryMaxTime, impersonation: opts.Impersonation}
+	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics(), admission: opts.Admission, queryMaxTime: opts.QueryMaxTime, limiter: opts.RateLimiter, impersonation: opts.Impersonation}
 	if opts.Auth != nil {
 		ttl := opts.TokenCacheTTL
 		if ttl == 0 {

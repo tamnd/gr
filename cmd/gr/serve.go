@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -61,6 +62,8 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	tlsKey := fs.String("tls-key", "", "path to the PEM private key for TLS listeners")
 	maxInFlight := fs.Int("max-in-flight", 0, "bound on queries executing at once across all connections; 0 means unlimited")
 	queryMaxTime := fs.Duration("query-max-time", 0, "server-wide wall-clock cap on a single query; a query that runs longer is cancelled and reported as timed out; 0 means no cap")
+	maxQPS := fs.Float64("max-queries-per-second", 0, "per-principal query rate limit; a principal over the rate is refused with a retry hint; 0 means no limit")
+	rateBurst := fs.Int("rate-limit-burst", 0, "momentary burst a principal may make above the steady rate; defaults to the per-second rate rounded up when --max-queries-per-second is set")
 	var users userList
 	fs.Var(&users, "user", "name:password[:roles] for HTTP auth (repeatable); roles is a comma list of reader/editor/publisher/admin, default admin; none means auth is off")
 	authStore := fs.Bool("auth-store", false, "authenticate against the database's own credential store (the users created with CreateUser), not an in-memory --user list")
@@ -110,7 +113,16 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	// across the whole process rather than per surface (doc 18 §8.8). A zero limit
 	// returns a nil gate, which admits every query.
 	admission := gr.NewAdmission(*maxInFlight, 0)
-	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL, Impersonation: *impersonation, Admission: admission, QueryMaxTime: *queryMaxTime})
+	// One rate limiter is shared by both transports too, so the per-principal bound holds
+	// across the whole process (doc 18 §8.8). The burst defaults to the per-second rate
+	// when not set, so a steady client at the rate is never throttled by a too-small
+	// bucket. A zero rate returns a nil limiter, which allows every query.
+	burst := *rateBurst
+	if burst <= 0 && *maxQPS > 0 {
+		burst = int(math.Ceil(*maxQPS))
+	}
+	limiter := gr.NewRateLimiter(*maxQPS, burst)
+	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL, Impersonation: *impersonation, Admission: admission, QueryMaxTime: *queryMaxTime, RateLimiter: limiter})
 	defer srv.Close()
 	fmt.Fprintf(stderr, "gr serving %s on %s (database %q, TLS %s)\n", describeDB(path), *addr, *name, *httpTLS)
 	if auth == nil {

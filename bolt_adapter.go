@@ -43,6 +43,15 @@ func WithBoltAuthFunc(fn func(scheme, principal, credentials string) (roles []st
 	}
 }
 
+// WithBoltAdmission gives the handler a shared in-flight-query admission gate (doc 18
+// §8.8). Every statement passes through the gate before it executes, so the gate bounds
+// how many queries run at once across both server surfaces. Passing the same gate to the
+// HTTP surface makes the bound hold across the whole process. A nil gate, or no option,
+// leaves the Bolt path ungated, the embedded-friendly default.
+func WithBoltAdmission(a *Admission) BoltOption {
+	return func(h *boltHandler) { h.admission = a }
+}
+
 // BoltHandler returns a bolt.Handler that runs Cypher over the database for a Bolt
 // server (doc 18 §5). Pass it to a bolt.Server, which a bolt.Listener serves over
 // TCP:
@@ -68,6 +77,7 @@ type boltHandler struct {
 	db          *DB
 	requireAuth bool
 	authFunc    func(scheme, principal, credentials string) (roles []string, err error)
+	admission   *Admission
 	bookmark    atomic.Uint64
 }
 
@@ -160,16 +170,27 @@ func (t *boltTx) Run(query string, params map[string]value.Value) (bolt.Cursor, 
 
 	p := boltParams(params)
 
+	// Pass the in-flight-query gate before executing, so a query that finds the gate
+	// full sheds as a retryable transient rather than the server queueing without bound
+	// (doc 18 §8.8, §8.9). The slot is held for the cursor's life and released when the
+	// cursor closes, so the gate bounds queries that are still streaming, not only those
+	// being submitted. A disabled gate admits immediately with a no-op release.
+	release, err := t.h.admission.Acquire(context.Background())
+	if err != nil {
+		return nil, boltAdmitErr(err)
+	}
+
 	// Schema, administrative, and pragma statements auto-commit and cannot run
 	// inside the held transaction (doc 18 §5.6); route them through the
 	// database-level Run, which dispatches and commits them itself.
 	if kind == SchemaStatement || kind == AdminStatement || kind == PragmaStatement {
 		res, err := t.db.Run(context.Background(), query, p)
 		if err != nil {
+			release()
 			return nil, boltErr(err)
 		}
 		t.standalone = true
-		return &boltCursor{res: res, kind: kind}, nil
+		return &boltCursor{res: res, kind: kind, release: release}, nil
 	}
 
 	// Open the engine transaction on the first read/write statement, choosing the
@@ -181,15 +202,30 @@ func (t *boltTx) Run(query string, params map[string]value.Value) (bolt.Cursor, 
 		}
 		tx, err := t.db.Begin(context.Background(), mode)
 		if err != nil {
+			release()
 			return nil, boltErr(err)
 		}
 		t.tx = tx
 	}
 	res, err := t.tx.Run(context.Background(), query, p)
 	if err != nil {
+		release()
 		return nil, boltErr(err)
 	}
-	return &boltCursor{res: res, kind: kind}, nil
+	return &boltCursor{res: res, kind: kind, release: release}, nil
+}
+
+// boltAdmitErr maps an admission-gate failure to a Bolt status (doc 18 §8.9). A full gate
+// is a retryable transient, so a driver backs off and retries; a cancelled context (a
+// RESET or timeout while queued) maps through the ordinary engine-error path.
+func boltAdmitErr(err error) error {
+	if errors.Is(err, ErrOverloaded) {
+		return &bolt.StatusError{
+			Code:    "Neo.TransientError.General.TransientError",
+			Message: "server is busy, too many queries in flight, retry shortly",
+		}
+	}
+	return boltErr(err)
 }
 
 // Materializer resolves node and relationship handles in a result against the
@@ -234,10 +270,13 @@ func (h *boltHandler) nextBookmark() string {
 	return "gr:bookmark:" + strconv.FormatUint(h.bookmark.Add(1), 10)
 }
 
-// boltCursor adapts a streaming Result to bolt.Cursor (doc 18 §5.7).
+// boltCursor adapts a streaming Result to bolt.Cursor (doc 18 §5.7). It holds the
+// admission slot the query was admitted on and releases it on Close, so the in-flight
+// bound covers a query for as long as it streams (doc 18 §8.9).
 type boltCursor struct {
-	res  *Result
-	kind Kind
+	res     *Result
+	kind    Kind
+	release func()
 }
 
 func (c *boltCursor) Fields() []string { return c.res.Columns() }
@@ -248,7 +287,14 @@ func (c *boltCursor) Summary() bolt.Summary {
 	return bolt.Summary{Type: boltQueryType(c.kind), Stats: boltStats(c.res.Summary())}
 }
 
-func (c *boltCursor) Close() error { return c.res.Close() }
+func (c *boltCursor) Close() error {
+	err := c.res.Close()
+	if c.release != nil {
+		c.release()
+		c.release = nil
+	}
+	return err
+}
 
 // boltMat adapts the internal object materializer to bolt.Materializer (doc 18
 // §6.10).

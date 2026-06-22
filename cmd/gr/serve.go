@@ -59,6 +59,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	httpTLS := fs.String("http-tls", "disabled", "HTTP transport security: disabled (plaintext) or required (HTTPS only); required needs --tls-cert and --tls-key")
 	tlsCert := fs.String("tls-cert", "", "path to the PEM certificate chain for TLS listeners")
 	tlsKey := fs.String("tls-key", "", "path to the PEM private key for TLS listeners")
+	maxInFlight := fs.Int("max-in-flight", 0, "bound on queries executing at once across all connections; 0 means unlimited")
 	var users userList
 	fs.Var(&users, "user", "name:password[:roles] for HTTP auth (repeatable); roles is a comma list of reader/editor/publisher/admin, default admin; none means auth is off")
 	authStore := fs.Bool("auth-store", false, "authenticate against the database's own credential store (the users created with CreateUser), not an in-memory --user list")
@@ -104,6 +105,10 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 		fmt.Fprintln(stderr, "gr:", err)
 		return exitUsage
 	}
+	// One admission gate is shared by both transports, so the in-flight bound holds
+	// across the whole process rather than per surface (doc 18 §8.8). A zero limit
+	// returns a nil gate, which admits every query.
+	admission := gr.NewAdmission(*maxInFlight, 0)
 	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL, Impersonation: *impersonation})
 	defer srv.Close()
 	fmt.Fprintf(stderr, "gr serving %s on %s (database %q, TLS %s)\n", describeDB(path), *addr, *name, *httpTLS)
@@ -121,7 +126,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 			fmt.Fprintln(stderr, "gr:", err)
 			return exitUsage
 		}
-		bh := db.BoltHandler(boltAuthOptions(auth)...)
+		bh := db.BoltHandler(append(boltAuthOptions(auth), gr.WithBoltAdmission(admission))...)
 		ln := &bolt.Listener{
 			Server:    &bolt.Server{Handler: bh},
 			Addr:      *boltAddr,

@@ -29,6 +29,7 @@ package mvcc
 
 import (
 	"sync"
+	"time"
 
 	"github.com/tamnd/gr/value"
 )
@@ -89,13 +90,20 @@ type Oracle struct {
 	mu   sync.Mutex
 	seq  Seq
 	next uint64
-	live map[uint64]Seq // snapshot id -> read sequence
+	live map[uint64]liveSnap // snapshot id -> live snapshot record
+}
+
+// liveSnap records a live snapshot's read sequence and the wall-clock instant it began, so the oracle
+// can report both the watermark (over read sequences) and the oldest snapshot's age (over begin times).
+type liveSnap struct {
+	read  Seq
+	begin time.Time
 }
 
 // NewOracle starts the clock at seq, the last durably committed sequence (the
 // engine passes the recovered change counter, so the clock continues monotonically).
 func NewOracle(seq Seq) *Oracle {
-	return &Oracle{seq: seq, live: map[uint64]Seq{}}
+	return &Oracle{seq: seq, live: map[uint64]liveSnap{}}
 }
 
 // Seq returns the current commit sequence.
@@ -122,7 +130,7 @@ func (o *Oracle) Begin() (id uint64, read Seq) {
 	defer o.mu.Unlock()
 	o.next++
 	id = o.next
-	o.live[id] = o.seq
+	o.live[id] = liveSnap{read: o.seq, begin: time.Now()}
 	return id, o.seq
 }
 
@@ -141,9 +149,9 @@ func (o *Oracle) Watermark() Seq {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	wm := o.seq
-	for _, r := range o.live {
-		if r < wm {
-			wm = r
+	for _, s := range o.live {
+		if s.read < wm {
+			wm = s.read
 		}
 	}
 	return wm
@@ -157,12 +165,32 @@ func (o *Oracle) WatermarkLag() uint64 {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	wm := o.seq
-	for _, r := range o.live {
-		if r < wm {
-			wm = r
+	for _, s := range o.live {
+		if s.read < wm {
+			wm = s.read
 		}
 	}
 	return o.seq - wm
+}
+
+// OldestSnapshotAge returns the wall-clock age of the oldest live snapshot, or zero when none is live
+// (doc 20 §5.1). It is the long-reader signal in time rather than in versions: a snapshot whose age
+// keeps climbing is pinning the watermark and bloating the version store, and a reader left open across
+// a maintenance window shows here as a steadily rising age. Begin stamps each snapshot's start, so this
+// is the gap between now and the earliest such stamp still live.
+func (o *Oracle) OldestSnapshotAge() time.Duration {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	var oldest time.Time
+	for _, s := range o.live {
+		if oldest.IsZero() || s.begin.Before(oldest) {
+			oldest = s.begin
+		}
+	}
+	if oldest.IsZero() {
+		return 0
+	}
+	return time.Since(oldest)
 }
 
 // --- the retention overlay ---

@@ -212,6 +212,14 @@ func (e *DiskEngine) GCStats() (runs, reclaimedNode, reclaimedRel uint64) {
 // engine lock; the write path takes the engine lock then the oracle lock, so there is no inversion.
 func (e *DiskEngine) WatermarkLag() int64 { return int64(e.oracle.WatermarkLag()) }
 
+// OldestSnapshotAgeSeconds returns the whole-second age of the oldest live snapshot, or zero when none
+// is live (doc 20 §5.1), for the gr_mvcc_oldest_snapshot_age_seconds gauge. Like WatermarkLag it reads
+// only the oracle's own lock, so the metrics path is safe to call it while a writer holds the engine
+// lock; the result is truncated to seconds since the gauge reports a coarse age for long readers.
+func (e *DiskEngine) OldestSnapshotAgeSeconds() int64 {
+	return int64(e.oracle.OldestSnapshotAge().Seconds())
+}
+
 // load (re)builds the store handles over the current pager state, creating the
 // stores when fresh and opening them otherwise. It is also used to rebuild state
 // after a rollback. It does not touch the oracle or overlay, which outlive a

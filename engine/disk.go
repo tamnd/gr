@@ -717,6 +717,12 @@ func (e *DiskEngine) BufferPoolStats() pager.PoolStats { return e.p.PoolStats() 
 // engine lock.
 func (e *DiskEngine) WALStats() wal.Stats { return e.p.WALStats() }
 
+// DrainWALFsyncDurations returns and clears the WAL's per-fsync durations in seconds buffered since the
+// last drain (doc 20 §5.2), the samples the metrics path observes into the fsync-latency histogram. It
+// forwards to the pager and on to the WAL, which takes only its own small buffer lock, never the engine
+// lock, so the metrics snapshot path drains it freely even while a write transaction holds the engine lock.
+func (e *DiskEngine) DrainWALFsyncDurations() []float64 { return e.p.DrainWALFsyncDurations() }
+
 // Close releases the engine and its pager.
 func (e *DiskEngine) Close() error {
 	e.mu.Lock()

@@ -15,7 +15,9 @@ package wal
 import (
 	"errors"
 	"hash/crc32"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/tamnd/gr/format"
 	"github.com/tamnd/gr/vfs"
@@ -64,6 +66,19 @@ type WAL struct {
 	framesCommit atomic.Uint64
 	sizeBytes    atomic.Uint64
 
+	// fsync observability (doc 20 §5.2). Every fsync the WAL issues, at commit and at reset, runs
+	// through syncFile so these stay in step. fsyncTotal is the cumulative fsync count, the durable
+	// barrier count a commit amortizes against; fsyncErrors counts fsyncs that returned an error, any
+	// nonzero value a durability alarm. The per-call durations cannot be delta-mirrored the way a
+	// counter can, so they are buffered under fsyncDurMu and the metrics sync step drains the buffer
+	// into the fsync-latency histogram, the same drain-queue shape the version-GC duration uses. The
+	// counters are atomics read lock-free off the snapshot path; the buffer's lock is a leaf lock the
+	// writer takes under the engine write lock and the metrics path takes alone, so neither inverts.
+	fsyncTotal     atomic.Uint64
+	fsyncErrors    atomic.Uint64
+	fsyncDurMu     sync.Mutex
+	fsyncDurations []float64
+
 	crcTab *crc32.Table
 }
 
@@ -74,17 +89,59 @@ type Stats struct {
 	FramesPage   uint64
 	FramesCommit uint64
 	SizeBytes    uint64
+	FsyncTotal   uint64
+	FsyncErrors  uint64
 }
 
 // Stats returns the WAL's cumulative write counters and current size, each a lock-free atomic load, so
-// the metrics path reads them without taking any WAL or engine lock (doc 20 §5.2).
+// the metrics path reads them without taking any WAL or engine lock (doc 20 §5.2). The fsync durations
+// are not here: a histogram needs each sample, so they are drained separately by DrainFsyncDurations.
 func (w *WAL) Stats() Stats {
 	return Stats{
 		BytesWritten: w.bytesWritten.Load(),
 		FramesPage:   w.framesPage.Load(),
 		FramesCommit: w.framesCommit.Load(),
 		SizeBytes:    w.sizeBytes.Load(),
+		FsyncTotal:   w.fsyncTotal.Load(),
+		FsyncErrors:  w.fsyncErrors.Load(),
 	}
+}
+
+// DrainFsyncDurations returns the fsync durations in seconds buffered since the last drain and clears
+// the buffer (doc 20 §5.2). The metrics sync step calls it on a scrape and observes each sample into
+// the fsync-latency histogram exactly once. It takes only the buffer's leaf lock, never the engine
+// lock, so a long-held write transaction cannot deadlock a snapshot. A nil return means no fsync ran
+// since the last drain.
+func (w *WAL) DrainFsyncDurations() []float64 {
+	w.fsyncDurMu.Lock()
+	defer w.fsyncDurMu.Unlock()
+	if len(w.fsyncDurations) == 0 {
+		return nil
+	}
+	out := w.fsyncDurations
+	w.fsyncDurations = nil
+	return out
+}
+
+// syncFile fsyncs the WAL file, counting and timing the call for the fsync metrics (doc 20 §5.2).
+// Every Sync the WAL issues, at commit in Append and at Reset, goes through here so the fsync count,
+// the latency samples, and the error count stay in step. The duration is recorded whether or not the
+// fsync succeeded, since a failed barrier still cost wall-clock time; a nonzero error count is a
+// durability alarm and the caller turns the error fatal. It runs under the engine write lock, so the
+// buffer append is uncontended; the counters are atomics a snapshot reads lock-free.
+func (w *WAL) syncFile() error {
+	start := time.Now()
+	err := w.f.Sync()
+	dur := time.Since(start).Seconds()
+	w.fsyncTotal.Add(1)
+	w.fsyncDurMu.Lock()
+	w.fsyncDurations = append(w.fsyncDurations, dur)
+	w.fsyncDurMu.Unlock()
+	if err != nil {
+		w.fsyncErrors.Add(1)
+		return err
+	}
+	return nil
 }
 
 // publishSize republishes the current on-disk WAL size for the size gauge, called after every append
@@ -186,7 +243,7 @@ func (w *WAL) Append(frames []Frame, commit bool, dbPages uint64) (uint64, error
 	}
 	w.publishSize()
 	if commit && w.sync >= SyncNormal {
-		if err := w.f.Sync(); err != nil {
+		if err := w.syncFile(); err != nil {
 			return 0, err
 		}
 	}
@@ -234,7 +291,7 @@ func (w *WAL) Reset(newSalt uint64) error {
 	}
 	w.publishSize()
 	if w.sync >= SyncNormal {
-		return w.f.Sync()
+		return w.syncFile()
 	}
 	return nil
 }

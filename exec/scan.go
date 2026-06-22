@@ -1,6 +1,8 @@
 package exec
 
 import (
+	"time"
+
 	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/bind"
 	"github.com/tamnd/gr/engine"
@@ -234,6 +236,7 @@ func (o *expandOp) next() (eval.Row, bool, error) {
 		}
 		o.cur, o.queue, o.qpos = in, o.queue[:0], 0
 		dir := toEngineDir(o.spec.Dir)
+		estart := time.Now()
 		err = o.ctx.Tx.Expand(engine.NodeID(src), o.relTok, dir, func(nb engine.Neighbor) error {
 			o.ctx.countScan(1)
 			o.queue = append(o.queue, nb)
@@ -242,6 +245,7 @@ func (o *expandOp) next() (eval.Row, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
+		o.ctx.countExpand(o.relTok, dir, len(o.queue), time.Since(estart))
 	}
 }
 

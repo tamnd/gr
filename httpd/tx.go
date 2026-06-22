@@ -201,6 +201,9 @@ func (s *server) handleTxBegin(w http.ResponseWriter, r *http.Request, name stri
 		})
 		return
 	}
+	if !s.authorizeStatements(w, r, req.Statements) {
+		return
+	}
 	ctx, cancel := s.withTimeout(r.Context(), req.MaxExecutionTime)
 	defer cancel()
 
@@ -255,6 +258,9 @@ func (s *server) handleTxRun(w http.ResponseWriter, r *http.Request, id string) 
 		})
 		return
 	}
+	if !s.authorizeStatements(w, r, req.Statements) {
+		return
+	}
 	e, code := s.txns.acquire(id, principal(r), s.now())
 	if !s.checkAcquire(w, code) {
 		return
@@ -289,6 +295,9 @@ func (s *server) handleTxCommit(w http.ResponseWriter, r *http.Request, id strin
 			Code:    "Neo.ClientError.Request.InvalidFormat",
 			Message: "invalid JSON request body: " + err.Error(),
 		})
+		return
+	}
+	if !s.authorizeStatements(w, r, req.Statements) {
 		return
 	}
 	e, code := s.txns.acquire(id, principal(r), s.now())

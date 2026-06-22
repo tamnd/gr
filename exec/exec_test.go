@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"runtime"
 	"sort"
 	"testing"
 
@@ -279,6 +280,55 @@ func countOf(t *testing.T, e *engine.MemEngine, cypher string) int64 {
 		t.Fatalf("count %q: result %v is not an int", cypher, rows[0][cols[0]])
 	}
 	return n
+}
+
+// bigPersonGraph builds n :Person nodes whose age property is their index, enough
+// to cross the morsel-parallel threshold so a grouping-free aggregation over the
+// scan runs on the parallel path.
+func bigPersonGraph(t *testing.T, n int) *engine.MemEngine {
+	t.Helper()
+	e := engine.NewMemEngine()
+	tx, err := e.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		id, err := tx.CreateNode([]engine.Token{lblPerson})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx.SetNodeProperty(id, keyAge, value.Int(int64(i)))
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
+// TestParallelAggregateMatchesSerial drives the morsel-driven parallel aggregation
+// path: a grouping-free count / min / max over a scan large enough to split into
+// several morsels, with GOMAXPROCS forced above one so the parallel branch runs
+// whatever the host's core count. The answers must equal the known graph values,
+// which are exactly the serial answers (count, min, max are order-independent), so
+// a wrong morsel partition (an overlap or a gap) would change count. Every worker
+// reads the one shared snapshot, so the race detector must stay clean.
+func TestParallelAggregateMatchesSerial(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(4))
+	const n = 4096 // > 2*morselChunk, so several workers run
+	e := bigPersonGraph(t, n)
+
+	if got := countOf(t, e, "MATCH (n:Person) RETURN count(*)"); got != int64(n) {
+		t.Fatalf("count(*): got %d, want %d", got, n)
+	}
+	if got := countOf(t, e, "MATCH (n:Person) WHERE n.age >= 1000 RETURN count(*)"); got != int64(n-1000) {
+		t.Fatalf("filtered count: got %d, want %d", got, n-1000)
+	}
+	if got := countOf(t, e, "MATCH (n:Person) RETURN min(n.age)"); got != 0 {
+		t.Fatalf("min(n.age): got %d, want 0", got)
+	}
+	if got := countOf(t, e, "MATCH (n:Person) RETURN max(n.age)"); got != int64(n-1) {
+		t.Fatalf("max(n.age): got %d, want %d", got, n-1)
+	}
 }
 
 // TestFactorizedCountMatchesEnumeration checks the factorized count(*) over an

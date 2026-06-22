@@ -1123,6 +1123,36 @@ func TestMetricsCheckpointDeltaFolded(t *testing.T) {
 	}
 }
 
+func TestMetricsCheckpointPagesWritten(t *testing.T) {
+	db := openMem(t, "mxckptpages.gr")
+	defer db.Close()
+
+	// Before any checkpoint nothing has been written back by a fold.
+	if c := db.Metrics().Counter("gr_checkpoint_pages_written_total", nil); c != 0 {
+		t.Fatalf("pages written before any checkpoint = %d, want 0", c)
+	}
+
+	for i := 0; i < 50; i++ {
+		mustExec(t, db, "CREATE (:Person {note: 'value'})", nil)
+	}
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+
+	pages := db.Metrics().Counter("gr_checkpoint_pages_written_total", nil)
+	if pages == 0 {
+		t.Fatalf("pages written after a checkpoint = %d, want > 0", pages)
+	}
+
+	// A second checkpoint folds and commits again, so it writes back more pages and the cumulative
+	// counter advances past the first.
+	for i := 0; i < 50; i++ {
+		mustExec(t, db, "CREATE (:Person {note: 'more'})", nil)
+	}
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+	if again := db.Metrics().Counter("gr_checkpoint_pages_written_total", nil); again <= pages {
+		t.Fatalf("pages written after a second checkpoint = %d, want > %d", again, pages)
+	}
+}
+
 func TestMetricsMvccGC(t *testing.T) {
 	db := openMem(t, "mxgc.gr")
 	defer db.Close()

@@ -181,18 +181,20 @@ func (db *DB) syncCacheMemoryMetrics() {
 
 // syncCheckpointMetrics mirrors the engine's cumulative per-checkpoint work counts into the registry at
 // snapshot time (doc 20 §5.4): it advances gr_checkpoint_segments_rewritten_total{store} by the
-// segments the node and rel folds have rewritten and gr_checkpoint_delta_folded_total by the adjacency
-// delta entries the folds merged, both since the last sync. The engine owns the authoritative counts,
-// bumped under its lock at each checkpoint, so the checkpoint path never touches the registry for this;
-// the bridge runs only on a scrape. The delta add keeps each counter monotonic, and checkpointSegMu
-// serializes two concurrent scrapes so neither double-counts. Reading the totals is a lock-free atomic
-// load, never the engine lock, so a long-held write transaction cannot deadlock a snapshot.
+// segments the node and rel folds have rewritten, gr_checkpoint_delta_folded_total by the adjacency
+// delta entries the folds merged, and gr_checkpoint_pages_written_total by the page images the
+// checkpoints wrote back to the file, all since the last sync. The engine owns the authoritative
+// counts, bumped under its lock at each checkpoint, so the checkpoint path never touches the registry
+// for this; the bridge runs only on a scrape. The delta add keeps each counter monotonic, and
+// checkpointSegMu serializes two concurrent scrapes so neither double-counts. Reading the totals is a
+// lock-free atomic load, never the engine lock, so a long-held write transaction cannot deadlock a snapshot.
 func (db *DB) syncCheckpointMetrics() {
 	if db.eng == nil {
 		return
 	}
 	node, rel := db.eng.CheckpointSegmentsTotal()
 	folded := db.eng.CheckpointDeltaFoldedTotal()
+	pages := db.eng.CheckpointPagesWrittenTotal()
 	m := db.metrics
 	m.checkpointSegMu.Lock()
 	defer m.checkpointSegMu.Unlock()
@@ -207,6 +209,10 @@ func (db *DB) syncCheckpointMetrics() {
 	if c := m.checkpointDeltaFolded; c != nil && folded > m.lastCkptDeltaFolded {
 		c.Add(folded - m.lastCkptDeltaFolded)
 		m.lastCkptDeltaFolded = folded
+	}
+	if c := m.checkpointPagesWritten; c != nil && pages > m.lastCkptPagesWritten {
+		c.Add(pages - m.lastCkptPagesWritten)
+		m.lastCkptPagesWritten = pages
 	}
 }
 
@@ -522,8 +528,8 @@ type queryMetrics struct {
 	// gr_checkpoint_duration_seconds histogram, and checkpointLast the
 	// gr_checkpoint_last_timestamp_seconds gauge (doc 20 §5.4). The checkpoint runs under the engine
 	// write lock, so these are recorded directly on the checkpoint path, not mirrored at snapshot
-	// time. The remaining per-checkpoint work counter, pages written, waits on the WAL checkpoint
-	// reporting its page-writeback count; segments rewritten and delta edges folded are mirrored below.
+	// time. The per-checkpoint work counters (segments rewritten, delta edges folded, pages written
+	// back) are cumulative atomics the engine bumps under its lock and the sync step mirrors below.
 	checkpointTotal    map[string]*metric.Counter
 	checkpointDuration *metric.Histogram
 	checkpointLast     *metric.Gauge
@@ -545,6 +551,14 @@ type queryMetrics struct {
 	// same lock and bridge the segment counters use, and lastCkptDeltaFolded holds the last value.
 	checkpointDeltaFolded *metric.Counter
 	lastCkptDeltaFolded   uint64
+
+	// checkpointPagesWritten holds gr_checkpoint_pages_written_total, the page images checkpoints write
+	// back to the database file (doc 20 §5.4): the durable write-back volume a fold costs, beside the
+	// segments it rewrites and the delta it folds. The engine owns the authoritative cumulative count,
+	// bumped under its lock by the pager's write-back delta across each checkpoint; the sync step
+	// mirrors it delta-style under checkpointSegMu, and lastCkptPagesWritten holds the last value.
+	checkpointPagesWritten *metric.Counter
+	lastCkptPagesWritten   uint64
 
 	// gcRuns holds gr_mvcc_gc_runs_total and gcReclaimed gr_mvcc_gc_reclaimed_total keyed by element
 	// (doc 20 §5.1). The engine owns the authoritative cumulative totals, bumped under its lock when
@@ -720,6 +734,8 @@ func newQueryMetrics() *queryMetrics {
 	}
 	m.checkpointDeltaFolded = reg.Counter("gr_checkpoint_delta_folded_total",
 		"Adjacency delta entries folded into the base CSR by checkpoints", "entries", nil)
+	m.checkpointPagesWritten = reg.Counter("gr_checkpoint_pages_written_total",
+		"Page images written back to the database file by checkpoints", "pages", nil)
 	m.gcRuns = reg.Counter("gr_mvcc_gc_runs_total",
 		"Version-GC passes executed", "runs", nil)
 	m.gcReclaimed = make(map[string]*metric.Counter, len(metricMvccElements))

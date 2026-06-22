@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/tamnd/gr/vfs"
 )
@@ -351,6 +352,43 @@ func TestMetricsPlanCacheEviction(t *testing.T) {
 	}
 	if e := snap.Gauge("gr_plan_cache_entries", nil); e != 1 {
 		t.Errorf("resident plans = %d, want 1 (cache holds one)", e)
+	}
+}
+
+// TestMetricsAdmissionQueued confirms the admission gate's queue wait lands in the database
+// metrics once wired: an immediate acquire queues nothing, a second acquire against a full gate
+// queues and is counted with its wait observed (doc 20 §3.1).
+func TestMetricsAdmissionQueued(t *testing.T) {
+	db, err := Open("madm.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	a := NewAdmission(1, 20*time.Millisecond)
+	db.InstrumentAdmission(a)
+
+	// The first acquire takes the only slot at once, so it does not queue.
+	rel, err := a.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q := db.Metrics().Counter("gr_query_queued_total", nil); q != 0 {
+		t.Errorf("queued after an immediate acquire = %d, want 0", q)
+	}
+
+	// The gate is full, so the second acquire queues for the wait and then sheds.
+	if _, err := a.Acquire(context.Background()); !errors.Is(err, ErrOverloaded) {
+		t.Fatalf("second acquire = %v, want ErrOverloaded", err)
+	}
+	rel()
+
+	snap := db.Metrics()
+	if q := snap.Counter("gr_query_queued_total", nil); q != 1 {
+		t.Errorf("queued = %d, want 1 (the second acquire waited)", q)
+	}
+	if h := snap.Histogram("gr_query_queue_wait_seconds", nil); h.Count != 1 {
+		t.Errorf("queue wait count = %d, want 1", h.Count)
 	}
 }
 

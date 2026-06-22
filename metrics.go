@@ -139,6 +139,9 @@ type queryMetrics struct {
 	cacheLookups       map[string]*metric.Counter // gr_plan_cache_lookups_total by [result]
 	cacheEvictions     map[string]*metric.Counter // gr_plan_cache_evictions_total by [reason]
 	cacheInvalidations map[string]*metric.Counter // gr_plan_cache_invalidations_total by [cause]
+
+	queued    *metric.Counter   // gr_query_queued_total (queries that waited for admission)
+	queueWait *metric.Histogram // gr_query_queue_wait_seconds (admission queue wait time)
 }
 
 // newQueryMetrics builds the registry and pre-resolves every query-metric handle (doc 20
@@ -198,6 +201,10 @@ func newQueryMetrics() *queryMetrics {
 			"Time spent in the executor only, by kind, excluding parse and plan", "seconds",
 			queryLatencyBuckets, metric.Labels{"kind": k})
 	}
+	m.queued = reg.Counter("gr_query_queued_total",
+		"Queries that waited in the admission queue before executing", "queries", nil)
+	m.queueWait = reg.Histogram("gr_query_queue_wait_seconds",
+		"Time a query waited in the admission queue before starting", "seconds", queryLatencyBuckets, nil)
 	m.returned = reg.Histogram("gr_query_rows_returned",
 		"Rows in the result set, the output cardinality", "rows", rowCountBuckets, nil)
 	m.scanned = reg.Histogram("gr_query_rows_scanned",
@@ -263,6 +270,20 @@ func (m *queryMetrics) recordCacheEviction(reason string) {
 func (m *queryMetrics) recordCacheInvalidation(cause string) {
 	if c := m.cacheInvalidations[cause]; c != nil {
 		c.Inc()
+	}
+}
+
+// recordQueued records that a query waited in the admission queue for wait before it was admitted
+// or shed (doc 20 §3.1, §18.3): it counts the query in gr_query_queued_total and observes the
+// wait in gr_query_queue_wait_seconds. A query that found a free slot at once does not call this,
+// so a nonzero queued rate is the saturation signal, the server queueing or shedding under load,
+// distinct from a query that is merely slow to execute.
+func (m *queryMetrics) recordQueued(wait time.Duration) {
+	if m.queued != nil {
+		m.queued.Inc()
+	}
+	if m.queueWait != nil {
+		m.queueWait.Observe(wait.Seconds())
 	}
 }
 

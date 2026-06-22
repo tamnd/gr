@@ -97,6 +97,9 @@ func (db *DB) BoltHandler(opts ...BoltOption) bolt.Handler {
 	for _, o := range opts {
 		o(h)
 	}
+	// Wire the admission gate to the database's queue-wait metrics, so a Bolt query that waits
+	// for a slot is counted in gr_query_queued_total (doc 20 §3.1). A nil gate is a no-op.
+	db.InstrumentAdmission(h.admission)
 	return h
 }
 

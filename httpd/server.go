@@ -124,6 +124,10 @@ func New(db *gr.DB, opts Options) *Server {
 		clock = time.Now
 	}
 	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics(), admission: opts.Admission, queryMaxTime: opts.QueryMaxTime, limiter: opts.RateLimiter, qlog: opts.QueryLog, elog: opts.EventLog, impersonation: opts.Impersonation}
+	// Wire the shared admission gate to the database's queue-wait metrics, so a query that waits
+	// for a slot is counted in gr_query_queued_total on the same registry /metrics renders (doc
+	// 20 §3.1). A nil gate (admission disabled) is a no-op.
+	db.InstrumentAdmission(opts.Admission)
 	if opts.Auth != nil {
 		ttl := opts.TokenCacheTTL
 		if ttl == 0 {

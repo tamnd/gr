@@ -192,6 +192,7 @@ func importNodes(db *gr.DB, opt importOptions, r io.Reader) (importResult, error
 	if err != nil {
 		return importResult{}, err
 	}
+	header = opt.applyTypedHeader(header)
 
 	ctx := context.Background()
 	var res importResult
@@ -269,6 +270,7 @@ func importRels(db *gr.DB, opt importOptions, r io.Reader) (importResult, error)
 		return importResult{}, err
 	}
 
+	header = opt.applyTypedHeader(header)
 	plan, err := opt.relPlan(header)
 	if err != nil {
 		return importResult{}, err
@@ -547,6 +549,54 @@ func (opt importOptions) nodeStatement(header, row []string) (string, gr.Params)
 		params[p] = v
 	}
 	return fmt.Sprintf("CREATE (n%s {%s})", labels.String(), strings.Join(assigns, ", ")), params
+}
+
+// applyTypedHeader rewrites a header that carries neo4j-admin-style type annotations
+// (doc 19 §6.1): a cell like "born:int" declares the property "born" of type integer.
+// It returns the bare property names and registers each declared type in opt.types when
+// no explicit --type already set it (so --type wins). A header is untyped if it carries
+// no recognized type, in which case the cell is the property name verbatim. opt.types is
+// a map, so writing through this value receiver persists to the caller.
+func (opt importOptions) applyTypedHeader(header []string) []string {
+	if header == nil {
+		return nil
+	}
+	out := make([]string, len(header))
+	for i, cell := range header {
+		name, typ, typed := splitTypedHeader(cell)
+		out[i] = name
+		if typed && typ != "" {
+			if _, set := opt.types[name]; !set {
+				opt.types[name] = typ
+			}
+		}
+	}
+	return out
+}
+
+// splitTypedHeader parses one header cell as an optional "name:type" annotation (doc 19
+// §6.1, §6.2). It returns the bare name, the coercion type for the row path (empty for
+// types this path stores as a string), and whether the cell was a recognized type
+// annotation. A cell with no colon, an empty name (a neo4j special column such as :ID,
+// out of scope here), or an unrecognized type is kept verbatim as the name.
+func splitTypedHeader(cell string) (name, coerceType string, typed bool) {
+	n, typ, ok := strings.Cut(cell, ":")
+	if !ok || n == "" {
+		return cell, "", false
+	}
+	base := strings.TrimSuffix(typ, "[]") // tolerate a list suffix; the row path stores it as text
+	switch strings.ToLower(base) {
+	case "int", "long", "short", "byte":
+		return n, "INTEGER", true
+	case "float", "double":
+		return n, "FLOAT", true
+	case "boolean", "bool":
+		return n, "BOOLEAN", true
+	case "string", "char", "date", "datetime", "localdatetime", "time", "localtime", "duration", "point":
+		return n, "", true // recognized, but stored as a string until the value model carries the type
+	default:
+		return cell, "", false
+	}
 }
 
 // columnName returns the name of column i: the header name when present, else a

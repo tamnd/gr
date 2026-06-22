@@ -16,16 +16,17 @@ import (
 // one of nodes, rels, or query selects the source; to names the output file ("-" for
 // stdout); format and the delimited settings shape the file.
 type exportOptions struct {
-	nodes     string // --nodes LABEL
-	rels      string // --rels TYPE
-	query     string // --query CYPHER
-	to        string // --to FILE ("-" for stdout)
-	format    string // csv|tsv (inferred from the extension when empty)
-	header    bool
-	separator string
-	idCol     string // the emitted node id column name (default _id)
-	fromProp  string // --from-property: emit this start-node property as _start (relink)
-	toProp    string // --to-property: emit this end-node property as _end (relink)
+	nodes       string // --nodes LABEL
+	rels        string // --rels TYPE
+	query       string // --query CYPHER
+	to          string // --to FILE ("-" for stdout)
+	format      string // csv|tsv (inferred from the extension when empty)
+	header      bool
+	separator   string
+	idCol       string // the emitted node id column name (default _id)
+	fromProp    string // --from-property: emit this start-node property as _start (relink)
+	toProp      string // --to-property: emit this end-node property as _end (relink)
+	typedHeader bool   // --typed-header: annotate property headers with their types (name:type)
 }
 
 // parseExportArgs parses the export flags shared by the dot-command and the subcommand
@@ -62,6 +63,8 @@ func parseExportArgs(args []string) (exportOptions, error) {
 			opt.fromProp, err = next()
 		case "--to-property":
 			opt.toProp, err = next()
+		case "--typed-header":
+			opt.typedHeader = true
 		case "--header":
 			opt.header = true
 		case "--no-header":
@@ -91,6 +94,9 @@ func parseExportArgs(args []string) (exportOptions, error) {
 	}
 	if (opt.fromProp != "" || opt.toProp != "") && opt.rels == "" {
 		return opt, fmt.Errorf("--from-property and --to-property apply to --rels only")
+	}
+	if opt.typedHeader && opt.query != "" {
+		return opt, fmt.Errorf("--typed-header applies to --nodes or --rels, not --query")
 	}
 	opt.format = resolveFormat(opt.format, opt.to)
 	if opt.format != "csv" && opt.format != "tsv" {
@@ -212,18 +218,14 @@ func exportQuery(tx *gr.Tx, query, format string, header bool, sep string, w io.
 // once to settle the columns, then once to write the rows.
 func exportNodes(tx *gr.Tx, opt exportOptions, d *delimited) (int, error) {
 	q := "MATCH (n:" + quoteIdent(opt.nodes) + ") RETURN n"
-	keys, err := collectKeys(tx, q, func(r *gr.Record) ([]string, error) {
-		n, err := r.GetNode("n")
-		if err != nil {
-			return nil, err
-		}
-		return n.Keys(), nil
+	keys, types, err := collectKeys(tx, q, func(r *gr.Record) (map[string]gr.Value, error) {
+		return nodeProps(r, "n")
 	})
 	if err != nil {
 		return 0, err
 	}
 	if opt.header {
-		d.writeRow(append([]string{opt.idCol}, keys...))
+		d.writeRow(append([]string{opt.idCol}, opt.headerKeys(keys, types)...))
 	}
 	r, err := tx.Run(context.Background(), q, nil)
 	if err != nil {
@@ -257,18 +259,14 @@ func exportNodes(tx *gr.Tx, opt exportOptions, d *delimited) (int, error) {
 func exportRels(tx *gr.Tx, opt exportOptions, d *delimited) (int, error) {
 	relink := opt.fromProp != "" && opt.toProp != ""
 	keyQ := "MATCH ()-[r:" + quoteIdent(opt.rels) + "]->() RETURN r"
-	keys, err := collectKeys(tx, keyQ, func(rec *gr.Record) ([]string, error) {
-		rel, err := rec.GetRelationship("r")
-		if err != nil {
-			return nil, err
-		}
-		return rel.Keys(), nil
+	keys, types, err := collectKeys(tx, keyQ, func(rec *gr.Record) (map[string]gr.Value, error) {
+		return relProps(rec, "r")
 	})
 	if err != nil {
 		return 0, err
 	}
 	if opt.header {
-		d.writeRow(append([]string{"_start", "_end"}, keys...))
+		d.writeRow(append([]string{"_start", "_end"}, opt.headerKeys(keys, types)...))
 	}
 	q := keyQ
 	if relink {
@@ -320,33 +318,99 @@ func endpointProps(rec *gr.Record, opt exportOptions) (string, string, error) {
 }
 
 // collectKeys scans a query once and returns the sorted union of the property keys the
-// extractor pulls from each record, so the export emits a stable column set even when
-// elements carry different property sets.
-func collectKeys(tx *gr.Tx, query string, keysOf func(*gr.Record) ([]string, error)) ([]string, error) {
+// extractor pulls from each record, plus a representative type per key (the first
+// non-null value's type, doc 19 §6.2), so the export emits a stable column set and can
+// annotate it when --typed-header is set.
+func collectKeys(tx *gr.Tx, query string, valuesOf func(*gr.Record) (map[string]gr.Value, error)) ([]string, map[string]string, error) {
 	r, err := tx.Run(context.Background(), query, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = r.Close() }()
 	seen := map[string]struct{}{}
+	types := map[string]string{}
 	for r.Next() {
-		ks, err := keysOf(r.Record())
+		props, err := valuesOf(r.Record())
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		for _, k := range ks {
+		for k, v := range props {
 			seen[k] = struct{}{}
+			if _, ok := types[k]; !ok && v != nil {
+				types[k] = typeToken(v)
+			}
 		}
 	}
 	if err := r.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	keys := make([]string, 0, len(seen))
 	for k := range seen {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	return keys, nil
+	return keys, types, nil
+}
+
+// typeToken names the neo4j-admin header type for a value (doc 19 §6.2), the inverse of
+// the import's splitTypedHeader. It covers the scalar types the row path carries;
+// anything else is written as a string.
+func typeToken(v gr.Value) string {
+	switch v.(type) {
+	case int, int8, int16, int32, int64:
+		return "long"
+	case float32, float64:
+		return "double"
+	case bool:
+		return "boolean"
+	default:
+		return "string"
+	}
+}
+
+// headerKeys builds the header property cells, appending ":type" to each when
+// --typed-header is set so the file re-imports with its types without --type.
+func (opt exportOptions) headerKeys(keys []string, types map[string]string) []string {
+	if !opt.typedHeader {
+		return keys
+	}
+	out := make([]string, len(keys))
+	for i, k := range keys {
+		if t := types[k]; t != "" {
+			out[i] = k + ":" + t
+		} else {
+			out[i] = k
+		}
+	}
+	return out
+}
+
+// nodeProps returns a node's properties as a map for the column-collection scan.
+func nodeProps(rec *gr.Record, key string) (map[string]gr.Value, error) {
+	n, err := rec.GetNode(key)
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]gr.Value, len(n.Keys()))
+	for _, k := range n.Keys() {
+		v, _ := n.Get(k)
+		m[k] = v
+	}
+	return m, nil
+}
+
+// relProps returns a relationship's properties as a map for the column-collection scan.
+func relProps(rec *gr.Record, key string) (map[string]gr.Value, error) {
+	rel, err := rec.GetRelationship(key)
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]gr.Value, len(rel.Keys()))
+	for _, k := range rel.Keys() {
+		v, _ := rel.Get(k)
+		m[k] = v
+	}
+	return m, nil
 }
 
 // dotExport writes the graph or a query result to a file (doc 17 §6.11). It is the

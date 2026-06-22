@@ -181,6 +181,46 @@ func (db *DB) Path() string { return db.path }
 // PageSize returns the file's page size in bytes.
 func (db *DB) PageSize() uint32 { return db.eng.PageSize() }
 
+// IndexInfo describes a schema index with its label and property names resolved (doc
+// 16 §11, doc 17 §6.5). It is the engine's IndexInfo re-exported so a caller listing
+// the schema does not import the engine package.
+type IndexInfo = engine.IndexInfo
+
+// Labels returns every node label the catalog holds, in interning order (doc 16 §11).
+// These are the names the database has ever seen, the schema-introspection surface the
+// CLI's .labels command and a program's schema browser read.
+func (db *DB) Labels() ([]string, error) {
+	if db.eng == nil {
+		return nil, ErrClosed
+	}
+	return db.eng.Labels(), nil
+}
+
+// RelationshipTypes returns every relationship type the catalog holds (doc 16 §11).
+func (db *DB) RelationshipTypes() ([]string, error) {
+	if db.eng == nil {
+		return nil, ErrClosed
+	}
+	return db.eng.RelationshipTypes(), nil
+}
+
+// PropertyKeys returns every property key the catalog holds (doc 16 §11).
+func (db *DB) PropertyKeys() ([]string, error) {
+	if db.eng == nil {
+		return nil, ErrClosed
+	}
+	return db.eng.PropertyKeys(), nil
+}
+
+// Indexes returns the schema indexes with their label and property names resolved
+// (doc 16 §11).
+func (db *DB) Indexes() ([]IndexInfo, error) {
+	if db.eng == nil {
+		return nil, ErrClosed
+	}
+	return db.eng.IndexInfos(), nil
+}
+
 // Query runs a Cypher read query against a snapshot of the database and returns a
 // streaming result. It threads the whole read pipeline: the text is parsed to an
 // AST ([parse]), bound against the catalog ([bind]), planned into a logical

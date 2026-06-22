@@ -496,6 +496,84 @@ func TestMetricsGraphOperators(t *testing.T) {
 	}
 }
 
+// TestMetricsExpand confirms the per-type expand metrics record a source position expanded: the
+// operation and neighbor counters labelled by type and direction, and the fan-out and time
+// histograms labelled by type (doc 20 §6.1). The query anchors at one node and expands its two
+// KNOWS edges, so the counts are exact.
+func TestMetricsExpand(t *testing.T) {
+	db, err := Open("mexp.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	if _, err := db.Run(ctx, "CREATE (a:Person {n: 'a'})-[:KNOWS]->(:Person {n: 'b'})", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Run(ctx,
+		"MATCH (a:Person {n: 'a'}) CREATE (a)-[:KNOWS]->(:Person {n: 'c'})", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := db.Run(ctx, "MATCH (a:Person {n: 'a'})-[:KNOWS]->(x) RETURN x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainResult(t, r)
+
+	out := Labels{"type": "KNOWS", "dir": "out"}
+	if c := db.Metrics().Counter("gr_expand_total", out); c != 1 {
+		t.Errorf("expand operations = %d, want 1", c)
+	}
+	if c := db.Metrics().Counter("gr_expand_neighbors_total", out); c != 2 {
+		t.Errorf("expand neighbors = %d, want 2", c)
+	}
+	fan := db.Metrics().Histogram("gr_expand_fanout", Labels{"type": "KNOWS"})
+	if fan.Count != 1 {
+		t.Errorf("fan-out observations = %d, want 1", fan.Count)
+	}
+	if fan.Sum != 2 {
+		t.Errorf("fan-out sum = %v, want 2", fan.Sum)
+	}
+	if s := db.Metrics().Histogram("gr_expand_seconds", Labels{"type": "KNOWS"}); s.Count != 1 {
+		t.Errorf("expand time observations = %d, want 1", s.Count)
+	}
+}
+
+// TestMetricsExpandWildcard confirms an expand with no named type is attributed to the all-types
+// bucket: the type label is "*" rather than a relationship-type name (doc 20 §6.1).
+func TestMetricsExpandWildcard(t *testing.T) {
+	db, err := Open("mexpw.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	if _, err := db.Run(ctx, "CREATE (a:Person {n: 'a'})-[:KNOWS]->(:Person {n: 'b'})", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := db.Run(ctx, "MATCH (a:Person {n: 'a'})-->(x) RETURN x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainResult(t, r)
+
+	// A typeless expand is attributed to the all-types bucket. The planner is free to pick the
+	// expand direction, so sum the wildcard series across directions rather than assume one.
+	var wildcard uint64
+	for _, s := range db.Metrics().Metrics() {
+		if s.Name == "gr_expand_total" && s.Labels["type"] == "*" {
+			wildcard += s.Counter
+		}
+	}
+	if wildcard == 0 {
+		t.Error("wildcard expand operations = 0, want at least one all-types expand")
+	}
+}
+
 // TestMetricsWcoj confirms the worst-case-optimal-join counter increments when the cost model
 // rewrites a triangle's closing expand into an Intersect. The rewrite only engages with a
 // non-trivial average degree, so the graph is seeded dense enough to make the binary plan's

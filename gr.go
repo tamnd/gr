@@ -211,6 +211,10 @@ func Open(path string, opt Options) (*DB, error) {
 	db.cache.OnEvict = func(reason string) { db.metrics.recordCacheEviction(reason) }
 	db.metrics.reg.ComputedGauge("gr_plan_cache_entries",
 		"Cached plans currently resident", "plans", nil, func() int64 { return int64(db.cache.Len()) })
+	// The expand metrics label by relationship-type name, so the observer needs the catalog's
+	// token-to-name resolver (doc 20 §6.1). Wire it now the engine exists; an expand before this
+	// would fall back to the all-types bucket, but no query runs during Open.
+	db.metrics.relTypeName = db.tokenNamer(catalog.KindRelType)
 	// The open event reports the file's real geometry and whether this open recovered a
 	// committed WAL prefix after a crash (doc 20 §11.3). StorageInfo reads the header the
 	// engine just mounted, so the format version and page size are the file's own.

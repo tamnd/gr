@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -81,6 +82,16 @@ var queryLatencyBuckets = []float64{
 // scan work an operator reads span the orders of magnitude a graph query ranges over. A query
 // that touches no rows lands in the first bucket; the +Inf catch-all is added by the histogram.
 var rowCountBuckets = []float64{1, 10, 100, 1000, 10000, 100000, 1000000, 10000000}
+
+// expandFanoutBuckets is the bucket layout for gr_expand_fanout (doc 20 §6.1), the per-source
+// neighbor count. It is finer than rowCountBuckets at the low end, where most expands sit, and
+// reaches the millions so a supernode's fan-out lands in a distinct high bucket rather than
+// saturating the top one: the gap between a p50 of a few and a p999 in the millions is the
+// supernode signal the histogram exists to show (§16.1).
+var expandFanoutBuckets = []float64{
+	1, 2, 4, 8, 16, 32, 64, 128, 256, 512,
+	1024, 4096, 16384, 65536, 262144, 1048576, 4194304,
+}
 
 // metricQueryKinds is the bounded domain of the kind label on the query metrics (doc 20 §3.1,
 // §7.2): the statement classes a query falls into. The handles for every kind are pre-resolved
@@ -168,6 +179,36 @@ type queryMetrics struct {
 	shortestPath *metric.Counter // gr_shortest_path_total
 	wcoj         *metric.Counter // gr_wcoj_total
 	binaryJoin   *metric.Counter // gr_binary_join_total
+
+	// relTypeName resolves a relationship-type token to its name for the expand metrics' type
+	// label. It is wired at Open once the engine exists; until then it is nil and an expand is
+	// attributed to the all-types bucket. The expand metrics are labelled by type, so a token
+	// that does not resolve (the all-types wildcard, or an unknown token) falls back to "*".
+	relTypeName func(engine.Token) (string, bool)
+	// expandHandles caches the per-(type,dir) metric handles for the expand operator, keyed by
+	// expandKey. Resolving a handle takes a registry lock and a label-map build, too much for the
+	// per-source expand hot path, so the first expand of a (type,dir) resolves and stores the four
+	// handles and every later one is a lock-free load. The key space is bounded by the schema's
+	// relationship types times three directions, so the cache stays small (§7.2).
+	expandHandles sync.Map // expandKey -> *expandHandles
+}
+
+// expandKey identifies the metric handles for one expand shape: the operator's type token (zero
+// for an expand of every type) and its direction. Both are small integers, so the key is
+// comparable and cheap as a sync.Map key.
+type expandKey struct {
+	tok engine.Token
+	dir engine.Direction
+}
+
+// expandHandles holds the four expand metric series for one (type,dir). total and neighbors carry
+// both labels; fanout and seconds are labelled by type only, so the registry hands back the same
+// pointer for the in and out directions of one type and the per-direction entries share them.
+type expandHandles struct {
+	total     *metric.Counter
+	neighbors *metric.Counter
+	fanout    *metric.Histogram
+	seconds   *metric.Histogram
 }
 
 // newQueryMetrics builds the registry and pre-resolves every query-metric handle (doc 20
@@ -543,6 +584,69 @@ func (g graphObserver) WCOJ() {
 func (g graphObserver) BinaryJoin() {
 	if g.m.binaryJoin != nil {
 		g.m.binaryJoin.Inc()
+	}
+}
+
+func (g graphObserver) Expand(relType engine.Token, dir engine.Direction, fanout int, dur time.Duration) {
+	g.m.recordExpand(relType, dir, fanout, dur)
+}
+
+// recordExpand records one source position expanded (doc 20 §6.1): it bumps the per-(type,dir)
+// expand and neighbor counters and observes the fan-out and the time the engine took. The handles
+// are resolved once per (type,dir) and cached, so the steady-state cost is a sync.Map load and
+// four atomic updates.
+func (m *queryMetrics) recordExpand(relType engine.Token, dir engine.Direction, fanout int, dur time.Duration) {
+	h := m.expandHandlesFor(relType, dir)
+	h.total.Inc()
+	if fanout > 0 {
+		h.neighbors.Add(uint64(fanout))
+	}
+	h.fanout.Observe(float64(fanout))
+	h.seconds.Observe(dur.Seconds())
+}
+
+// expandHandlesFor returns the cached expand handles for a (type,dir), resolving and registering
+// them on the first call for that key. The type label is the relationship-type name, or "*" when
+// the operator expands every type or the token does not resolve; the dir label is out, in, or
+// both.
+func (m *queryMetrics) expandHandlesFor(relType engine.Token, dir engine.Direction) *expandHandles {
+	key := expandKey{tok: relType, dir: dir}
+	if v, ok := m.expandHandles.Load(key); ok {
+		return v.(*expandHandles)
+	}
+	typeLabel := "*"
+	if relType != 0 && m.relTypeName != nil {
+		if name, ok := m.relTypeName(relType); ok {
+			typeLabel = name
+		}
+	}
+	dirLabel := metricExpandDir(dir)
+	h := &expandHandles{
+		total: m.reg.Counter("gr_expand_total",
+			"Expand operations, one per source position expanded, by type and direction", "expands",
+			metric.Labels{"type": typeLabel, "dir": dirLabel}),
+		neighbors: m.reg.Counter("gr_expand_neighbors_total",
+			"Neighbors produced by expands, by type and direction", "neighbors",
+			metric.Labels{"type": typeLabel, "dir": dirLabel}),
+		fanout: m.reg.Histogram("gr_expand_fanout",
+			"Per-expand fan-out, the neighbors one source produced; its tail is the supernode signal",
+			"neighbors", expandFanoutBuckets, metric.Labels{"type": typeLabel}),
+		seconds: m.reg.Histogram("gr_expand_seconds",
+			"Time per expand, by type", "seconds", queryLatencyBuckets, metric.Labels{"type": typeLabel}),
+	}
+	actual, _ := m.expandHandles.LoadOrStore(key, h)
+	return actual.(*expandHandles)
+}
+
+// metricExpandDir maps an engine direction to the dir label on the expand metrics (doc 20 §6.1).
+func metricExpandDir(dir engine.Direction) string {
+	switch dir {
+	case engine.Outgoing:
+		return "out"
+	case engine.Incoming:
+		return "in"
+	default:
+		return "both"
 	}
 }
 

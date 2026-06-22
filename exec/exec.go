@@ -24,6 +24,7 @@ package exec
 import (
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/tamnd/gr/bind"
 	"github.com/tamnd/gr/engine"
@@ -91,6 +92,12 @@ type GraphObserver interface {
 	WCOJ()
 	// BinaryJoin reports that a binary hash join (tree-pattern join) executed (§6.3).
 	BinaryJoin()
+	// Expand reports one source position expanded along relType and dir, producing fanout
+	// neighbors in dur (doc 20 §6.1). relType is the operator's single type token, or zero when
+	// it expands every type; the observer resolves the token to the metric's type label. fanout
+	// is the raw neighbor count the engine produced for this source, the per-source fan-out whose
+	// tail is the supernode signal.
+	Expand(relType engine.Token, dir engine.Direction, fanout int, dur time.Duration)
 }
 
 // countScan adds n to the scanned-rows counter when one is armed (doc 20 §3.1). It is the
@@ -121,6 +128,15 @@ func (c *Ctx) countWCOJ() {
 func (c *Ctx) countBinaryJoin() {
 	if c.Graph != nil {
 		c.Graph.BinaryJoin()
+	}
+}
+
+// countExpand reports one source position expanded to the observer when one is wired (doc 20
+// §6.1), called once per source node the expand operator pulls neighbors for. With no observer
+// set it is a nil check and nothing more, so an uninstrumented expand pays nothing.
+func (c *Ctx) countExpand(relType engine.Token, dir engine.Direction, fanout int, dur time.Duration) {
+	if c.Graph != nil {
+		c.Graph.Expand(relType, dir, fanout, dur)
 	}
 }
 

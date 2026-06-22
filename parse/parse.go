@@ -196,6 +196,9 @@ func (p *parser) queryBody() (*ast.Query, error) {
 	if p.atWord("REVOKE") {
 		return p.revokeRole()
 	}
+	if p.atWord("PRAGMA") {
+		return p.pragma()
+	}
 	start := p.cur()
 	first, err := p.singleQuery()
 	if err != nil {

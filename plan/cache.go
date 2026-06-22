@@ -135,3 +135,12 @@ func (c *Cache) Len() int {
 	defer c.mu.Unlock()
 	return c.ll.Len()
 }
+
+// Cap returns the cache's capacity in distinct query shapes, the resolved maximum that
+// NewCache fixed (the configured size, or DefaultCacheSize when none was given). It backs
+// the read-only plan_cache_size pragma (doc 24 §3.3).
+func (c *Cache) Cap() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.max
+}

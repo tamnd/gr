@@ -23,7 +23,9 @@ type Pos struct {
 // CONSTRAINT, DROP CONSTRAINT) Schema is set and First is nil: a schema command
 // is a whole statement on its own, not a clause inside a query (doc 08 §6.1). For
 // an administrative statement (CREATE USER, GRANT ROLE, doc 18 §10) Admin is set
-// and First is nil, likewise a whole statement on its own.
+// and First is nil, likewise a whole statement on its own. For a PRAGMA (doc 24 §3)
+// Pragma is set and First is nil, a configuration statement that reads or sets a
+// tunable rather than touching graph data.
 //
 // Explain marks a statement the EXPLAIN prefix introduced: the planner builds its
 // operator tree but the engine never runs it, so the result is the plan listing
@@ -35,6 +37,7 @@ type Query struct {
 	Rest    []UnionTail
 	Schema  SchemaCommand
 	Admin   AdminCommand
+	Pragma  *PragmaCommand
 	Explain bool
 }
 

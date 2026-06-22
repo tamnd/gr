@@ -113,6 +113,13 @@ func (s *shell) afterStatement() {
 // compile or runtime error prints a diagnostic to the chatter channel and updates the
 // accumulated exit code without ending the session.
 func (s *shell) runStatement(stmt string) {
+	// A dot-command reaching here came from -c or a trailing flush, where the script
+	// path's line-level dispatch did not see it; route it to the dot handler, since no
+	// Cypher statement begins with a dot (doc 17 §3.4).
+	if isDotCommand(stmt) {
+		s.runDot(stmt)
+		return
+	}
 	if s.echo {
 		fmt.Fprintln(s.errw, stmt)
 	}

@@ -22,6 +22,18 @@ import (
 	"github.com/tamnd/gr/wal"
 )
 
+// PageIOObserver receives the wall-clock latency in seconds of each page read and write the pager
+// performs against the VFS (doc 20 §4.2): the device-side view that complements the cache hit rate. The
+// root wires one that observes into the gr_page_read_seconds and gr_page_write_seconds histograms;
+// until then it is nil and the pager times nothing. The observe is lock-free on the metric side (an
+// atomic bucket add), so the pager calls it on the read and commit paths without taking the registry
+// lock, the same way it keeps its hit and miss counts off the registry. The interface keeps the pager
+// free of the metric package, the same decoupling the constraint observer uses.
+type PageIOObserver interface {
+	ObservePageRead(seconds float64)
+	ObservePageWrite(seconds float64)
+}
+
 // Options configure a pager at open time.
 type Options struct {
 	// PageSize is used only when creating a new file; an existing file's page
@@ -35,6 +47,10 @@ type Options struct {
 	SaltSeed uint64
 	// ReadOnly opens without a writable WAL (queries only).
 	ReadOnly bool
+	// PageIO observes the latency of each page read and write against the VFS (doc 20 §4.2). It is set
+	// before open does any I/O, so the page reads that load the stores into memory at open are timed
+	// too, the dominant read I/O this engine does today. nil leaves page I/O untimed.
+	PageIO PageIOObserver
 }
 
 var (
@@ -102,6 +118,11 @@ type Pager struct {
 	// it without the pool lock; the engine reads it around its checkpoint to mirror the fold's writes.
 	pagesWritten atomic.Uint64
 
+	// io observes the latency of each page read and write against the VFS (doc 20 §4.2), or is nil when
+	// no observer is wired (a test pager). It is set from Options before open does any I/O and never
+	// changed after, so reading it on the read and commit paths needs no synchronization.
+	io PageIOObserver
+
 	headerDirty bool
 	closed      bool
 	recovered   bool // true if open redid committed WAL frames after a crash
@@ -146,6 +167,7 @@ func Open(fsys vfs.VFS, path string, opt Options) (*Pager, error) {
 		pool:     make(map[format.PageID]*Frame),
 		maxPool:  opt.MaxPoolPages,
 		saltNext: opt.SaltSeed + 1,
+		io:       opt.PageIO,
 	}
 
 	if created {

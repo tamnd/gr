@@ -353,6 +353,20 @@ var queryLatencyBuckets = []float64{
 	1, 2.5, 5, 10,
 }
 
+// pageLatencyBuckets is the bucket layout for gr_page_read_seconds and gr_page_write_seconds (doc 20
+// §4.2): the latency of one page operation against the VFS. It starts an order of magnitude below the
+// query buckets, at ten microseconds, because a page read served by the OS page cache or a fast NVMe
+// device lands in the tens of microseconds, and the device-health signal is exactly where that floor
+// sits and how far the tail stretches above it; the top runs to a second for a stalled or contended
+// device. The +Inf catch-all is added by the histogram itself.
+var pageLatencyBuckets = []float64{
+	0.00001, 0.000025, 0.00005,
+	0.0001, 0.00025, 0.0005,
+	0.001, 0.0025, 0.005,
+	0.01, 0.025, 0.05,
+	0.1, 0.25, 0.5, 1,
+}
+
 // rowCountBuckets is the bucket layout for gr_query_rows_returned and gr_query_rows_scanned
 // (doc 20 §3.1): powers of ten from one row to ten million, so the output cardinality and the
 // scan work an operator reads span the orders of magnitude a graph query ranges over. A query
@@ -574,6 +588,14 @@ type queryMetrics struct {
 	bufferpoolMu         sync.Mutex
 	lastBufferpoolHits   uint64
 	lastBufferpoolMisses uint64
+
+	// pageReadSeconds and pageWriteSeconds hold gr_page_read_seconds and gr_page_write_seconds, the
+	// device-latency distribution of a page fault and a page write-back against the VFS (doc 20 §4.2),
+	// the floor under every cache miss and the storage-health picture. The pager observes into them
+	// directly through the pageIOObserver, lock-free, so unlike the cumulative cache counts these are
+	// not mirrored at snapshot time; they need no last* basis since a histogram accumulates in place.
+	pageReadSeconds  *metric.Histogram
+	pageWriteSeconds *metric.Histogram
 
 	// cacheMemory holds gr_cache_memory_bytes keyed by cache name, the unified per-cache
 	// resident-memory view (doc 20 §4.5), and cacheBudgetUsed gr_cache_budget_used_bytes, the sum of
@@ -804,6 +826,12 @@ func newQueryMetrics() *queryMetrics {
 		"Frames currently holding a page", "frames", nil)
 	m.bufferpoolBytes = reg.Gauge("gr_bufferpool_memory_bytes",
 		"Memory held by the buffer pool, resident frames times page size", "bytes", nil)
+	m.pageReadSeconds = reg.Histogram("gr_page_read_seconds",
+		"Latency of a page read against the VFS, the floor under every cache miss", "seconds",
+		pageLatencyBuckets, nil)
+	m.pageWriteSeconds = reg.Histogram("gr_page_write_seconds",
+		"Latency of a page write against the VFS, mostly checkpoint write-back", "seconds",
+		pageLatencyBuckets, nil)
 	m.cacheMemory = make(map[string]*metric.Gauge, len(metricCacheNames))
 	for _, name := range metricCacheNames {
 		m.cacheMemory[name] = reg.Gauge("gr_cache_memory_bytes",
@@ -1479,6 +1507,24 @@ type constraintObserver struct{ m *queryMetrics }
 
 func (o constraintObserver) ConstraintCheck(kind string, ok bool) {
 	o.m.recordConstraintCheck(kind, ok)
+}
+
+// pageIOObserver implements pager.PageIOObserver against the query metrics (doc 20 §4.2): it observes
+// each page read and write latency into gr_page_read_seconds and gr_page_write_seconds. The histograms
+// observe lock-free, so the pager calls these straight off the read and commit paths without the
+// registry lock. One value serves the pager for a database's life, holding only the shared handles.
+type pageIOObserver struct{ m *queryMetrics }
+
+func (o pageIOObserver) ObservePageRead(seconds float64) {
+	if o.m.pageReadSeconds != nil {
+		o.m.pageReadSeconds.Observe(seconds)
+	}
+}
+
+func (o pageIOObserver) ObservePageWrite(seconds float64) {
+	if o.m.pageWriteSeconds != nil {
+		o.m.pageWriteSeconds.Observe(seconds)
+	}
 }
 
 // scanLoad reads a scan counter, treating a nil counter (a result with no execution, such as a

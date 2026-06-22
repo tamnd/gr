@@ -176,11 +176,16 @@ func Open(path string, opt Options) (*DB, error) {
 	if fsys == nil {
 		fsys = vfs.NewOS()
 	}
+	// Build the registry before opening the engine so the page I/O observer is live for the pager's
+	// open-time reads, the store-loading faults that are the dominant read I/O this engine does (doc 20
+	// §4.2). newQueryMetrics has no engine dependency; the engine-derived hooks are wired below.
+	metrics := newQueryMetrics()
 	eng, err := engine.Open(fsys, path, pager.Options{
 		PageSize: opt.PageSize,
 		Sync:     opt.Sync,
 		ReadOnly: opt.ReadOnly,
 		SaltSeed: opt.SaltSeed,
+		PageIO:   pageIOObserver{metrics},
 	})
 	if err != nil {
 		return nil, err
@@ -204,7 +209,7 @@ func Open(path string, opt Options) (*DB, error) {
 		lazyProps:   opt.LazyProperties,
 		readOnly:    opt.ReadOnly,
 		events:      opt.EventLog,
-		metrics:     newQueryMetrics(),
+		metrics:     metrics,
 	}
 	// Wire the plan-cache metrics to the cache now both exist (doc 20 §3.2): the eviction hook
 	// counts LRU drops, and a computed gauge reads the resident plan count at snapshot time.

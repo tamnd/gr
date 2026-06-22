@@ -67,6 +67,11 @@ type DiskEngine struct {
 	idx    *propIndexSet
 	closed bool
 
+	// conObs receives one report per constraint check at commit, so a higher layer can count
+	// enforcement without the engine importing a metric registry (doc 20 §6.4). It is nil until a
+	// caller sets it, and every report goes through the nil-safe reportConstraint helper.
+	conObs ConstraintObserver
+
 	// bc fronts the segmented-base read with decoded segments, so a repeated point
 	// read in a segment does not re-decode it (doc 14 §4). It is an in-memory cache,
 	// never a source of truth: every cached segment carries the checkpoint epoch it

@@ -218,6 +218,10 @@ func Open(path string, opt Options) (*DB, error) {
 	// The index-lookup metric labels by index name, so the observer needs the (label, property)
 	// to index-name resolver (doc 20 §6.4). Wire it now the engine exists.
 	db.metrics.indexNameOf = db.indexNamer()
+	// The commit path counts each constraint check it runs, so give the engine the observer that
+	// feeds gr_constraint_checks_total (doc 20 §6.4). A database with no declared constraints never
+	// calls it, so this costs nothing until a constraint exists.
+	db.eng.SetConstraintObserver(constraintObserver{db.metrics})
 	// The open event reports the file's real geometry and whether this open recovered a
 	// committed WAL prefix after a crash (doc 20 §11.3). StorageInfo reads the header the
 	// engine just mounted, so the format version and page size are the file's own.

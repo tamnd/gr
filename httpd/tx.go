@@ -48,6 +48,10 @@ const (
 type txStore struct {
 	mu sync.Mutex
 	m  map[string]*txEntry
+	// reaped counts transactions force-rolled-back because they expired, whether by
+	// the background sweeper or lazily on access (doc 18 §13.5). A nonzero value means
+	// clients held transactions open and then vanished.
+	reaped int64
 }
 
 func newTxStore() *txStore { return &txStore{m: make(map[string]*txEntry)} }
@@ -83,6 +87,7 @@ func (st *txStore) acquire(id, principal string, now time.Time) (*txEntry, int) 
 	}
 	if now.After(e.expires) {
 		delete(st.m, id)
+		st.reaped++
 		_ = e.tx.Rollback()
 		return nil, acqNotFound
 	}
@@ -115,6 +120,36 @@ func (st *txStore) remove(id string) {
 	st.mu.Lock()
 	delete(st.m, id)
 	st.mu.Unlock()
+}
+
+// sweep force-rolls-back and removes every transaction past its expiry (doc 18 §8.7,
+// §9.5), the cleanup for a client that began a transaction and then vanished without
+// committing or rolling back. It returns the number reaped. The lazy reap in acquire
+// handles a client that does come back; this handles one that never does, so a dead
+// HTTP client cannot pin the writer (or a read snapshot) indefinitely. A busy entry is
+// left alone, since an in-flight request owns it and will release or remove it.
+func (st *txStore) sweep(now time.Time) int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	n := 0
+	for id, e := range st.m {
+		if e.busy || !now.After(e.expires) {
+			continue
+		}
+		delete(st.m, id)
+		st.reaped++
+		_ = e.tx.Rollback()
+		n++
+	}
+	return n
+}
+
+// stats returns the live open-transaction count and the cumulative reaped count for the
+// metrics endpoint (doc 18 §13.5).
+func (st *txStore) stats() (open int, reaped int64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return len(st.m), st.reaped
 }
 
 // closeAll rolls back every held transaction, used when the server shuts down so no

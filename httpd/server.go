@@ -24,6 +24,7 @@ type server struct {
 	now       func() time.Time
 	txTimeout time.Duration
 	auth      AuthProvider
+	metrics   *metrics
 }
 
 // Options configures the handler.
@@ -41,12 +42,20 @@ type Options struct {
 	now func() time.Time
 }
 
-// Handler builds the HTTP/JSON handler over a database (doc 18 §9.1). It is a plain
-// http.Handler so it mounts into any server and is driven by httptest in the tests
-// without binding a port. The returned handler routes the discovery, health, and
-// auto-commit query endpoints; the transactional tx family and authentication are
-// added in later slices.
-func Handler(db *gr.DB, opts Options) http.Handler {
+// Server is the HTTP/JSON server over a database (doc 18 §9.1). It is an http.Handler so
+// it mounts into any net/http server and is driven by httptest in the tests without
+// binding a port, and it adds the lifecycle the bare handler cannot express: Sweep reaps
+// expired transactions, which the serve command runs on a ticker, and Close rolls back
+// any still-open transaction on shutdown.
+type Server struct {
+	s   *server
+	mux *http.ServeMux
+}
+
+// New builds a Server over a database (doc 18 §9.1). It routes the discovery, health,
+// metrics, auto-commit query, and transactional tx endpoints, and authenticates and
+// authorizes the data endpoints when an auth provider is configured.
+func New(db *gr.DB, opts Options) *Server {
 	name := opts.Name
 	if name == "" {
 		name = "neo4j"
@@ -59,12 +68,32 @@ func Handler(db *gr.DB, opts Options) http.Handler {
 	if clock == nil {
 		clock = time.Now
 	}
-	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth}
+	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/", s.route)
-	return mux
+	return &Server{s: s, mux: mux}
+}
+
+// ServeHTTP routes a request, so a Server is an http.Handler.
+func (sv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { sv.mux.ServeHTTP(w, r) }
+
+// Sweep reaps every server-side transaction past its expiry and returns the count (doc
+// 18 §8.7). The serve command calls it on a ticker so a vanished client's transaction
+// does not pin the writer until someone happens to touch its id.
+func (sv *Server) Sweep(now time.Time) int { return sv.s.txns.sweep(now) }
+
+// Close rolls back every still-open transaction (doc 18 §13.1). It is called on shutdown
+// so no held transaction leaks a snapshot or a write intent past the server's life.
+func (sv *Server) Close() { sv.s.txns.closeAll() }
+
+// Handler builds the HTTP/JSON handler over a database (doc 18 §9.1) as a plain
+// http.Handler, for a caller that does not need the Sweep/Close lifecycle. It is New
+// with the concrete type erased.
+func Handler(db *gr.DB, opts Options) http.Handler {
+	return New(db, opts)
 }
 
 // route dispatches the path-parameterized endpoints (doc 18 §9.1). The discovery
@@ -83,6 +112,11 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 	// The data endpoints are authenticated; discovery and the health probes above are
 	// not, so a load balancer or an operator can probe liveness without a credential.
 	princ, fail := s.authenticate(r)
+	if s.auth != nil {
+		// Count the outcome only when authentication actually ran (a provider is
+		// configured); with auth off every request is anonymous and is not an auth event.
+		s.metrics.countAuth(fail == nil)
+	}
 	if fail != nil {
 		s.writeAuthError(w, fail)
 		return
@@ -209,8 +243,10 @@ func (s *server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ready\n"))
 }
 
-// writeError writes a JSON error body in the doc 18 §9.3 shape with the given status.
+// writeError writes a JSON error body in the doc 18 §9.3 shape with the given status and
+// records the error by its Neo4j status code for the metrics endpoint (doc 18 §13.5).
 func (s *server) writeError(w http.ResponseWriter, status int, ae apiError) {
+	s.metrics.countError(ae.Code)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{"errors": []apiError{ae}})

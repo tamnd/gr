@@ -523,6 +523,9 @@ func (db *DB) execCtx(etx engine.Tx, b *bind.Bound, params map[string]value.Valu
 		// for gr_query_rows_scanned (doc 20 §3.1). It is a cheap atomic the library reads
 		// after the cursor drains, the amplification numerator paired with rows returned.
 		Scanned: new(atomic.Int64),
+		// Wire the graph-operator metrics (doc 20 §6): the shortest-path, WCOJ, and binary-join
+		// operators report through this as they open.
+		Graph: graphObserver{db.metrics},
 	}
 	// Arm spilling only when a budget is configured. With the default zero budget
 	// the executor never spills, so leaving TempFile unset keeps the in-memory path.

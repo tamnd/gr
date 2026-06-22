@@ -431,5 +431,7 @@ func (tx *Tx) readCtx(b *bind.Bound, params map[string]value.Value) *exec.Ctx {
 		// Arm the scanned-rows counter the same way the auto-commit path does, so a read run
 		// inside a managed transaction records gr_query_rows_scanned too (doc 20 §3.1).
 		Scanned: new(atomic.Int64),
+		// Wire the graph-operator metrics the same way (doc 20 §6).
+		Graph: graphObserver{tx.db.metrics},
 	}
 }

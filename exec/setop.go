@@ -117,6 +117,7 @@ type joinOp struct {
 
 func (o *joinOp) open(ctx *Ctx) error {
 	o.ctx, o.table, o.built, o.grace = ctx, nil, false, nil
+	ctx.countBinaryJoin()
 	o.blockBuild, o.blockRdr = nil, nil
 	o.rightOpened = false
 	o.cur, o.matches, o.mpos = nil, nil, 0

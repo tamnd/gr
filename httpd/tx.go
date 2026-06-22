@@ -176,6 +176,7 @@ type txBeginRequest struct {
 	Statements       []statement `json:"statements"`
 	MaxExecutionTime int         `json:"maxExecutionTime"`
 	AccessMode       string      `json:"accessMode"`
+	ImpersonatedUser string      `json:"impersonatedUser"`
 }
 
 // runStatements runs each statement on the held transaction and buffers each result in
@@ -236,6 +237,10 @@ func (s *server) handleTxBegin(w http.ResponseWriter, r *http.Request, name stri
 		})
 		return
 	}
+	r, ok := s.impersonate(w, r, req.ImpersonatedUser)
+	if !ok {
+		return
+	}
 	if !s.authorizeStatements(w, r, req.Statements) {
 		return
 	}
@@ -269,7 +274,7 @@ func (s *server) handleTxBegin(w http.ResponseWriter, r *http.Request, name stri
 		return
 	}
 	expires := s.now().Add(s.txTimeout)
-	s.txns.put(id, &txEntry{tx: tx, principal: principal(r), expires: expires})
+	s.txns.put(id, &txEntry{tx: tx, principal: owner(r), expires: expires})
 
 	w.Header().Set("Location", "/db/"+name+"/tx/"+id)
 	w.Header().Set("Content-Type", "application/json")
@@ -293,10 +298,14 @@ func (s *server) handleTxRun(w http.ResponseWriter, r *http.Request, id string) 
 		})
 		return
 	}
+	r, ok := s.impersonate(w, r, req.ImpersonatedUser)
+	if !ok {
+		return
+	}
 	if !s.authorizeStatements(w, r, req.Statements) {
 		return
 	}
-	e, code := s.txns.acquire(id, principal(r), s.now())
+	e, code := s.txns.acquire(id, owner(r), s.now())
 	if !s.checkAcquire(w, code) {
 		return
 	}
@@ -332,10 +341,14 @@ func (s *server) handleTxCommit(w http.ResponseWriter, r *http.Request, id strin
 		})
 		return
 	}
+	r, ok := s.impersonate(w, r, req.ImpersonatedUser)
+	if !ok {
+		return
+	}
 	if !s.authorizeStatements(w, r, req.Statements) {
 		return
 	}
-	e, code := s.txns.acquire(id, principal(r), s.now())
+	e, code := s.txns.acquire(id, owner(r), s.now())
 	if !s.checkAcquire(w, code) {
 		return
 	}
@@ -368,7 +381,7 @@ func (s *server) handleTxCommit(w http.ResponseWriter, r *http.Request, id strin
 // handleTxRollback serves DELETE /db/{name}/tx/{id} (doc 18 §9.5): it aborts the open
 // transaction and removes it.
 func (s *server) handleTxRollback(w http.ResponseWriter, r *http.Request, id string) {
-	e, code := s.txns.acquire(id, principal(r), s.now())
+	e, code := s.txns.acquire(id, owner(r), s.now())
 	if !s.checkAcquire(w, code) {
 		return
 	}
@@ -421,11 +434,21 @@ func decodeBody(r *http.Request, v any) error {
 	return nil
 }
 
-// principal returns the authenticated principal's name for a request (doc 18 §9.9),
-// which scopes transaction ownership. With authentication off every request is the
-// anonymous principal (the empty name), so the ownership check is a no-op; with auth on
-// it is the authenticated user, so one user cannot touch another's transaction.
-func principal(r *http.Request) string { return principalFrom(r.Context()).Name }
+// owner returns the principal name that scopes transaction ownership for a request (doc
+// 18 §9.9). It is the authenticating principal, even when the request impersonates another
+// user: under impersonation the context principal's Name is the impersonated user but
+// ImpersonatedBy is the actor, and ownership follows the actor so a later request to the
+// same transaction (including a body-less rollback, which carries no impersonatedUser
+// field) still matches. With authentication off every request is the anonymous principal
+// (the empty name), so the ownership check is a no-op; with auth on it is the authenticated
+// user, so one user cannot touch another's transaction.
+func owner(r *http.Request) string {
+	p := principalFrom(r.Context())
+	if p.ImpersonatedBy != "" {
+		return p.ImpersonatedBy
+	}
+	return p.Name
+}
 
 // formatExpiry formats a transaction expiry for the response (doc 18 §9.5).
 func formatExpiry(t time.Time) string { return t.UTC().Format(time.RFC3339) }

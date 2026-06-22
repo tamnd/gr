@@ -50,6 +50,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	fs.StringVar(&jwt.audience, "jwt-audience", "", "required token audience (aud claim) for bearer-token auth")
 	fs.StringVar(&jwt.rolesClaim, "jwt-roles-claim", "", "token claim to read roles from (default roles)")
 	tokenCacheTTL := fs.Duration("auth-token-cache-ttl", 0, "how long a validated bearer token is cached before revalidation (0 uses the default)")
+	impersonation := fs.Bool("auth-impersonation", false, "allow an admin to run a query as another user via the impersonatedUser request field")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: gr serve [flags] [database]")
 		fmt.Fprintln(stderr)
@@ -75,7 +76,11 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 		fmt.Fprintln(stderr, "gr:", err)
 		return exitUsage
 	}
-	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL})
+	if *impersonation && auth == nil {
+		fmt.Fprintln(stderr, "gr: --auth-impersonation needs an auth provider; pass --user, --auth-store, or --jwt-*")
+		return exitUsage
+	}
+	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL, Impersonation: *impersonation})
 	defer srv.Close()
 	fmt.Fprintf(stderr, "gr serving %s on %s (database %q)\n", describeDB(path), *addr, *name)
 	if auth == nil {

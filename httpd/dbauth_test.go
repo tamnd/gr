@@ -88,6 +88,25 @@ func TestDBProviderLockout(t *testing.T) {
 	}
 }
 
+// TestDBProviderResolve confirms the provider resolves a user's roles by name for
+// impersonation, with no credential check, and reports ErrNoSuchPrincipal for a name the
+// store does not hold (doc 18 §10.5).
+func TestDBProviderResolve(t *testing.T) {
+	db := dbWithUser(t, "ada", "s3cret", gr.RoleEditor)
+	p := NewDBProvider(db)
+
+	princ, err := p.Resolve(t.Context(), "ada")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if princ.Name != "ada" || !slices.Equal(princ.Roles, []string{gr.RoleEditor}) {
+		t.Errorf("resolved = %+v, want ada [editor]", princ)
+	}
+	if _, err := p.Resolve(t.Context(), "ghost"); !errors.Is(err, ErrNoSuchPrincipal) {
+		t.Errorf("resolve unknown err = %v, want ErrNoSuchPrincipal", err)
+	}
+}
+
 // TestDBProviderSeesLiveUsers confirms the provider reads the live store, so a user
 // created after the provider is built authenticates, and one dropped no longer does.
 func TestDBProviderSeesLiveUsers(t *testing.T) {

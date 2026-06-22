@@ -65,3 +65,20 @@ func (p *DBProvider) Authenticate(ctx context.Context, scheme, principal string,
 
 // Schemes reports that the database-backed store verifies only the basic scheme.
 func (p *DBProvider) Schemes() []string { return []string{"basic"} }
+
+// Resolve returns the principal for a user by name, without a credential check, so an
+// admin may impersonate it (doc 18 §10.5). It reads the live credential store, so a user
+// created or dropped after the server starts resolves correctly, and returns
+// ErrNoSuchPrincipal for a name the store does not hold.
+func (p *DBProvider) Resolve(ctx context.Context, name string) (*Principal, error) {
+	users, err := p.db.Users()
+	if err != nil {
+		return nil, err
+	}
+	for _, u := range users {
+		if u.Name == name {
+			return &Principal{Name: name, Roles: append([]string(nil), u.Roles...)}, nil
+		}
+	}
+	return nil, ErrNoSuchPrincipal
+}

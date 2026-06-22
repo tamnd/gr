@@ -26,6 +26,9 @@ type server struct {
 	auth        AuthProvider
 	bearerCache *tokenCache
 	metrics     *metrics
+	// impersonation enables the imp_user/impersonatedUser request field (doc 18 §10.5).
+	// It is off by default, so a deployment opts into impersonation explicitly.
+	impersonation bool
 }
 
 // Options configures the handler.
@@ -43,6 +46,11 @@ type Options struct {
 	// revalidated (doc 18 §10.4). Zero uses defaultTokenCacheTTL; the cache is only
 	// consulted when Auth is set, since an anonymous server has no token to cache.
 	TokenCacheTTL time.Duration
+	// Impersonation enables the impersonatedUser request field (doc 18 §10.5), which
+	// lets an admin run a query as another user. It is off by default; turning it on
+	// requires an auth provider that resolves users (a RoleResolver), since an anonymous
+	// server has no principal to authorize the impersonation against.
+	Impersonation bool
 	// now overrides the clock for tests; nil uses time.Now.
 	now func() time.Time
 }
@@ -73,7 +81,7 @@ func New(db *gr.DB, opts Options) *Server {
 	if clock == nil {
 		clock = time.Now
 	}
-	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics()}
+	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics(), impersonation: opts.Impersonation}
 	if opts.Auth != nil {
 		ttl := opts.TokenCacheTTL
 		if ttl == 0 {

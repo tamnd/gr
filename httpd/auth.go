@@ -32,12 +32,32 @@ type AuthProvider interface {
 // Principal is an authenticated identity and its roles (doc 18 §10.4, §10.6). The roles
 // drive the authorization model (doc 18 §10.6) and the transaction store scopes ownership
 // to the name (doc 18 §9.9). Token carries the validated claims for a bearer/JWT principal
-// and is nil for a basic credential, which has no token.
+// and is nil for a basic credential, which has no token. ImpersonatedBy names the
+// authenticating principal when this one is an impersonation target (doc 18 §10.5): the
+// principal runs with the impersonated user's Name and Roles, but the audit trail records
+// who is acting as whom, so ImpersonatedBy holds the actor and Name the impersonated user.
+// It is empty for an ordinary, non-impersonated principal.
 type Principal struct {
-	Name  string
-	Roles []string
-	Token *Claims
+	Name           string
+	Roles          []string
+	Token          *Claims
+	ImpersonatedBy string
 }
+
+// RoleResolver is the optional seam a provider implements to support impersonation (doc
+// 18 §10.5). Resolve returns the principal for a user by name, with its roles, without a
+// credential check, so an admin may run a query as that user. A provider that does not
+// implement it cannot be a target of impersonation, so impersonation is refused when the
+// configured provider is not a RoleResolver. Resolve returns ErrNoSuchPrincipal when the
+// named user does not exist.
+type RoleResolver interface {
+	Resolve(ctx context.Context, name string) (*Principal, error)
+}
+
+// ErrNoSuchPrincipal is returned by a RoleResolver when the named user does not exist
+// (doc 18 §10.5). The impersonation check maps it to a forbidden response, so a probe
+// cannot tell a missing impersonation target from one the actor may not assume.
+var ErrNoSuchPrincipal = errors.New("gr: no such principal")
 
 // Claims is the validated content of a bearer/JWT token (doc 18 §10.4). It is what a
 // JWTProvider returns on the Principal so a downstream caller (audit, the token cache)
@@ -194,6 +214,19 @@ func (p *StaticProvider) Authenticate(ctx context.Context, scheme, principal str
 
 // Schemes reports that the built-in store verifies only the basic scheme.
 func (p *StaticProvider) Schemes() []string { return []string{"basic"} }
+
+// Resolve returns the principal for a user by name, without a credential check, so an
+// admin may impersonate it (doc 18 §10.5). It returns ErrNoSuchPrincipal for a name the
+// store does not hold.
+func (p *StaticProvider) Resolve(ctx context.Context, name string) (*Principal, error) {
+	p.mu.RLock()
+	u, ok := p.users[name]
+	p.mu.RUnlock()
+	if !ok {
+		return nil, ErrNoSuchPrincipal
+	}
+	return &Principal{Name: name, Roles: append([]string(nil), u.roles...)}, nil
+}
 
 // derive computes the PBKDF2-HMAC-SHA256 hash of a password with a salt.
 func derive(password string, salt []byte) ([]byte, error) {

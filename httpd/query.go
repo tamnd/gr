@@ -14,11 +14,12 @@ import (
 // required; the rest default. parameters arrive as decoded JSON, so an integer
 // parameter arrives as a JSON number (float64) unless sent in a string form.
 type queryRequest struct {
-	Statement       string         `json:"statement"`
-	Parameters      map[string]any `json:"parameters"`
-	IncludeCounters bool           `json:"includeCounters"`
-	MaxExecutionTime int           `json:"maxExecutionTime"`
-	AccessMode      string         `json:"accessMode"`
+	Statement        string         `json:"statement"`
+	Parameters       map[string]any `json:"parameters"`
+	IncludeCounters  bool           `json:"includeCounters"`
+	MaxExecutionTime int            `json:"maxExecutionTime"`
+	AccessMode       string         `json:"accessMode"`
+	ImpersonatedUser string         `json:"impersonatedUser"`
 }
 
 // handleQuery serves POST /db/{name}/query/v2 (doc 18 §9.2): it runs the statement as
@@ -47,6 +48,11 @@ func (s *server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			Code:    "Neo.ClientError.Request.Invalid",
 			Message: "statement is required",
 		})
+		return
+	}
+
+	r, ok := s.impersonate(w, r, req.ImpersonatedUser)
+	if !ok {
 		return
 	}
 

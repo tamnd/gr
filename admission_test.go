@@ -23,6 +23,9 @@ func TestAdmissionDisabled(t *testing.T) {
 	if a.InFlight() != 0 {
 		t.Errorf("nil gate InFlight = %d, want 0", a.InFlight())
 	}
+	if a.Shed() != 0 {
+		t.Errorf("nil gate Shed = %d, want 0", a.Shed())
+	}
 }
 
 func TestAdmissionAcquireRelease(t *testing.T) {
@@ -41,6 +44,9 @@ func TestAdmissionAcquireRelease(t *testing.T) {
 	// The gate is full: a third acquire sheds after the queue wait.
 	if _, err := a.Acquire(context.Background()); !errors.Is(err, ErrOverloaded) {
 		t.Errorf("full-gate acquire err = %v, want ErrOverloaded", err)
+	}
+	if a.Shed() != 1 {
+		t.Errorf("Shed = %d, want 1 after one shed", a.Shed())
 	}
 	// Releasing a slot lets the next acquire through.
 	r1()

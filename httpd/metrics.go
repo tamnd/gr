@@ -11,11 +11,11 @@ import (
 
 // metrics is the server's running counters and gauges (doc 18 §13.5, doc 20). It records
 // only what the HTTP handler can observe honestly: error counts by status code, auth
-// outcomes, and (read live from the transaction store) the open-transaction gauge and
-// the reaped-transaction counter. The metrics that need a connection pool or an
-// admission gate (connections, in-flight, queued, watermark age) are not emitted here,
-// because a plain http.Handler does not own those; they arrive with the Bolt server and
-// the admission gate, so emitting them now as constant zeros would mislead an operator.
+// outcomes, (read live from the transaction store) the open-transaction gauge and the
+// reaped-transaction counter, and (when a gate is configured) the in-flight-query gauge
+// and the shed counter. The metrics that need a connection pool (connections, watermark
+// age) are not emitted here, because a plain http.Handler does not own those; emitting
+// them as constant zeros would mislead an operator.
 type metrics struct {
 	mu          sync.Mutex
 	errors      map[string]int64 // by Neo4j status code
@@ -75,6 +75,16 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"explicit transactions held open", "", float64(open))
 	writeMetric(&b, "gr_server_tx_reaped_total", "counter",
 		"transactions force-rolled-back by the sweeper", "", float64(reaped))
+
+	// The in-flight gauge and shed counter come from the shared admission gate (doc 18
+	// §8.8, §13.5). They are emitted only when a gate is configured, so an ungated server
+	// does not report a misleading constant zero.
+	if s.admission != nil {
+		writeMetric(&b, "gr_server_in_flight_queries", "gauge",
+			"queries executing right now across all connections", "", float64(s.admission.InFlight()))
+		writeMetric(&b, "gr_server_queries_shed_total", "counter",
+			"queries shed because the in-flight gate was full", "", float64(s.admission.Shed()))
+	}
 
 	s.metrics.mu.Lock()
 	codes := make([]string, 0, len(s.metrics.errors))

@@ -260,11 +260,15 @@ func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value
 	var b *bind.Bound
 	var op plan.Op
 	if tx.write {
+		// A read inside a write transaction binds against the transaction's own catalog, so it
+		// never uses the plan cache: time the bind and plan as a plan-cache miss (doc 20 §3.1).
+		pstart := time.Now()
 		bound, err := bind.Bind(q, bind.NewEngineCatalog(tx.etx), false)
 		if err != nil {
 			return nil, err
 		}
 		b, op = bound, plan.Plan(bound)
+		tx.db.metrics.recordPlan("miss", time.Since(pstart))
 	} else {
 		entry, err := tx.db.compile(cypher)
 		if err != nil {
@@ -272,11 +276,14 @@ func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value
 		}
 		b, op = entry.Bound, entry.Op
 	}
+	// The executor span starts once the plan is ready; Close records the time since it as
+	// gr_query_execute_duration_seconds (doc 20 §3.1).
+	execStart := time.Now()
 	cur, err := exec.Open(op, tx.readCtx(b, params))
 	if err != nil {
 		return nil, err
 	}
-	return &Result{cols: cur.Cols(), cursor: cur, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy), mscan: cur.ScanCount()}, nil
+	return &Result{cols: cur.Cols(), cursor: cur, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy), mscan: cur.ScanCount(), mexec: execStart}, nil
 }
 
 // runWrite executes a write statement eagerly and returns a result over its

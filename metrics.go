@@ -91,6 +91,12 @@ var metricQueryKinds = []string{"read", "write", "schema", "admin", "pragma", "e
 // §3.1): the outcomes a query ends in.
 var metricQueryStatuses = []string{"ok", "error", "timeout", "killed"}
 
+// metricPlanCache is the bounded domain of the cache label on gr_query_plan_duration_seconds
+// (doc 20 §3.1): whether the plan came from the plan cache (hit, which skips most of the work)
+// or was compiled fresh (miss, which pays full planning). A write is always a miss, since the
+// write path does not cache.
+var metricPlanCache = []string{"hit", "miss"}
+
 // metricErrorClasses is the bounded domain of the class label on gr_query_errors_total (doc 20
 // §3.1): the cause an error falls into. The metric is a sub-view of
 // gr_queries_total{status="error"} broken out by cause, plus the syntax errors that fail before
@@ -109,6 +115,8 @@ type queryMetrics struct {
 	errors   map[string]*metric.Counter            // gr_query_errors_total by [class]
 	returned *metric.Histogram                     // gr_query_rows_returned (output cardinality)
 	scanned  *metric.Histogram                     // gr_query_rows_scanned (scan and expand work)
+	plan     map[string]*metric.Histogram          // gr_query_plan_duration_seconds by [cache]
+	execute  map[string]*metric.Histogram          // gr_query_execute_duration_seconds by [kind]
 }
 
 // newQueryMetrics builds the registry and pre-resolves every query-metric handle (doc 20
@@ -122,10 +130,17 @@ func newQueryMetrics() *queryMetrics {
 		duration: make(map[string]*metric.Histogram, len(metricQueryKinds)),
 		inflight: make(map[string]*metric.Gauge, len(metricQueryKinds)),
 		errors:   make(map[string]*metric.Counter, len(metricErrorClasses)),
+		plan:     make(map[string]*metric.Histogram, len(metricPlanCache)),
+		execute:  make(map[string]*metric.Histogram, len(metricQueryKinds)),
 	}
 	for _, c := range metricErrorClasses {
 		m.errors[c] = reg.Counter("gr_query_errors_total",
 			"Query errors by cause", "errors", metric.Labels{"class": c})
+	}
+	for _, c := range metricPlanCache {
+		m.plan[c] = reg.Histogram("gr_query_plan_duration_seconds",
+			"Time to obtain the query plan, by plan-cache outcome", "seconds",
+			queryLatencyBuckets, metric.Labels{"cache": c})
 	}
 	for _, k := range metricQueryKinds {
 		byStatus := make(map[string]*metric.Counter, len(metricQueryStatuses))
@@ -141,6 +156,9 @@ func newQueryMetrics() *queryMetrics {
 		m.inflight[k] = reg.Gauge("gr_query_inflight",
 			"Currently executing queries, by kind", "queries",
 			metric.Labels{"kind": k})
+		m.execute[k] = reg.Histogram("gr_query_execute_duration_seconds",
+			"Time spent in the executor only, by kind, excluding parse and plan", "seconds",
+			queryLatencyBuckets, metric.Labels{"kind": k})
 	}
 	m.returned = reg.Histogram("gr_query_rows_returned",
 		"Rows in the result set, the output cardinality", "rows", rowCountBuckets, nil)
@@ -159,6 +177,27 @@ func (m *queryMetrics) recordRows(returned, scanned int64) {
 	}
 	if m.scanned != nil {
 		m.scanned.Observe(float64(scanned))
+	}
+}
+
+// recordPlan observes the time to obtain one query's plan (doc 20 §3.1), labelled by whether the
+// plan cache served it (cache=hit, which pays only the lookup) or it was compiled fresh
+// (cache=miss, which pays parse, bind, and planning). A write is always a miss, since the write
+// path does not cache. Splitting plan time out of the end-to-end latency tells a plan-bound slow
+// query (a cold cache, a query that keeps missing) from an execute-bound one.
+func (m *queryMetrics) recordPlan(cache string, d time.Duration) {
+	if h := m.plan[cache]; h != nil {
+		h.Observe(d.Seconds())
+	}
+}
+
+// recordExecute observes the time one query of the given kind spent in the executor alone (doc 20
+// §3.1), the span from the plan being ready to the last result row, excluding parse and plan. It
+// is the other half of the split recordPlan starts: the end-to-end latency is roughly parse plus
+// plan plus execute, so an operator reads which phase a slow query is bound by.
+func (m *queryMetrics) recordExecute(kind string, d time.Duration) {
+	if h := m.execute[kind]; h != nil {
+		h.Observe(d.Seconds())
 	}
 }
 

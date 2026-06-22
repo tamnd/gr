@@ -222,6 +222,78 @@ func TestMetricsRowAmplification(t *testing.T) {
 	}
 }
 
+// TestMetricsPlanCacheSplit confirms gr_query_plan_duration_seconds splits a cold compile from a
+// warm cache hit: the first run of a read misses the plan cache, the second run of the same text
+// hits it, and a write is always a miss (doc 20 §3.1).
+func TestMetricsPlanCacheSplit(t *testing.T) {
+	db, err := Open("mp.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// A write compiles fresh: one plan-cache miss.
+	if _, err := db.Run(context.Background(), "CREATE (:Person {name: 'a'})", nil); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if h := db.Metrics().Histogram("gr_query_plan_duration_seconds", Labels{"cache": "miss"}); h.Count == 0 {
+		t.Error("write should record a plan-cache miss")
+	}
+
+	// First run of a read text: a miss that fills the cache.
+	r1, err := db.Run(context.Background(), "MATCH (p:Person) RETURN p", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainResult(t, r1)
+	missAfterFirst := db.Metrics().Histogram("gr_query_plan_duration_seconds", Labels{"cache": "miss"}).Count
+
+	// Second run of the same text: a cache hit, recorded under cache=hit, not miss.
+	r2, err := db.Run(context.Background(), "MATCH (p:Person) RETURN p", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainResult(t, r2)
+
+	hit := db.Metrics().Histogram("gr_query_plan_duration_seconds", Labels{"cache": "hit"})
+	if hit.Count != 1 {
+		t.Errorf("plan hits = %d, want 1 (the second run of the same read)", hit.Count)
+	}
+	if missNow := db.Metrics().Histogram("gr_query_plan_duration_seconds", Labels{"cache": "miss"}).Count; missNow != missAfterFirst {
+		t.Errorf("misses grew on a cache hit: %d then %d", missAfterFirst, missNow)
+	}
+}
+
+// TestMetricsExecuteDuration confirms gr_query_execute_duration_seconds records the executor span
+// for both a streaming read (at Close) and an eager write (doc 20 §3.1).
+func TestMetricsExecuteDuration(t *testing.T) {
+	db, err := Open("mx.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Run(context.Background(), "CREATE (:Person {name: 'a'})", nil); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if h := db.Metrics().Histogram("gr_query_execute_duration_seconds", Labels{"kind": "write"}); h.Count != 1 {
+		t.Errorf("write execute count = %d, want 1", h.Count)
+	}
+
+	// A streaming read records its executor span at Close, not before.
+	res, err := db.Run(context.Background(), "MATCH (p:Person) RETURN p", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := db.Metrics().Histogram("gr_query_execute_duration_seconds", Labels{"kind": "read"}); h.Count != 0 {
+		t.Errorf("read execute count before close = %d, want 0", h.Count)
+	}
+	drainResult(t, res)
+	if h := db.Metrics().Histogram("gr_query_execute_duration_seconds", Labels{"kind": "read"}); h.Count != 1 {
+		t.Errorf("read execute count after close = %d, want 1", h.Count)
+	}
+}
+
 // TestMetricsAlwaysOn confirms the registry exists on a plain Open with no logging configured,
 // so the metrics plane is always on (doc 20 §1.2).
 func TestMetricsAlwaysOn(t *testing.T) {

@@ -491,12 +491,15 @@ func (db *DB) query(cypher string, params map[string]value.Value, lazy bool) (*R
 	if err != nil {
 		return nil, err
 	}
+	// The executor span for the streaming read starts here, once the plan is ready and the
+	// snapshot is open; Close records the time since it (doc 20 §3.1).
+	execStart := time.Now()
 	cur, err := exec.Open(entry.Op, db.execCtx(tx, entry.Bound, params))
 	if err != nil {
 		_ = tx.Abort()
 		return nil, err
 	}
-	return &Result{cols: cur.Cols(), cursor: cur, tx: tx, ownTx: true, mat: db.materializer(tx, lazy), mscan: cur.ScanCount()}, nil
+	return &Result{cols: cur.Cols(), cursor: cur, tx: tx, ownTx: true, mat: db.materializer(tx, lazy), mscan: cur.ScanCount(), mexec: execStart}, nil
 }
 
 // execCtx builds the execution context shared by every run of a statement: the
@@ -536,6 +539,9 @@ func (db *DB) execCtx(etx engine.Tx, b *bind.Bound, params map[string]value.Valu
 // statement partly applied at commit. It does not begin, commit, or abort the
 // transaction; the caller owns that.
 func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]value.Value) ([]string, []eval.Row, Summary, *atomic.Int64, error) {
+	// A write is never served from the plan cache, so the bind and plan below are a full
+	// compile: time them as a plan-cache miss for gr_query_plan_duration_seconds (doc 20 §3.1).
+	pstart := time.Now()
 	if err := internWriteNames(etx, q); err != nil {
 		return nil, nil, Summary{}, nil, err
 	}
@@ -543,11 +549,18 @@ func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]v
 	if err != nil {
 		return nil, nil, Summary{}, nil, err
 	}
+	op := plan.Plan(b)
+	db.metrics.recordPlan("miss", time.Since(pstart))
 	eff := &exec.SideEffects{}
 	ctx := db.execCtx(etx, b, params)
 	ctx.Effects = eff
-	cur, err := exec.Open(plan.Plan(b), ctx)
+	// The executor span starts here, once the plan is ready, and ends when the cursor drains and
+	// closes: it is gr_query_execute_duration_seconds for the write, the executor work alone with
+	// parse and plan excluded (doc 20 §3.1).
+	estart := time.Now()
+	cur, err := exec.Open(op, ctx)
 	if err != nil {
+		db.metrics.recordExecute("write", time.Since(estart))
 		return nil, nil, Summary{}, nil, err
 	}
 	cols := cur.Cols()
@@ -556,6 +569,7 @@ func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]v
 		row, ok, err := cur.Next()
 		if err != nil {
 			_ = cur.Close()
+			db.metrics.recordExecute("write", time.Since(estart))
 			return nil, nil, Summary{}, nil, err
 		}
 		if !ok {
@@ -564,8 +578,10 @@ func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]v
 		buf = append(buf, cloneRow(row))
 	}
 	if err := cur.Close(); err != nil {
+		db.metrics.recordExecute("write", time.Since(estart))
 		return nil, nil, Summary{}, nil, err
 	}
+	db.metrics.recordExecute("write", time.Since(estart))
 	// The scan counter is final now the cursor is drained and closed, so the caller stores it
 	// on the eager result and measureQuery reads it for gr_query_rows_scanned (doc 20 §3.1).
 	return cols, buf, summaryOf(eff), ctx.Scanned, nil
@@ -1133,9 +1149,11 @@ func summaryOf(e *exec.SideEffects) Summary {
 // drifts again. Drift is a relative-fraction test, so uniform growth does not trigger
 // it, and a re-plan on a false positive only costs a compile, never correctness.
 func (db *DB) compile(cypher string) (*plan.Entry, error) {
+	start := time.Now()
 	key := plan.Key{Text: plan.NormalizeText(cypher), Catalog: db.eng.CatalogVersion()}
 	st := engineStats{db.eng}
 	if entry, ok := db.cache.Get(key); ok && !plan.Drifted(entry.Stats, st, db.drift()) {
+		db.metrics.recordPlan("hit", time.Since(start))
 		return entry, nil
 	}
 	q, err := parse.Parse(cypher)
@@ -1163,6 +1181,7 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 	op := plan.SeekRewrite(plan.PlanWithStats(b, st), b, indexLookup{db.eng}, st)
 	entry := &plan.Entry{Bound: b, Op: op, Stats: plan.Snapshot(op, st)}
 	db.cache.Put(key, entry)
+	db.metrics.recordPlan("miss", time.Since(start))
 	return entry, nil
 }
 
@@ -1315,6 +1334,10 @@ type Result struct {
 	mkind  string
 	mstart time.Time
 	mdone  bool
+	// mexec is the start of the executor span for a streaming read (doc 20 §3.1): query stamps
+	// it once the plan is ready and the cursor is open, and Close records the time since it as
+	// gr_query_execute_duration_seconds, the executor work alone with parse and plan excluded.
+	mexec time.Time
 	// mscan is the shared executor scan counter (doc 20 §3.1), the rows the query's scans
 	// and expands touched, read at the recording point for gr_query_rows_scanned. It is nil
 	// for a result with no execution (a schema or EXPLAIN result). rowsReturned counts the
@@ -1437,6 +1460,9 @@ func (r *Result) Close() error {
 			r.mdb.metrics.recordError(r.err)
 		}
 		r.mdb.metrics.recordRows(r.rowsReturned, scanLoad(r.mscan))
+		if !r.mexec.IsZero() {
+			r.mdb.metrics.recordExecute(r.mkind, time.Since(r.mexec))
+		}
 		r.mdb.metrics.finish(r.mkind, metricStatusOf(r.err), time.Since(r.mstart))
 	}
 	if cerr != nil {

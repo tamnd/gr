@@ -284,14 +284,19 @@ func boltAuthOptions(auth httpd.AuthProvider) []gr.BoltOption {
 // boltAuthFunc adapts an HTTP auth provider to the Bolt handler's auth seam (doc 18
 // §10.4). The Bolt "basic" scheme carries the principal and password, "bearer" carries a
 // token in the credentials with no principal; both route to the provider's Authenticate.
-// The "none" scheme is rejected, since reaching here means auth is required.
-func boltAuthFunc(auth httpd.AuthProvider) func(scheme, principal, credentials string) error {
-	return func(scheme, principal, credentials string) error {
+// The "none" scheme is rejected, since reaching here means auth is required. The
+// authenticated principal's roles are returned so the Bolt path authorizes each statement
+// against the same role model as HTTP (doc 18 §10.6).
+func boltAuthFunc(auth httpd.AuthProvider) func(scheme, principal, credentials string) ([]string, error) {
+	return func(scheme, principal, credentials string) ([]string, error) {
 		if scheme == "" || scheme == "none" {
-			return errors.New("authentication required")
+			return nil, errors.New("authentication required")
 		}
-		_, err := auth.Authenticate(context.Background(), scheme, principal, []byte(credentials))
-		return err
+		p, err := auth.Authenticate(context.Background(), scheme, principal, []byte(credentials))
+		if err != nil {
+			return nil, err
+		}
+		return p.Roles, nil
 	}
 }
 

@@ -142,8 +142,10 @@ type fakeHandler struct {
 	beginErr error
 }
 
-func (h *fakeHandler) Authenticate(scheme, principal, credentials string) error { return h.authErr }
-func (h *fakeHandler) Begin(extra map[string]any) (Tx, error) {
+func (h *fakeHandler) Authenticate(scheme, principal, credentials string) (Auth, error) {
+	return Auth{Principal: principal}, h.authErr
+}
+func (h *fakeHandler) Begin(extra map[string]any, auth Auth) (Tx, error) {
 	if h.beginErr != nil {
 		return nil, h.beginErr
 	}

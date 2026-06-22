@@ -33,9 +33,10 @@ func WithBoltAuth() BoltOption {
 // of the database credential store, so the Bolt and HTTP transports share one auth
 // provider (doc 18 §10.4): a deployment configures auth once and both surfaces
 // enforce it identically. The function receives the HELLO/LOGON scheme, principal,
-// and credentials and returns nil to admit the connection or an error to reject it;
-// it is responsible for rejecting the "none" scheme when auth is required.
-func WithBoltAuthFunc(fn func(scheme, principal, credentials string) error) BoltOption {
+// and credentials and returns the principal's roles to admit the connection, or an
+// error to reject it; it is responsible for rejecting the "none" scheme when auth is
+// required. The returned roles drive per-statement authorization (doc 18 §10.6).
+func WithBoltAuthFunc(fn func(scheme, principal, credentials string) (roles []string, err error)) BoltOption {
 	return func(h *boltHandler) {
 		h.requireAuth = true
 		h.authFunc = fn
@@ -66,43 +67,47 @@ func (db *DB) BoltHandler(opts ...BoltOption) bolt.Handler {
 type boltHandler struct {
 	db          *DB
 	requireAuth bool
-	authFunc    func(scheme, principal, credentials string) error
+	authFunc    func(scheme, principal, credentials string) (roles []string, err error)
 	bookmark    atomic.Uint64
 }
 
 // Authenticate verifies a connection's credentials (doc 18 §10). With auth off it
 // authorizes everyone; with auth on it checks the principal and credentials
 // against the credential store and rejects the "none" scheme.
-func (h *boltHandler) Authenticate(scheme, principal, credentials string) error {
+func (h *boltHandler) Authenticate(scheme, principal, credentials string) (bolt.Auth, error) {
 	if !h.requireAuth {
-		return nil
+		return bolt.Auth{}, nil
 	}
 	// An external verifier (the shared auth provider) takes over entirely when set,
-	// including rejecting the "none" scheme (doc 18 §10.4).
+	// including rejecting the "none" scheme (doc 18 §10.4). It returns the principal's
+	// roles, so per-statement authorization runs the same role model as HTTP.
 	if h.authFunc != nil {
-		return h.authFunc(scheme, principal, credentials)
+		roles, err := h.authFunc(scheme, principal, credentials)
+		if err != nil {
+			return bolt.Auth{}, err
+		}
+		return bolt.Auth{Principal: principal, Roles: roles}, nil
 	}
 	if scheme == "none" || scheme == "" {
-		return errors.New("authentication required")
+		return bolt.Auth{}, errors.New("authentication required")
 	}
 	roles, ok, err := h.db.Authenticate(principal, credentials)
 	if err != nil {
-		return err
+		return bolt.Auth{}, err
 	}
 	if !ok {
-		return errors.New("invalid principal or credentials")
+		return bolt.Auth{}, errors.New("invalid principal or credentials")
 	}
-	_ = roles
-	return nil
+	return bolt.Auth{Principal: principal, Roles: roles}, nil
 }
 
 // Begin opens a Bolt transaction (doc 18 §5.10). The engine transaction itself is
 // opened lazily on the first Run, once the statement is known, so the access mode
 // can follow the client's mode hint or the statement kind (doc 18 §8.3) rather
 // than always taking the write path.
-func (h *boltHandler) Begin(extra map[string]any) (bolt.Tx, error) {
+func (h *boltHandler) Begin(extra map[string]any, auth bolt.Auth) (bolt.Tx, error) {
 	mode, hinted := boltModeHint(extra)
-	return &boltTx{h: h, db: h.db, mode: mode, modeHinted: hinted}, nil
+	return &boltTx{h: h, db: h.db, mode: mode, modeHinted: hinted, roles: auth.Roles}, nil
 }
 
 // boltModeHint reads the access-mode hint from a BEGIN or RUN extra map (doc 18
@@ -130,6 +135,7 @@ type boltTx struct {
 	db         *DB
 	mode       AccessMode
 	modeHinted bool
+	roles      []string // the connection's roles, for per-statement authorization
 
 	tx         *Tx
 	standalone bool // last statement auto-committed itself (schema/admin/pragma)
@@ -137,7 +143,21 @@ type boltTx struct {
 
 // Run executes a query and returns a cursor over its rows (doc 18 §5.6).
 func (t *boltTx) Run(query string, params map[string]value.Value) (bolt.Cursor, error) {
-	kind, _ := t.db.StatementKind(query)
+	kind, kindErr := t.db.StatementKind(query)
+
+	// Authorize the statement against the connection's roles before any side effect
+	// (doc 18 §10.6), the same role model the HTTP surface enforces. With auth off
+	// there is no authorization. An unparseable statement is let through so execution
+	// reports it as a syntax error rather than a misleading forbidden error.
+	if t.h.requireAuth && kindErr == nil {
+		if boltRoleLevel(t.roles) < boltKindLevel(kind) {
+			return nil, &bolt.StatusError{
+				Code:    "Neo.ClientError.Security.Forbidden",
+				Message: "this account is not allowed to run " + kind.String() + " statements",
+			}
+		}
+	}
+
 	p := boltParams(params)
 
 	// Schema, administrative, and pragma statements auto-commit and cannot run
@@ -258,6 +278,58 @@ func (b boltMat) MaterializeRel(id uint64) (bolt.Rel, error) {
 		StartElementID: r.StartElementId(),
 		EndElementID:   r.EndElementId(),
 	}, nil
+}
+
+// Authorization levels order the built-in roles by what statement kind they may run
+// (doc 18 §10.6), mirroring the HTTP surface's model so both transports authorize
+// identically. A principal's effective level is the highest its roles grant, and a
+// statement runs when that level reaches the kind's level.
+const (
+	boltLevelNone   = -1 // no role, or only unknown roles: may run nothing
+	boltLevelRead   = 0  // reader: read statements only
+	boltLevelWrite  = 1  // editor: read and write data
+	boltLevelSchema = 2  // publisher: read, write, and change schema
+	boltLevelAdmin  = 3  // admin: everything publisher may, plus user management
+)
+
+// boltRoleLevel returns the highest access level a set of roles grants (doc 18 §10.6).
+// An unknown role grants nothing, so a typo fails closed rather than open.
+func boltRoleLevel(roles []string) int {
+	level := boltLevelNone
+	for _, role := range roles {
+		l := boltLevelNone
+		switch role {
+		case RoleReader:
+			l = boltLevelRead
+		case RoleEditor:
+			l = boltLevelWrite
+		case RolePublisher:
+			l = boltLevelSchema
+		case RoleAdmin:
+			l = boltLevelAdmin
+		}
+		if l > level {
+			level = l
+		}
+	}
+	return level
+}
+
+// boltKindLevel returns the access level a statement of the given kind requires
+// (doc 18 §10.6, §12.3): a read needs read, a write needs write, a schema change
+// needs schema, and an administrative statement needs admin. This mirrors the HTTP
+// surface's kindLevel so both transports authorize a statement identically.
+func boltKindLevel(k Kind) int {
+	switch k {
+	case WriteStatement:
+		return boltLevelWrite
+	case SchemaStatement:
+		return boltLevelSchema
+	case AdminStatement:
+		return boltLevelAdmin
+	default:
+		return boltLevelRead
+	}
 }
 
 // boltQueryType maps a statement kind to the Bolt result-summary type letter

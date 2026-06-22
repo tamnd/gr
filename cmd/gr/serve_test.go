@@ -322,7 +322,7 @@ func TestServeBolt(t *testing.T) {
 		if h == nil {
 			t.Fatal("Bolt handler not captured before HTTP listen")
 		}
-		tx, err := h.Begin(map[string]any{})
+		tx, err := h.Begin(map[string]any{}, bolt.Auth{})
 		if err != nil {
 			t.Fatalf("bolt begin: %v", err)
 		}
@@ -378,13 +378,13 @@ func TestServeBoltAuth(t *testing.T) {
 	var boltAddr string
 	var h bolt.Handler
 	listen := func(addr string, handler http.Handler) error {
-		if err := h.Authenticate("basic", "alice", "secret"); err != nil {
+		if _, err := h.Authenticate("basic", "alice", "secret"); err != nil {
 			t.Errorf("valid credentials rejected over Bolt: %v", err)
 		}
-		if err := h.Authenticate("basic", "alice", "wrong"); err == nil {
+		if _, err := h.Authenticate("basic", "alice", "wrong"); err == nil {
 			t.Error("wrong password accepted over Bolt")
 		}
-		if err := h.Authenticate("none", "", ""); err == nil {
+		if _, err := h.Authenticate("none", "", ""); err == nil {
 			t.Error("none scheme accepted over Bolt while auth is on")
 		}
 		return nil

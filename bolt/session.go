@@ -65,17 +65,31 @@ type Tx interface {
 	Rollback() error
 }
 
+// Auth is the authenticated identity a session carries from Authenticate to
+// Begin, so the engine can authorize each statement against the principal's roles
+// (doc 18 §10.6). An anonymous connection (authentication off) carries the zero
+// Auth, and the engine runs without authorization.
+type Auth struct {
+	// Principal is the authenticated account name, empty for an anonymous connection.
+	Principal string
+	// Roles are the principal's granted roles, the input to per-statement
+	// authorization.
+	Roles []string
+}
+
 // Handler is the engine seam the session drives (doc 18 §5). The engine adapter
 // implements it over a gr.DB; tests implement it with fakes. Keeping the session
 // behind this interface keeps the bolt package free of the engine and unit
 // testable over an in-memory connection.
 type Handler interface {
 	// Authenticate verifies credentials for an auth scheme ("none", "basic",
-	// "bearer", "kerberos"). A nil return authorizes the connection.
-	Authenticate(scheme, principal, credentials string) error
+	// "bearer", "kerberos"). A nil error authorizes the connection; the returned
+	// Auth carries the principal and roles the session hands to Begin.
+	Authenticate(scheme, principal, credentials string) (Auth, error)
 	// Begin opens a transaction with the given extra metadata (mode, db,
-	// tx_timeout, and the rest, doc 18 §5.3).
-	Begin(extra map[string]any) (Tx, error)
+	// tx_timeout, and the rest, doc 18 §5.3) for the authenticated identity, so the
+	// engine can authorize each statement against the principal's roles (doc 18 §10.6).
+	Begin(extra map[string]any, auth Auth) (Tx, error)
 }
 
 // Server holds the configuration shared across Bolt connections (doc 18 §5, §7).
@@ -145,6 +159,7 @@ type session struct {
 	state   state
 	connID  string
 
+	auth       Auth
 	tx         Tx
 	cursor     Cursor
 	autocommit bool
@@ -296,12 +311,14 @@ func (s *session) handleHello(h Hello) error {
 	pre51 := s.version.Major < 5 || (s.version.Major == 5 && s.version.Minor < 1)
 	if pre51 {
 		scheme, principal, credentials := authFields(h.Extra)
-		if err := s.srv.Handler.Authenticate(scheme, principal, credentials); err != nil {
+		auth, err := s.srv.Handler.Authenticate(scheme, principal, credentials)
+		if err != nil {
 			// A failed legacy HELLO leaves the connection unusable (doc 18 §5.4).
 			_ = s.send(Failure(codeUnauthorized, err.Error()))
 			s.state = stateDefunct
 			return nil
 		}
+		s.auth = auth
 		s.state = stateReady
 		return s.send(Success(meta))
 	}
@@ -312,11 +329,13 @@ func (s *session) handleHello(h Hello) error {
 // handleLogon authenticates a 5.1+ connection (doc 18 §5.5).
 func (s *session) handleLogon(l Logon) error {
 	scheme, principal, credentials := authFields(l.Auth)
-	if err := s.srv.Handler.Authenticate(scheme, principal, credentials); err != nil {
+	auth, err := s.srv.Handler.Authenticate(scheme, principal, credentials)
+	if err != nil {
 		// The connection stays in AUTHENTICATION so the driver can retry
 		// (doc 18 §5.5).
 		return s.send(Failure(codeUnauthorized, err.Error()))
 	}
+	s.auth = auth
 	s.state = stateReady
 	return s.send(Success(nil))
 }
@@ -344,7 +363,7 @@ func (s *session) handleRun(r Run) error {
 	autocommit := s.state == stateReady
 	tx := s.tx
 	if autocommit {
-		tx, err = s.srv.Handler.Begin(r.Extra)
+		tx, err = s.srv.Handler.Begin(r.Extra, s.auth)
 		if err != nil {
 			return s.failFrom(err)
 		}
@@ -376,7 +395,7 @@ func (s *session) handleRun(r Run) error {
 
 // handleBegin opens an explicit transaction (doc 18 §5.10).
 func (s *session) handleBegin(b Begin) error {
-	tx, err := s.srv.Handler.Begin(b.Extra)
+	tx, err := s.srv.Handler.Begin(b.Extra, s.auth)
 	if err != nil {
 		return s.failFrom(err)
 	}

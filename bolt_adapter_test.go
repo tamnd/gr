@@ -24,7 +24,7 @@ func boltDB(t *testing.T) *DB {
 // cursor into rows, and commits, the way an auto-commit Bolt RUN does.
 func runBolt(t *testing.T, h bolt.Handler, query string, params map[string]value.Value) ([][]value.Value, bolt.Summary, bolt.Tx) {
 	t.Helper()
-	tx, err := h.Begin(map[string]any{})
+	tx, err := h.Begin(map[string]any{}, bolt.Auth{})
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestBoltAdapterMaterializeNode(t *testing.T) {
 	_, _, tx := runBolt(t, h, "CREATE (:City {name: 'Oslo'})", nil)
 	tx.Commit()
 
-	tx, err := h.Begin(map[string]any{"mode": "r"})
+	tx, err := h.Begin(map[string]any{"mode": "r"}, bolt.Auth{})
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestBoltAdapterMaterializeRel(t *testing.T) {
 	_, _, tx := runBolt(t, h, "CREATE (a:P {n:'a'})-[:KNOWS {since: 2020}]->(b:P {n:'b'})", nil)
 	tx.Commit()
 
-	tx, err := h.Begin(map[string]any{"mode": "r"})
+	tx, err := h.Begin(map[string]any{"mode": "r"}, bolt.Auth{})
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestBoltAdapterParams(t *testing.T) {
 func TestBoltAdapterRollback(t *testing.T) {
 	db := boltDB(t)
 	h := db.BoltHandler()
-	tx, err := h.Begin(map[string]any{"mode": "w"})
+	tx, err := h.Begin(map[string]any{"mode": "w"}, bolt.Auth{})
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestBoltAdapterSchema(t *testing.T) {
 func TestBoltAdapterSyntaxError(t *testing.T) {
 	db := boltDB(t)
 	h := db.BoltHandler()
-	tx, err := h.Begin(map[string]any{})
+	tx, err := h.Begin(map[string]any{}, bolt.Auth{})
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -264,20 +264,94 @@ func TestBoltAdapterAuth(t *testing.T) {
 	}
 	h := db.BoltHandler(WithBoltAuth())
 
-	if err := h.Authenticate("basic", "alice", "secret"); err != nil {
+	auth, err := h.Authenticate("basic", "alice", "secret")
+	if err != nil {
 		t.Errorf("valid credentials rejected: %v", err)
 	}
-	if err := h.Authenticate("basic", "alice", "wrong"); err == nil {
+	if len(auth.Roles) != 1 || auth.Roles[0] != RoleReader {
+		t.Errorf("authenticated roles %v, want [%s]", auth.Roles, RoleReader)
+	}
+	if _, err := h.Authenticate("basic", "alice", "wrong"); err == nil {
 		t.Error("wrong password accepted")
 	}
-	if err := h.Authenticate("none", "", ""); err == nil {
+	if _, err := h.Authenticate("none", "", ""); err == nil {
 		t.Error("none scheme accepted while auth is required")
 	}
 
 	// With auth off the same none scheme is accepted.
-	if err := db.BoltHandler().Authenticate("none", "", ""); err != nil {
+	if _, err := db.BoltHandler().Authenticate("none", "", ""); err != nil {
 		t.Errorf("none scheme rejected while auth is off: %v", err)
 	}
+}
+
+// TestBoltAdapterAuthz confirms per-statement role authorization on the Bolt path (doc
+// 18 §10.6): a reader may read but not write, an editor may write, and an account with
+// no role may run nothing, the same role model the HTTP surface enforces.
+func TestBoltAdapterAuthz(t *testing.T) {
+	db := boltDB(t)
+	h := db.BoltHandler(WithBoltAuthFunc(func(scheme, principal, credentials string) ([]string, error) {
+		switch principal {
+		case "reader":
+			return []string{RoleReader}, nil
+		case "editor":
+			return []string{RoleEditor}, nil
+		default:
+			return nil, nil // authenticated but role-less
+		}
+	}))
+
+	run := func(principal, query string) error {
+		auth, err := h.Authenticate("basic", principal, "pw")
+		if err != nil {
+			t.Fatalf("authenticate %s: %v", principal, err)
+		}
+		tx, err := h.Begin(map[string]any{}, auth)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer tx.Rollback()
+		cur, err := tx.Run(query, nil)
+		if err != nil {
+			return err
+		}
+		return cur.Close()
+	}
+
+	forbidden := func(err error) bool {
+		var se *bolt.StatusError
+		return errors.As(err, &se) && se.Code == "Neo.ClientError.Security.Forbidden"
+	}
+
+	if err := run("reader", "RETURN 1"); err != nil {
+		t.Errorf("reader read rejected: %v", err)
+	}
+	if err := run("reader", "CREATE (:T)"); !forbidden(err) {
+		t.Errorf("reader write error = %v, want Forbidden", err)
+	}
+	if err := run("editor", "CREATE (:T)"); err != nil {
+		t.Errorf("editor write rejected: %v", err)
+	}
+	if err := run("nobody", "RETURN 1"); !forbidden(err) {
+		t.Errorf("role-less read error = %v, want Forbidden", err)
+	}
+}
+
+// TestBoltAdapterAuthOffNoAuthz confirms that with authentication off there is no
+// authorization, so an anonymous connection runs any statement (doc 18 §11.4).
+func TestBoltAdapterAuthOffNoAuthz(t *testing.T) {
+	db := boltDB(t)
+	h := db.BoltHandler() // auth off
+	auth, _ := h.Authenticate("none", "", "")
+	tx, err := h.Begin(map[string]any{}, auth)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	cur, err := tx.Run("CREATE (:T)", nil)
+	if err != nil {
+		t.Fatalf("anonymous write rejected with auth off: %v", err)
+	}
+	cur.Close()
 }
 
 // TestBoltAdapterAuthFunc confirms WithBoltAuthFunc routes authentication through the
@@ -287,21 +361,25 @@ func TestBoltAdapterAuth(t *testing.T) {
 func TestBoltAdapterAuthFunc(t *testing.T) {
 	db := boltDB(t)
 	var sawScheme, sawPrincipal, sawCreds string
-	h := db.BoltHandler(WithBoltAuthFunc(func(scheme, principal, credentials string) error {
+	h := db.BoltHandler(WithBoltAuthFunc(func(scheme, principal, credentials string) ([]string, error) {
 		sawScheme, sawPrincipal, sawCreds = scheme, principal, credentials
 		if principal == "ada" && credentials == "letmein" {
-			return nil
+			return []string{RoleEditor}, nil
 		}
-		return errors.New("denied")
+		return nil, errors.New("denied")
 	}))
 
-	if err := h.Authenticate("basic", "ada", "letmein"); err != nil {
+	auth, err := h.Authenticate("basic", "ada", "letmein")
+	if err != nil {
 		t.Errorf("verifier-approved credentials rejected: %v", err)
+	}
+	if len(auth.Roles) != 1 || auth.Roles[0] != RoleEditor {
+		t.Errorf("verifier roles %v, want [%s]", auth.Roles, RoleEditor)
 	}
 	if sawScheme != "basic" || sawPrincipal != "ada" || sawCreds != "letmein" {
 		t.Errorf("verifier saw (%q,%q,%q), want (basic,ada,letmein)", sawScheme, sawPrincipal, sawCreds)
 	}
-	if err := h.Authenticate("basic", "ada", "nope"); err == nil {
+	if _, err := h.Authenticate("basic", "ada", "nope"); err == nil {
 		t.Error("verifier-denied credentials accepted")
 	}
 }

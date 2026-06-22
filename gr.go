@@ -604,6 +604,9 @@ func (db *DB) Run(ctx context.Context, cypher string, params Params, opts ...Run
 	}
 	q, err := parse.Parse(cypher)
 	if err != nil {
+		// A parse failure never classifies into a kind, so it is not in gr_queries_total, but
+		// it is still a query error and counts in gr_query_errors_total{class="syntax"}.
+		db.metrics.recordError(err)
 		return nil, err
 	}
 	// The query metrics (doc 20 §3.1) wrap the dispatch: begin raises the in-flight gauge,
@@ -1410,6 +1413,9 @@ func (r *Result) Close() error {
 	// mdone makes this fire once, so Close is still safe to call more than once.
 	if r.mdb != nil && !r.mdone {
 		r.mdone = true
+		if r.err != nil {
+			r.mdb.metrics.recordError(r.err)
+		}
 		r.mdb.metrics.finish(r.mkind, metricStatusOf(r.err), time.Since(r.mstart))
 	}
 	if cerr != nil {

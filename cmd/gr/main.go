@@ -7,7 +7,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"strings"
 
@@ -33,7 +32,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 {
 		switch args[0] {
 		case "serve":
-			return runServe(args[1:], stdout, stderr, http.ListenAndServe, startBolt)
+			return runServe(args[1:], stdout, stderr, startHTTP, startBolt)
 		case "dump":
 			return runDumpCmd(args[1:], stdout, stderr)
 		case "load":

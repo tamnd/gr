@@ -47,7 +47,7 @@ const defaultBoltAddr = ":7687"
 // the Bolt listener; serve builds the fully configured listener (address, TLS posture)
 // and boltServe runs it, so a test can inspect the configuration without binding a port.
 // The real entry point passes startBolt, a test passes a stub.
-func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, h http.Handler) error, boltServe func(ln *bolt.Listener) (io.Closer, error)) int {
+func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, h http.Handler, tlsConf *tls.Config) error, boltServe func(ln *bolt.Listener) (io.Closer, error)) int {
 	fs := flag.NewFlagSet("gr serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	addr := fs.String("addr", defaultServeAddr, "address to listen on")
@@ -56,6 +56,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	boltEnabled := fs.Bool("bolt", false, "also serve the Bolt protocol so Neo4j drivers can connect")
 	boltAddr := fs.String("bolt-addr", defaultBoltAddr, "address the Bolt listener binds when --bolt is set")
 	boltTLS := fs.String("bolt-tls", "disabled", "Bolt transport security: disabled (plaintext), optional (sniff TLS or plaintext), or required (TLS only); optional and required need --tls-cert and --tls-key")
+	httpTLS := fs.String("http-tls", "disabled", "HTTP transport security: disabled (plaintext) or required (HTTPS only); required needs --tls-cert and --tls-key")
 	tlsCert := fs.String("tls-cert", "", "path to the PEM certificate chain for TLS listeners")
 	tlsKey := fs.String("tls-key", "", "path to the PEM private key for TLS listeners")
 	var users userList
@@ -98,9 +99,14 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 		fmt.Fprintln(stderr, "gr: --auth-impersonation needs an auth provider; pass --user, --auth-store, or --jwt-*")
 		return exitUsage
 	}
+	httpTLSConf, err := httpTLSPosture(*httpTLS, *tlsCert, *tlsKey)
+	if err != nil {
+		fmt.Fprintln(stderr, "gr:", err)
+		return exitUsage
+	}
 	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL, Impersonation: *impersonation})
 	defer srv.Close()
-	fmt.Fprintf(stderr, "gr serving %s on %s (database %q)\n", describeDB(path), *addr, *name)
+	fmt.Fprintf(stderr, "gr serving %s on %s (database %q, TLS %s)\n", describeDB(path), *addr, *name, *httpTLS)
 	if auth == nil {
 		fmt.Fprintln(stderr, "gr: WARNING authentication is off, every request is anonymous; pass --user or --auth-store to require auth")
 	}
@@ -136,7 +142,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	// listener returns, so the goroutine does not outlive the server.
 	stop := make(chan struct{})
 	go sweepLoop(srv, stop)
-	err = listen(*addr, srv)
+	err = listen(*addr, srv, httpTLSConf)
 	close(stop)
 	if err != nil {
 		fmt.Fprintln(stderr, "gr:", err)
@@ -355,6 +361,32 @@ func boltTLSPosture(mode, certPath, keyPath string) (bolt.TLSMode, *tls.Config, 
 	default:
 		return bolt.TLSDisabled, nil, fmt.Errorf("invalid --bolt-tls %q, want disabled, optional, or required", mode)
 	}
+}
+
+// httpTLSPosture turns the --http-tls flag into the HTTP listener's TLS configuration
+// (doc 18 §11.2). Unlike Bolt there is no sniffing posture: HTTP TLS is decided by the
+// port, so the choice is plaintext or HTTPS. The disabled posture returns a nil config so
+// the listener serves plaintext; required loads the shared certificate material.
+func httpTLSPosture(mode, certPath, keyPath string) (*tls.Config, error) {
+	switch mode {
+	case "disabled", "":
+		return nil, nil
+	case "required":
+		return loadServerTLS(certPath, keyPath)
+	default:
+		return nil, fmt.Errorf("invalid --http-tls %q, want disabled or required", mode)
+	}
+}
+
+// startHTTP serves the HTTP handler at addr, plaintext when tlsConf is nil and HTTPS when
+// it is set. It is the real listen the serve command injects; a test substitutes a stub.
+// The certificate and key already live in tlsConf, so ListenAndServeTLS takes empty paths.
+func startHTTP(addr string, h http.Handler, tlsConf *tls.Config) error {
+	if tlsConf == nil {
+		return http.ListenAndServe(addr, h)
+	}
+	srv := &http.Server{Addr: addr, Handler: h, TLSConfig: tlsConf}
+	return srv.ListenAndServeTLS("", "")
 }
 
 // loadServerTLS loads the certificate chain and private key and returns a server

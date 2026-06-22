@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync/atomic"
 
@@ -320,6 +321,18 @@ type DBInfo struct {
 	Indexes       int
 	Constraints   int
 	UniqueCons    int
+}
+
+// Backup writes a consistent physical image of the database to w and returns the
+// number of bytes written (doc 16, doc 17 §6.13). The image is a standalone .gr
+// file that opens directly, the fast same-version copy that complements the
+// portable logical dump. It is safe to call while the database is open; the
+// engine pins a single committed snapshot for the copy.
+func (db *DB) Backup(w io.Writer) (int64, error) {
+	if db.eng == nil {
+		return 0, ErrClosed
+	}
+	return db.eng.Backup(w)
 }
 
 // Info gathers the database's static and structural facts (doc 17 §6.15). The

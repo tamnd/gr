@@ -7,7 +7,10 @@ import (
 	"time"
 
 	"github.com/tamnd/gr/ast"
+	"github.com/tamnd/gr/bind"
+	"github.com/tamnd/gr/engine"
 	"github.com/tamnd/gr/metric"
+	"github.com/tamnd/gr/parse"
 )
 
 // Labels is a metric's bounded label set (doc 20 §7.2), re-exported from the metric package
@@ -81,6 +84,12 @@ var metricQueryKinds = []string{"read", "write", "schema", "admin", "pragma", "e
 // §3.1): the outcomes a query ends in.
 var metricQueryStatuses = []string{"ok", "error", "timeout", "killed"}
 
+// metricErrorClasses is the bounded domain of the class label on gr_query_errors_total (doc 20
+// §3.1): the cause an error falls into. The metric is a sub-view of
+// gr_queries_total{status="error"} broken out by cause, plus the syntax errors that fail before
+// a query classifies into a kind and so never reach gr_queries_total at all.
+var metricErrorClasses = []string{"syntax", "semantic", "constraint", "conflict", "resource", "internal"}
+
 // queryMetrics holds the pre-resolved handles for the query throughput, latency, and in-flight
 // metrics (doc 20 §3.1). Resolving every (kind, status) handle once at open keeps the record
 // path off the registry lock: recording a finished query is a couple of map reads and an
@@ -90,6 +99,7 @@ type queryMetrics struct {
 	total    map[string]map[string]*metric.Counter // gr_queries_total by [kind][status]
 	duration map[string]*metric.Histogram          // gr_query_duration_seconds by [kind]
 	inflight map[string]*metric.Gauge              // gr_query_inflight by [kind]
+	errors   map[string]*metric.Counter            // gr_query_errors_total by [class]
 }
 
 // newQueryMetrics builds the registry and pre-resolves every query-metric handle (doc 20
@@ -102,6 +112,11 @@ func newQueryMetrics() *queryMetrics {
 		total:    make(map[string]map[string]*metric.Counter, len(metricQueryKinds)),
 		duration: make(map[string]*metric.Histogram, len(metricQueryKinds)),
 		inflight: make(map[string]*metric.Gauge, len(metricQueryKinds)),
+		errors:   make(map[string]*metric.Counter, len(metricErrorClasses)),
+	}
+	for _, c := range metricErrorClasses {
+		m.errors[c] = reg.Counter("gr_query_errors_total",
+			"Query errors by cause", "errors", metric.Labels{"class": c})
 	}
 	for _, k := range metricQueryKinds {
 		byStatus := make(map[string]*metric.Counter, len(metricQueryStatuses))
@@ -148,6 +163,19 @@ func (m *queryMetrics) finish(kind, status string, d time.Duration) {
 	}
 }
 
+// recordError increments gr_query_errors_total for the error's class (doc 20 §3.1). It is the
+// one error-counting point every terminal error path calls, including a parse failure that
+// never classifies into a kind, so the error metric is the complete error-by-cause view: it is
+// broader than the status split on gr_queries_total, which omits a pre-kind parse error.
+func (m *queryMetrics) recordError(err error) {
+	if err == nil {
+		return
+	}
+	if c := m.errors[metricErrorClass(err)]; c != nil {
+		c.Inc()
+	}
+}
+
 // metricQueryKind classifies a parsed statement into its query-metric kind label (doc 20
 // §3.1): EXPLAIN is its own kind (it never executes the underlying statement), then admin,
 // pragma, and schema by their clause, then a statement with write clauses is a write and the
@@ -184,6 +212,34 @@ func metricStatusOf(err error) string {
 	}
 }
 
+// metricErrorClass maps an error to its gr_query_errors_total class label (doc 20 §3.1). It
+// keys off the typed errors and sentinels the library exposes, the same taxonomy the CLI exit
+// codes and the server's Neo4j status mapping use: a parse error is syntax, a bind error is
+// semantic, a constraint violation is constraint, a transaction conflict is conflict, a
+// deadline or admission refusal is resource, and anything that names no known cause is
+// internal. The class is coarser than the full error space on purpose, since it is a label
+// dimension an operator alerts on, not a message.
+func metricErrorClass(err error) string {
+	var perr *parse.Error
+	var berr *bind.Error
+	var cerr *engine.ConstraintError
+	switch {
+	case errors.As(err, &perr):
+		return "syntax"
+	case errors.As(err, &berr):
+		return "semantic"
+	case errors.As(err, &cerr):
+		return "constraint"
+	case errors.Is(err, ErrConflict):
+		return "conflict"
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
+		errors.Is(err, ErrOverloaded), errors.Is(err, ErrRateLimited):
+		return "resource"
+	default:
+		return "internal"
+	}
+}
+
 // measureQuery records the query metrics for one statement at a dispatch boundary (doc 20
 // §3.1). begin must already have raised the in-flight gauge for kind. An error or an eagerly
 // executed result (a write, a schema or admin command, a pragma, an EXPLAIN) is complete now,
@@ -192,6 +248,7 @@ func metricStatusOf(err error) string {
 // where the parse-through-last-row latency actually ends.
 func (db *DB) measureQuery(kind string, start time.Time, res *Result, err error) (*Result, error) {
 	if err != nil {
+		db.metrics.recordError(err)
 		db.metrics.finish(kind, metricStatusOf(err), time.Since(start))
 		return res, err
 	}

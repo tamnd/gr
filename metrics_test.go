@@ -2,6 +2,7 @@ package gr
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/tamnd/gr/vfs"
@@ -112,6 +113,72 @@ func TestMetricsErrorStatus(t *testing.T) {
 	}
 	if total != 1 {
 		t.Errorf("total across all series = %d, want 1 (the parse error is not counted)", total)
+	}
+}
+
+// TestMetricsErrorClasses confirms gr_query_errors_total splits errors by cause: a parse
+// failure is syntax (and is counted here even though it never reaches gr_queries_total), and a
+// constraint violation is constraint.
+func TestMetricsErrorClasses(t *testing.T) {
+	db, err := Open("mc.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// A parse error: counted in gr_query_errors_total{class="syntax"} though absent from
+	// gr_queries_total.
+	if _, err := db.Run(context.Background(), "this is not cypher", nil); err == nil {
+		t.Fatal("expected a parse error")
+	}
+	if c := db.Metrics().Counter("gr_query_errors_total", Labels{"class": "syntax"}); c != 1 {
+		t.Errorf("syntax errors = %d, want 1", c)
+	}
+
+	// A constraint violation: insert a duplicate against a unique constraint.
+	if _, err := db.Run(context.Background(),
+		"CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE", nil); err != nil {
+		t.Fatalf("create constraint: %v", err)
+	}
+	if _, err := db.Run(context.Background(), "CREATE (:Person {email: 'a@b.c'})", nil); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+	if _, err := db.Run(context.Background(), "CREATE (:Person {email: 'a@b.c'})", nil); err == nil {
+		t.Fatal("expected a constraint violation on the duplicate")
+	}
+	if c := db.Metrics().Counter("gr_query_errors_total", Labels{"class": "constraint"}); c != 1 {
+		t.Errorf("constraint errors = %d, want 1", c)
+	}
+
+	// The error total across all classes is the two failures (syntax + constraint), since the
+	// successful statements did not count.
+	total := uint64(0)
+	for _, class := range metricErrorClasses {
+		total += db.Metrics().Counter("gr_query_errors_total", Labels{"class": class})
+	}
+	if total != 2 {
+		t.Errorf("errors across all classes = %d, want 2", total)
+	}
+}
+
+// TestMetricsErrorClassMapping checks the classifier maps the library's typed errors and
+// sentinels to their class labels, the same taxonomy the CLI and server share.
+func TestMetricsErrorClassMapping(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{ErrConflict, "conflict"},
+		{ErrOverloaded, "resource"},
+		{ErrRateLimited, "resource"},
+		{context.DeadlineExceeded, "resource"},
+		{context.Canceled, "resource"},
+		{errors.New("something unexpected"), "internal"},
+	}
+	for _, c := range cases {
+		if got := metricErrorClass(c.err); got != c.want {
+			t.Errorf("metricErrorClass(%v) = %q, want %q", c.err, got, c.want)
+		}
 	}
 }
 

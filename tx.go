@@ -194,6 +194,9 @@ func (tx *Tx) Run(ctx context.Context, cypher string, params Params, opts ...Run
 	}
 	q, err := parse.Parse(cypher)
 	if err != nil {
+		// As in the database-level Run, a parse failure counts in gr_query_errors_total even
+		// though it never reaches gr_queries_total (doc 20 §3.1).
+		tx.db.metrics.recordError(err)
 		return nil, err
 	}
 	// The query metrics (doc 20 §3.1) wrap the dispatch the same way the database-level Run

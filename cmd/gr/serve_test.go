@@ -249,6 +249,37 @@ func TestServeAuthStoreConflict(t *testing.T) {
 	}
 }
 
+// TestServeImpersonationNeedsAuth rejects --auth-impersonation with no auth provider as a
+// usage error, since impersonation needs a principal to authorize against.
+func TestServeImpersonationNeedsAuth(t *testing.T) {
+	listen := func(addr string, h http.Handler) error { return nil }
+	var out, errw bytes.Buffer
+	if code := runServe([]string{"--auth-impersonation"}, &out, &errw, listen); code != exitUsage {
+		t.Errorf("code = %d, want exitUsage", code)
+	}
+}
+
+// TestServeImpersonationEndToEnd serves with --user and --auth-impersonation and confirms
+// an admin can run a query as another user over the wire.
+func TestServeImpersonationEndToEnd(t *testing.T) {
+	listen := func(addr string, handler http.Handler) error {
+		body := `{"statement":"CREATE (:T)","impersonatedUser":"e"}`
+		req := httptest.NewRequest(http.MethodPost, "/db/neo4j/query/v2", strings.NewReader(body))
+		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("boss:pw")))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("admin-as-editor write = %d, want 200, body = %s", rec.Code, rec.Body.String())
+		}
+		return nil
+	}
+	var out, errw bytes.Buffer
+	args := []string{"--user", "boss:pw:admin", "--user", "e:pw:editor", "--auth-impersonation"}
+	if code := runServe(args, &out, &errw, listen); code != exitOK {
+		t.Fatalf("code = %d, stderr = %s", code, errw.String())
+	}
+}
+
 // TestServeListenError surfaces a listener failure as the I/O exit code.
 func TestServeListenError(t *testing.T) {
 	listen := func(addr string, h http.Handler) error {

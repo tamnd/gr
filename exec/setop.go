@@ -5,6 +5,7 @@ import (
 
 	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/eval"
+	"github.com/tamnd/gr/plan"
 	"github.com/tamnd/gr/value"
 )
 
@@ -89,8 +90,15 @@ type joinOp struct {
 	right operator
 	ctx   *Ctx
 
-	table map[string][]eval.Row
-	built bool
+	// rightPlan is the build side's logical plan, kept so build can construct the hash
+	// table across cores from a private copy of the pipeline per worker (paralleljoin.go)
+	// when no memory budget is set. It is nil for a join whose build side is not a plan
+	// the executor can recompile (only the test harness builds one of those).
+	rightPlan plan.Op
+
+	table       map[string][]eval.Row
+	built       bool
+	rightOpened bool // whether the serial build opened o.right (so close knows to close it)
 
 	// grace is non-nil once a keyed join's build side has grown past the memory
 	// budget and the join has spilled its partitions to disk (spilljoin.go); next
@@ -110,10 +118,11 @@ type joinOp struct {
 func (o *joinOp) open(ctx *Ctx) error {
 	o.ctx, o.table, o.built, o.grace = ctx, nil, false, nil
 	o.blockBuild, o.blockRdr = nil, nil
+	o.rightOpened = false
 	o.cur, o.matches, o.mpos = nil, nil, 0
-	if err := o.right.open(ctx); err != nil {
-		return err
-	}
+	// The right (build) side is opened lazily by build, because the parallel build path
+	// runs private copies of the build subplan rather than this operator and would
+	// otherwise pay for a wasted serial scan here.
 	return o.left.open(ctx)
 }
 
@@ -124,6 +133,25 @@ func (o *joinOp) open(ctx *Ctx) error {
 // product, which has no key to partition on) spills the build side to one file that
 // next streams per probe row.
 func (o *joinOp) build() error {
+	// Parallel build path: with no memory budget the table lives in memory anyway, so
+	// when the build side is a scan-rooted independent pipeline, construct it across
+	// cores. The probe below is unchanged and serial, so the output and its order match
+	// the serial build exactly. A budget forces the serial path so the join can spill.
+	if !o.ctx.spillEnabled() && o.rightPlan != nil {
+		table, ok, err := parallelBuildTable(o.ctx, o.rightPlan, o.on)
+		if err != nil {
+			return err
+		}
+		if ok {
+			o.table = table
+			o.built = true
+			return nil
+		}
+	}
+	if err := o.right.open(o.ctx); err != nil {
+		return err
+	}
+	o.rightOpened = true
 	o.table = map[string][]eval.Row{}
 	var bytes int64
 	canSpill := o.ctx.spillEnabled()
@@ -278,8 +306,10 @@ func (o *joinOp) close() error {
 		_ = o.blockBuild.discardOnce()
 	}
 	err := o.left.close()
-	if rerr := o.right.close(); err == nil {
-		err = rerr
+	if o.rightOpened {
+		if rerr := o.right.close(); err == nil {
+			err = rerr
+		}
 	}
 	return err
 }

@@ -38,6 +38,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return runDumpCmd(args[1:], stdout, stderr)
 		case "load":
 			return runLoadCmd(args[1:], stdin, stdout, stderr)
+		case "info":
+			return runInfoCmd(args[1:], stdout, stderr)
 		}
 	}
 	cfg, err := parseArgs(args)
@@ -191,13 +193,15 @@ Usage:
   gr serve [flags] [database]
   gr dump  [flags] database
   gr load  [flags] database
+  gr info  database
 
 Open the interactive shell on a database, run a one-shot statement, or run a
 script. With no database argument gr opens a transient in-memory database.
 
 The serve subcommand serves the HTTP/JSON API over a database; the dump and
-load subcommands write and replay a logical Cypher dump. Run "gr serve -h",
-"gr dump -h", or "gr load -h" for their flags.
+load subcommands write and replay a logical Cypher dump; the info subcommand
+prints a database's facts. Run "gr serve -h", "gr dump -h", or "gr load -h"
+for their flags.
 
 Flags:
   -c, --cypher STMT     Run one statement and exit (repeatable)

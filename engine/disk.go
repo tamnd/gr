@@ -331,6 +331,36 @@ func (e *DiskEngine) ConstraintInfos() []ConstraintInfo {
 	return out
 }
 
+// StorageInfo is the static, structural nameplate of the database file: the
+// format version, the page geometry, and the free-page count (doc 17 §6.15).
+type StorageInfo struct {
+	FormatVersion uint32
+	PageSize      uint32
+	PageCount     uint64
+	FreePages     uint64
+	SizeBytes     int64
+}
+
+// StorageInfo reports the file's structural facts behind `.info` / `gr info`
+// (doc 17 §6.15). The size is the allocated page count times the page size, the
+// logical database size, which is the on-disk main-file size after a checkpoint.
+func (e *DiskEngine) StorageInfo() (StorageInfo, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	h := e.p.Header()
+	free, err := e.p.FreeCount()
+	if err != nil {
+		return StorageInfo{}, err
+	}
+	return StorageInfo{
+		FormatVersion: h.FormatVersion,
+		PageSize:      h.PageSize,
+		PageCount:     h.PageCount,
+		FreePages:     free,
+		SizeBytes:     int64(h.PageCount) * int64(h.PageSize),
+	}, nil
+}
+
 // CatalogVersion returns a monotonic version of the catalog: the total number of
 // interned names across the label, type, and property-key dictionaries. The
 // catalog is append-only (names are interned, never removed), so any schema

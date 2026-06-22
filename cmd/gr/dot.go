@@ -67,6 +67,8 @@ func (s *shell) runDot(line string) {
 		s.dotSchema()
 	case ".databases":
 		s.dotDatabases()
+	case ".info":
+		s.dotInfo()
 	case ".dump":
 		s.dotDump(args)
 	case ".load":
@@ -99,6 +101,7 @@ func (s *shell) dotHelp() {
 .indexes              List the schema indexes
 .schema               Show the labels, types, keys, and indexes
 .databases            Show the open database and its path
+.info                 Show the database and engine facts
 .dump [FILE]          Write a Cypher dump of the database (--schema-only,
                       --data-only); no FILE writes to the output sink
 .load FILE            Replay a Cypher dump into the database
@@ -382,7 +385,7 @@ func suggestDot(cmd string) string {
 		".help", ".quit", ".exit", ".version", ".mode", ".headers", ".timer",
 		".echo", ".nullvalue", ".separator", ".output", ".once", ".read",
 		".begin", ".commit", ".rollback", ".open", ".labels", ".types",
-		".indexes", ".schema", ".databases", ".dump", ".load", ".print",
+		".indexes", ".schema", ".databases", ".info", ".dump", ".load", ".print",
 	}
 	for _, k := range known {
 		if near(cmd, k) {

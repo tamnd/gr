@@ -835,6 +835,56 @@ func TestMetricsIndexMemoryBytes(t *testing.T) {
 	}
 }
 
+func TestMetricsColcacheAccesses(t *testing.T) {
+	db := openMem(t, "mxcolcache.gr")
+	defer db.Close()
+
+	mustExec(t, db, "CREATE (:Person {email: 'a@x'})", nil)
+	mustExec(t, db, "CREATE (:Person {email: 'b@x'})", nil)
+	mustExec(t, db, "CREATE (:Person {email: 'c@x'})", nil)
+	// Fold the properties into the segmented base so reads go through the column cache.
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+
+	// No property read has touched the segmented base yet, so the cache is untouched.
+	if c := db.Metrics().Counter("gr_colcache_accesses_total", Labels{"result": "miss"}); c != 0 {
+		t.Fatalf("colcache misses before any read = %d, want 0", c)
+	}
+
+	read := func() {
+		res, err := db.Run(context.Background(), "MATCH (p:Person) RETURN p.email", nil)
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		drainResult(t, res)
+	}
+
+	// The first scan decodes its segments on a miss and caches them, so misses climb and
+	// the resident-population gauges report the cached blocks.
+	read()
+	snap := db.Metrics()
+	miss := snap.Counter("gr_colcache_accesses_total", Labels{"result": "miss"})
+	if miss == 0 {
+		t.Fatalf("colcache misses after first scan = %d, want > 0", miss)
+	}
+	if b := snap.Gauge("gr_colcache_blocks_resident", nil); b == 0 {
+		t.Fatalf("colcache blocks resident = %d, want > 0", b)
+	}
+	if b := snap.Gauge("gr_colcache_memory_bytes", nil); b <= 0 {
+		t.Fatalf("colcache memory bytes = %d, want > 0", b)
+	}
+
+	// A second scan over the same segments is served from the cache, so hits climb while
+	// misses hold steady at the first scan's count.
+	read()
+	snap = db.Metrics()
+	if hit := snap.Counter("gr_colcache_accesses_total", Labels{"result": "hit"}); hit == 0 {
+		t.Fatalf("colcache hits after second scan = %d, want > 0", hit)
+	}
+	if c := snap.Counter("gr_colcache_accesses_total", Labels{"result": "miss"}); c != miss {
+		t.Fatalf("colcache misses after second scan = %d, want %d (no new misses on a warm cache)", c, miss)
+	}
+}
+
 func TestMetricsConstraintChecks(t *testing.T) {
 	db := openMem(t, "mxcons.gr")
 	defer db.Close()

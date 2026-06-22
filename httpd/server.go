@@ -115,7 +115,14 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 	if s.auth != nil {
 		// Count the outcome only when authentication actually ran (a provider is
 		// configured); with auth off every request is anonymous and is not an auth event.
-		s.metrics.countAuth(fail == nil)
+		switch {
+		case fail == nil:
+			s.metrics.countAuth(authSuccess)
+		case fail.lockout:
+			s.metrics.countAuth(authLocked)
+		default:
+			s.metrics.countAuth(authFailure)
+		}
 	}
 	if fail != nil {
 		s.writeAuthError(w, fail)

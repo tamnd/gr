@@ -8,9 +8,11 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 // AuthProvider verifies a credential and yields an authenticated principal (doc 18
@@ -40,6 +42,21 @@ type Principal struct {
 // provider returns it for a bad username, a bad password, or an unsupported scheme, so
 // the response never reveals which, the standard non-disclosing auth failure.
 var ErrUnauthorized = errors.New("gr: unauthorized")
+
+// ErrLockedOut is returned during a principal's lockout window (doc 18 §10.3). It wraps
+// ErrUnauthorized, so a caller that only cares whether authentication failed treats it
+// the same and the client sees the same non-disclosing 401, while a caller that records
+// metrics can tell a lockout apart from an ordinary failure to raise the brute-force
+// signal (the auth_total{outcome="lockout"} counter).
+var ErrLockedOut = fmt.Errorf("gr: account locked: %w", ErrUnauthorized)
+
+// Default lockout policy (doc 24): five failures locks a principal for a minute. Zero
+// max disables lockout. These are the spec's defaults; a deployment tunes them through
+// the configuration model (doc 24), or in code with SetLockout.
+const (
+	defaultMaxFailedAttempts = 5
+	defaultLockoutDuration   = 60 * time.Second
+)
 
 // anonymous is the principal a request carries when authentication is disabled (no
 // provider configured), so the rest of the server treats the auth-on and auth-off
@@ -72,12 +89,48 @@ type StaticProvider struct {
 	// so a missing user takes the same time as a wrong password and the lookup does
 	// not leak which usernames exist through timing.
 	dummy []byte
+
+	// amu guards the lockout state, separate from mu so a flood of failed attempts
+	// does not contend with credential reads.
+	amu        sync.Mutex
+	attempts   map[string]*attempt
+	maxFailed  int           // failures before lockout; 0 disables lockout
+	lockoutDur time.Duration // how long a locked principal stays locked
+	// now is the clock, overridable in tests so lockout expiry is driven without sleeping.
+	now func() time.Time
 }
 
-// NewStaticProvider returns an empty credential store.
+// attempt is a principal's lockout state (doc 18 §10.3): the consecutive-failure count
+// and, once locked, the time the lock lifts. This is process state, not persisted, so a
+// restart clears lockouts.
+type attempt struct {
+	failed int
+	until  time.Time
+}
+
+// NewStaticProvider returns an empty credential store with the default lockout policy
+// (doc 18 §10.3, doc 24): a principal is locked after five failures for a minute.
 func NewStaticProvider() *StaticProvider {
 	dummy, _ := derive("", make([]byte, 16))
-	return &StaticProvider{users: make(map[string]storedUser), dummy: dummy}
+	return &StaticProvider{
+		users:      make(map[string]storedUser),
+		dummy:      dummy,
+		attempts:   make(map[string]*attempt),
+		maxFailed:  defaultMaxFailedAttempts,
+		lockoutDur: defaultLockoutDuration,
+		now:        time.Now,
+	}
+}
+
+// SetLockout sets the failed-attempt lockout policy (doc 18 §10.3): a principal is locked
+// after maxFailed consecutive failures for dur, and a maxFailed of 0 disables lockout. It
+// returns the provider so a caller can chain it after NewStaticProvider.
+func (p *StaticProvider) SetLockout(maxFailed int, dur time.Duration) *StaticProvider {
+	p.amu.Lock()
+	p.maxFailed = maxFailed
+	p.lockoutDur = dur
+	p.amu.Unlock()
+	return p
 }
 
 // AddUser adds or replaces a user with a salted hash of the password and the given
@@ -106,6 +159,14 @@ func (p *StaticProvider) Authenticate(ctx context.Context, scheme, principal str
 	if scheme != "basic" {
 		return nil, ErrUnauthorized
 	}
+	// A locked principal is refused without consulting the hash (doc 18 §10.3), even
+	// with a correct password, so a flood of guesses cannot succeed during the lockout.
+	// A dummy derive is still run so a locked attempt takes the same wall-clock as a
+	// normal failure and the lockout does not leak through timing.
+	if p.locked(principal) {
+		_, _ = derive(string(credential), make([]byte, 16))
+		return nil, ErrLockedOut
+	}
 	p.mu.RLock()
 	u, ok := p.users[principal]
 	p.mu.RUnlock()
@@ -114,6 +175,7 @@ func (p *StaticProvider) Authenticate(ctx context.Context, scheme, principal str
 		// from a wrong password by timing, then fail.
 		_, _ = derive(string(credential), make([]byte, 16))
 		subtle.ConstantTimeCompare(p.dummy, p.dummy)
+		p.recordFailure(principal)
 		return nil, ErrUnauthorized
 	}
 	got, err := derive(string(credential), u.salt)
@@ -121,9 +183,59 @@ func (p *StaticProvider) Authenticate(ctx context.Context, scheme, principal str
 		return nil, err
 	}
 	if subtle.ConstantTimeCompare(got, u.hash) != 1 {
+		p.recordFailure(principal)
 		return nil, ErrUnauthorized
 	}
+	// A success resets the principal's failed-attempt counter (doc 18 §10.3).
+	p.recordSuccess(principal)
 	return &Principal{Name: principal, Roles: append([]string(nil), u.roles...)}, nil
+}
+
+// locked reports whether a principal is currently within its lockout window (doc 18
+// §10.3). With lockout disabled (maxFailed == 0) it is always false.
+func (p *StaticProvider) locked(principal string) bool {
+	p.amu.Lock()
+	defer p.amu.Unlock()
+	if p.maxFailed <= 0 {
+		return false
+	}
+	a, ok := p.attempts[principal]
+	if !ok || a.until.IsZero() {
+		return false
+	}
+	return p.now().Before(a.until)
+}
+
+// recordFailure counts a failed attempt and locks the principal once it reaches the
+// threshold (doc 18 §10.3). When a previous lock has already expired the counter restarts,
+// so a principal gets a fresh window of attempts after a lockout lifts rather than being
+// re-locked by a single late failure.
+func (p *StaticProvider) recordFailure(principal string) {
+	p.amu.Lock()
+	defer p.amu.Unlock()
+	if p.maxFailed <= 0 {
+		return
+	}
+	a := p.attempts[principal]
+	if a == nil {
+		a = &attempt{}
+		p.attempts[principal] = a
+	}
+	if !a.until.IsZero() && !p.now().Before(a.until) {
+		a.failed = 0
+		a.until = time.Time{}
+	}
+	a.failed++
+	if a.failed >= p.maxFailed {
+		a.until = p.now().Add(p.lockoutDur)
+	}
+}
+
+// recordSuccess clears a principal's lockout state after a successful authentication.
+func (p *StaticProvider) recordSuccess(principal string) {
+	p.amu.Lock()
+	delete(p.attempts, principal)
+	p.amu.Unlock()
 }
 
 // Schemes reports that the built-in store verifies only the basic scheme.
@@ -135,10 +247,13 @@ func derive(password string, salt []byte) ([]byte, error) {
 }
 
 // authFail describes a rejected request: the apiError to return and the scheme to put
-// in the WWW-Authenticate header. The status is always 401 for an auth failure.
+// in the WWW-Authenticate header. The status is always 401 for an auth failure. lockout
+// records that the failure was a lockout rather than a bad credential, so the metrics can
+// raise the brute-force signal; the client sees the same non-disclosing 401 either way.
 type authFail struct {
-	err    apiError
-	scheme string
+	err     apiError
+	scheme  string
+	lockout bool
 }
 
 // authenticate verifies a request and returns its principal (doc 18 §9.8). With no
@@ -158,39 +273,42 @@ func (s *server) authenticate(r *http.Request) (*Principal, *authFail) {
 	}
 	scheme, rest, ok := strings.Cut(header, " ")
 	if !ok {
-		return nil, unauthorized()
+		return nil, unauthorized(nil)
 	}
 	switch {
 	case strings.EqualFold(scheme, "Basic"):
 		raw, err := base64.StdEncoding.DecodeString(rest)
 		if err != nil {
-			return nil, unauthorized()
+			return nil, unauthorized(nil)
 		}
 		user, pass, ok := strings.Cut(string(raw), ":")
 		if !ok {
-			return nil, unauthorized()
+			return nil, unauthorized(nil)
 		}
 		princ, err := s.auth.Authenticate(r.Context(), "basic", user, []byte(pass))
 		if err != nil {
-			return nil, unauthorized()
+			return nil, unauthorized(err)
 		}
 		return princ, nil
 	case strings.EqualFold(scheme, "Bearer"):
 		princ, err := s.auth.Authenticate(r.Context(), "bearer", "", []byte(rest))
 		if err != nil {
-			return nil, unauthorized()
+			return nil, unauthorized(err)
 		}
 		return princ, nil
 	default:
-		return nil, unauthorized()
+		return nil, unauthorized(nil)
 	}
 }
 
-// unauthorized is the generic 401 for a bad credential, non-disclosing about why.
-func unauthorized() *authFail {
+// unauthorized is the generic 401 for a bad credential, non-disclosing about why. It
+// flags a lockout (from the underlying error) so the metrics can record it; the client
+// response is the same regardless.
+func unauthorized(err error) *authFail {
 	return &authFail{
-		err:    apiError{Code: "Neo.ClientError.Security.Unauthorized", Message: "invalid authentication credentials"},
-		scheme: "Basic realm=\"gr\"",
+		err:     apiError{Code: "Neo.ClientError.Security.Unauthorized", Message: "invalid authentication credentials"},
+		scheme:  "Basic realm=\"gr\"",
+		lockout: errors.Is(err, ErrLockedOut),
 	}
 }
 

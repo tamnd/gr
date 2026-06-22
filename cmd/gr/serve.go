@@ -109,7 +109,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	// across the whole process rather than per surface (doc 18 §8.8). A zero limit
 	// returns a nil gate, which admits every query.
 	admission := gr.NewAdmission(*maxInFlight, 0)
-	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL, Impersonation: *impersonation})
+	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL, Impersonation: *impersonation, Admission: admission})
 	defer srv.Close()
 	fmt.Fprintf(stderr, "gr serving %s on %s (database %q, TLS %s)\n", describeDB(path), *addr, *name, *httpTLS)
 	if auth == nil {

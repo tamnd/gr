@@ -38,6 +38,13 @@ func mapError(err error) (int, apiError) {
 			Code:    "Neo.TransientError.Transaction.Terminated",
 			Message: err.Error(),
 		}
+	case errors.Is(err, gr.ErrOverloaded):
+		// The in-flight gate is full (doc 18 §8.8). 503 with a transient code tells a
+		// driver to back off and retry rather than treat the request as failed.
+		return http.StatusServiceUnavailable, apiError{
+			Code:    "Neo.TransientError.General.TransientError",
+			Message: err.Error(),
+		}
 	case errors.Is(err, gr.ErrClosed):
 		return http.StatusServiceUnavailable, apiError{
 			Code:    "Neo.DatabaseError.General.UnknownError",

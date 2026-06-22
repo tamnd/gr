@@ -26,6 +26,9 @@ type server struct {
 	auth        AuthProvider
 	bearerCache *tokenCache
 	metrics     *metrics
+	// admission is the shared in-flight-query gate (doc 18 §8.8); nil leaves queries
+	// ungated.
+	admission *gr.Admission
 	// impersonation enables the imp_user/impersonatedUser request field (doc 18 §10.5).
 	// It is off by default, so a deployment opts into impersonation explicitly.
 	impersonation bool
@@ -51,6 +54,11 @@ type Options struct {
 	// requires an auth provider that resolves users (a RoleResolver), since an anonymous
 	// server has no principal to authorize the impersonation against.
 	Impersonation bool
+	// Admission is the shared in-flight-query gate (doc 18 §8.8). When set, every query
+	// passes through it before executing, so the bound holds across both server surfaces
+	// when the same gate is also given to the Bolt handler. Nil leaves the HTTP path
+	// ungated.
+	Admission *gr.Admission
 	// now overrides the clock for tests; nil uses time.Now.
 	now func() time.Time
 }
@@ -81,7 +89,7 @@ func New(db *gr.DB, opts Options) *Server {
 	if clock == nil {
 		clock = time.Now
 	}
-	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics(), impersonation: opts.Impersonation}
+	s := &server{db: db, name: name, txns: newTxStore(), now: clock, txTimeout: timeout, auth: opts.Auth, metrics: newMetrics(), admission: opts.Admission, impersonation: opts.Impersonation}
 	if opts.Auth != nil {
 		ttl := opts.TokenCacheTTL
 		if ttl == 0 {
@@ -239,11 +247,11 @@ func (s *server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	doc := map[string]any{
-		"gr_version":         Version,
-		"neo4j_version":      "5.0.0",
-		"neo4j_edition":      "community",
-		"query":              "/db/" + s.name + "/query/v2",
-		"transaction":        "/db/" + s.name + "/tx",
+		"gr_version":          Version,
+		"neo4j_version":       "5.0.0",
+		"neo4j_edition":       "community",
+		"query":               "/db/" + s.name + "/query/v2",
+		"transaction":         "/db/" + s.name + "/tx",
 		"db/cluster/overview": nil,
 	}
 	w.Header().Set("Content-Type", "application/json")

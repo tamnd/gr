@@ -11,7 +11,9 @@ package gr
 
 import (
 	"errors"
+	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/bind"
@@ -60,6 +62,15 @@ type DB struct {
 	cache       *plan.Cache
 	maxRetries  int
 	driftFactor float64
+
+	// fsys is the filesystem the database was opened through, kept so a query that
+	// outgrows its memory budget can open spill files in the same namespace as the
+	// database file (doc 12 §9.2). memBudget is the per-operator byte ceiling those
+	// queries run under; zero leaves every operator in memory, the default. tmpSeq
+	// names spill files uniquely within this open database.
+	fsys      vfs.VFS
+	memBudget int64
+	tmpSeq    atomic.Uint64
 }
 
 // Options configure how a database is opened. The zero value is the default:
@@ -91,6 +102,12 @@ type Options struct {
 	// §7). 0 uses [plan.DefaultDriftFactor]; a value of one or less disables adaptive
 	// re-planning, leaving a cached plan in place until the schema changes.
 	ReplanDriftFactor float64
+	// MemBudget bounds the bytes a single buffering operator (today a hash join's
+	// build side) may hold before it spills to temp files alongside the database
+	// (doc 12 §9). 0, the default, leaves every operator in memory and never spills,
+	// so the answers and the in-memory fast path are unchanged; set it to cap the
+	// memory a large join uses at the cost of disk I/O for the overflow.
+	MemBudget int64
 }
 
 // Open opens the database at path, creating it with a fresh graph structure if it
@@ -124,7 +141,37 @@ func Open(path string, opt Options) (*DB, error) {
 		cache:       plan.NewCache(opt.PlanCacheSize),
 		maxRetries:  maxRetries,
 		driftFactor: driftFactor,
+		fsys:        fsys,
+		memBudget:   opt.MemBudget,
 	}, nil
+}
+
+// tempFile opens a fresh, empty spill file in the database's filesystem and
+// returns it with a discard closure that closes and removes it (the seam
+// [exec.Ctx.TempFile] expects, doc 12 §9.2). The name is unique within this open
+// database and sits beside the database file, so the spill area inherits the same
+// filesystem and permissions. The file is truncated on open so a name left behind
+// by an earlier process start cannot hand back stale bytes.
+func (db *DB) tempFile() (vfs.File, func() error, error) {
+	name := fmt.Sprintf("%s-spill-%d.tmp", db.path, db.tmpSeq.Add(1))
+	f, err := db.fsys.Open(name, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := f.Truncate(0); err != nil {
+		_ = f.Close()
+		_ = db.fsys.Remove(name)
+		return nil, nil, err
+	}
+	discard := func() error {
+		cerr := f.Close()
+		rerr := db.fsys.Remove(name)
+		if cerr != nil {
+			return cerr
+		}
+		return rerr
+	}
+	return f, discard, nil
 }
 
 // Path returns the database file path.
@@ -177,7 +224,7 @@ func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, erro
 // query, and the reverse token namers the entity functions need. A write run sets
 // Effects on the returned context to collect its mutation counts.
 func (db *DB) execCtx(etx engine.Tx, b *bind.Bound, params map[string]value.Value) *exec.Ctx {
-	return &exec.Ctx{
+	ctx := &exec.Ctx{
 		Tx:          etx,
 		Params:      params,
 		Resolve:     exec.ResolverFromBound(b),
@@ -185,6 +232,13 @@ func (db *DB) execCtx(etx engine.Tx, b *bind.Bound, params map[string]value.Valu
 		RelTypeName: db.tokenNamer(catalog.KindRelType),
 		PropKeyName: db.tokenNamer(catalog.KindPropKey),
 	}
+	// Arm spilling only when a budget is configured. With the default zero budget
+	// the executor never spills, so leaving TempFile unset keeps the in-memory path.
+	if db.memBudget > 0 {
+		ctx.MemBudget = db.memBudget
+		ctx.TempFile = db.tempFile
+	}
+	return ctx
 }
 
 // execWriteBuffered interns, binds, plans, and runs a write statement against an

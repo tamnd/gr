@@ -42,6 +42,11 @@ const (
 	// even if over budget, which guarantees termination when a single key (or a
 	// hash-colliding set) dominates and cannot be split further.
 	graceMaxDepth = 4
+	// readChunk is how many bytes the streaming reader pulls from a spill file at a
+	// time. It bounds the resident bytes of a block-nested-loop scan of the build
+	// side (plus at most one straddling record), so a cartesian join's build side
+	// streams from disk instead of sitting in memory.
+	readChunk = 64 << 10
 )
 
 // spillPart is one input's rows for one partition, length-prefixed records in a
@@ -105,6 +110,54 @@ func (p *spillPart) readAll() ([]eval.Row, error) {
 // budget when deciding whether to re-partition.
 func (p *spillPart) bytes() int64 { return p.off }
 
+// partReader streams a spill file's rows back one at a time, reading in fixed-size
+// chunks so the resident bytes stay bounded (the point of spilling). It never reads
+// past the recorded size, because the in-memory VFS zero-fills a short read rather
+// than returning EOF, so the recorded byte count is the only reliable end marker. A
+// record that straddles a chunk boundary is completed by appending the next chunk to
+// the carry buffer, so the buffer holds at most one chunk plus one record.
+type partReader struct {
+	p   *spillPart
+	off int64
+	buf []byte
+}
+
+// next returns the next row, or ok false at the end of the file.
+func (r *partReader) next() (eval.Row, bool, error) {
+	for {
+		if n, hn, err := format.Uvarint(r.buf); err == nil && uint64(len(r.buf)) >= uint64(hn)+n {
+			row, _, derr := decodeRow(r.buf[hn : hn+int(n)])
+			if derr != nil {
+				return nil, false, derr
+			}
+			r.buf = r.buf[hn+int(n):]
+			return row, true, nil
+		}
+		if r.off >= r.p.off {
+			return nil, false, nil
+		}
+		chunk := int64(readChunk)
+		if rem := r.p.off - r.off; chunk > rem {
+			chunk = rem
+		}
+		tmp := make([]byte, chunk)
+		if _, err := r.p.file.ReadAt(tmp, r.off); err != nil {
+			return nil, false, err
+		}
+		r.off += chunk
+		r.buf = append(r.buf, tmp...)
+	}
+}
+
+// newSpillPart opens a fresh temp file as an empty partition.
+func newSpillPart(ctx *Ctx) (*spillPart, error) {
+	f, discard, err := ctx.TempFile()
+	if err != nil {
+		return nil, err
+	}
+	return &spillPart{file: f, discard: discard}, nil
+}
+
 // discardOnce closes and removes the file, at most once.
 func (p *spillPart) discardOnce() error {
 	if p.done {
@@ -160,11 +213,10 @@ func newGraceJoin(ctx *Ctx, on []string) (*graceJoin, error) {
 
 // newPart opens a fresh temp file and tracks it for cleanup.
 func (g *graceJoin) newPart() (*spillPart, error) {
-	f, discard, err := g.ctx.TempFile()
+	p, err := newSpillPart(g.ctx)
 	if err != nil {
 		return nil, err
 	}
-	p := &spillPart{file: f, discard: discard}
 	g.all = append(g.all, p)
 	return p, nil
 }

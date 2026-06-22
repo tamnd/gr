@@ -2,28 +2,33 @@ package exec
 
 import (
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/tamnd/gr/engine"
+	"github.com/tamnd/gr/eval"
 	"github.com/tamnd/gr/plan"
 )
 
-// Morsel-driven parallelism for a grouping-free aggregation over a scan-rooted
-// read pipeline (spec 2060 doc 12 §10, doc 25 §7.2 deliverable 8, the §7.4 exit
-// criterion "morsel parallelism scales"). The shape is the simplest one that is
-// genuinely parallel: a read-only RETURN count(*) / min / max over MATCH (n:L)
-// ... with no GROUP BY. The whole input pipeline is independent per anchor row,
-// so the scanned node set is cut into fixed-size morsels handed out by an atomic
-// cursor, each worker runs a private copy of the pipeline over the morsels it
-// pulls into its own accumulators, and the partials are merged at the end.
+// Morsel-driven parallelism for an aggregation over a scan-rooted read pipeline
+// (spec 2060 doc 12 §10, doc 25 §7.2 deliverable 8, the §7.4 exit criterion
+// "morsel parallelism scales"). It covers a read-only RETURN count(*) / min / max
+// over MATCH (n:L) ..., with or without GROUP BY. The whole input pipeline is
+// independent per anchor row, so the scanned node set is cut into fixed-size
+// morsels handed out by an atomic cursor, each worker runs a private copy of the
+// pipeline over the morsels it pulls, and the per-morsel group buckets are merged
+// at the end.
 //
 // This is transparent: the plan is unchanged (still Aggregate over its input),
 // and the executor decides at run time whether to parallelize. The aggregates it
 // parallelizes (count, min, max) are exactly associative and commutative, so the
 // merged answer is byte-identical to the serial one, which keeps the M2/M3 result
-// oracle green (M4 changes performance, not answers). sum and avg (float
+// oracle green (M4 changes performance, not answers). For grouped aggregation the
+// output row order matches the serial path too: morsels are disjoint id windows,
+// so replaying them in ascending window order, each window in its own first-seen
+// order, reproduces the serial first-seen group order exactly. sum and avg (float
 // re-association would change the last bits), collect (order), and the DISTINCT
 // variants (cross-row set state) stay on the serial path; widening the set is a
 // later slice. The read path the workers share was made concurrency-safe first
@@ -175,12 +180,23 @@ func primaryScan(tx engine.Tx, ns *plan.NodeScan) ([]engine.NodeID, error) {
 	return ids, err
 }
 
-// drainWorker runs one worker: a fresh, private copy of the aggregate's input
-// pipeline whose scan is pointed at the shared morsel source, folded into its own
-// accumulators. The copy and its accumulators are unshared, and every read it
-// makes goes through the concurrency-safe read path, so workers run without
-// coordination beyond the atomic morsel handoff.
-func (o *aggregateOp) drainWorker(src *morselSource) ([]accumulator, error) {
+// windowResult is one morsel's group buckets, tagged with the morsel's window
+// start so the merge can replay morsels in scan order. order is the keys in the
+// order this morsel first saw them, which (within one disjoint window) matches the
+// order the serial scan would have seen them.
+type windowResult struct {
+	lo     int
+	groups map[string]*group
+	order  []string
+}
+
+// windowWorker runs one worker: a fresh, private copy of the aggregate's input
+// pipeline that processes one morsel at a time. For each morsel it takes from the
+// shared cursor it points the scan at that window, re-opens the pipeline, and drains
+// it into its own group buckets, tagging the result with the window start. The copy
+// and its accumulators are unshared, and every read goes through the concurrency-safe
+// read path, so workers run without coordination beyond the atomic morsel handoff.
+func (o *aggregateOp) windowWorker(ids []engine.NodeID, src *morselSource) ([]windowResult, error) {
 	op, err := compile(o.inputPlan)
 	if err != nil {
 		return nil, err
@@ -189,33 +205,35 @@ func (o *aggregateOp) drainWorker(src *morselSource) ([]accumulator, error) {
 	if leaf == nil {
 		return nil, errNoScanLeaf
 	}
-	leaf.src = src
-	if err := op.open(o.ctx); err != nil {
-		return nil, err
-	}
-	defer op.close()
-	accs := o.newAccs()
+	leaf.windowed = true
+	leaf.winIDs = ids
+	var out []windowResult
 	for {
-		in, ok, err := op.next()
-		if err != nil {
+		lo, hi, ok := src.take()
+		if !ok {
+			return out, nil
+		}
+		leaf.winLo, leaf.winHi = lo, hi
+		if err := op.open(o.ctx); err != nil {
 			return nil, err
 		}
-		if !ok {
-			break
+		groups, order, err := o.drainGroups(op)
+		if err != nil {
+			_ = op.close()
+			return nil, err
 		}
-		env := o.ctx.env(in)
-		for j, call := range o.calls {
-			if err := o.feed(accs[j], call, env); err != nil {
-				return nil, err
-			}
+		if err := op.close(); err != nil {
+			return nil, err
+		}
+		if len(order) > 0 {
+			out = append(out, windowResult{lo: lo, groups: groups, order: order})
 		}
 	}
-	return accs, nil
 }
 
 // runParallel scans the anchor nodes once, fans the morsels across workers, and
-// merges their partial accumulators into the single grouping-free output row. It
-// falls back to the serial path when the scan is too small to be worth splitting.
+// merges their per-morsel group buckets into the output rows. It falls back to the
+// serial path when the scan is too small to be worth splitting.
 func (o *aggregateOp) runParallel(ns *plan.NodeScan) error {
 	ids, err := primaryScan(o.ctx.Tx, ns)
 	if err != nil {
@@ -226,14 +244,14 @@ func (o *aggregateOp) runParallel(ns *plan.NodeScan) error {
 		return o.runSerial()
 	}
 	src := &morselSource{ids: ids, chunk: morselChunk}
-	partials := make([][]accumulator, w)
+	partials := make([][]windowResult, w)
 	errs := make([]error, w)
 	var wg sync.WaitGroup
 	for k := 0; k < w; k++ {
 		wg.Add(1)
 		go func(k int) {
 			defer wg.Done()
-			partials[k], errs[k] = o.drainWorker(src)
+			partials[k], errs[k] = o.windowWorker(ids, src)
 		}(k)
 	}
 	wg.Wait()
@@ -242,12 +260,42 @@ func (o *aggregateOp) runParallel(ns *plan.NodeScan) error {
 			return e
 		}
 	}
-	merged := o.newAccs()
-	for _, accs := range partials {
-		for j := range merged {
-			merged[j].(mergeable).merge(accs[j])
+	return o.mergeWindows(partials)
+}
+
+// mergeWindows folds every worker's per-morsel group buckets into one global set in
+// the order the serial scan would have first seen each group, then emits. Morsels
+// are disjoint id windows, so sorting them by window start and replaying each in its
+// own first-seen order reproduces the serial first-seen group order exactly; the
+// accumulators merge associatively, so the grouped answer is byte-identical to the
+// serial one. A grouping-free aggregation with no surviving rows still yields its
+// one empty group (count 0), the same rule the serial path applies.
+func (o *aggregateOp) mergeWindows(partials [][]windowResult) error {
+	var all []windowResult
+	for _, p := range partials {
+		all = append(all, p...)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].lo < all[j].lo })
+	global := map[string]*group{}
+	var order []string
+	for _, wr := range all {
+		for _, key := range wr.order {
+			gw := wr.groups[key]
+			g := global[key]
+			if g == nil {
+				g = &group{rep: gw.rep, accs: o.newAccs()}
+				global[key] = g
+				order = append(order, key)
+			}
+			for j := range g.accs {
+				g.accs[j].(mergeable).merge(gw.accs[j])
+			}
 		}
 	}
-	g := &group{rep: nil, accs: merged}
-	return o.emit(map[string]*group{"": g}, []string{""})
+	if len(order) == 0 && len(o.spec.GroupKeys) == 0 {
+		g := &group{rep: eval.Row{}, accs: o.newAccs()}
+		global[""] = g
+		order = append(order, "")
+	}
+	return o.emit(global, order)
 }

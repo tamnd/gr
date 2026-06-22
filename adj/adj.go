@@ -43,6 +43,7 @@ package adj
 
 import (
 	"slices"
+	"sync"
 
 	"github.com/tamnd/gr/colcodec"
 	"github.com/tamnd/gr/format"
@@ -98,7 +99,14 @@ type Adj struct {
 	dir    *store.Vector
 	folded uint64
 	delta  map[uint32]map[uint64][]Neighbor // slot -> src -> sorted neighbors
-	cache  map[uint32]*base                 // opened base arrays, cleared on checkpoint
+	// cacheMu guards cache against concurrent readers. The base cache is filled
+	// lazily on read (openBase opens a slot's vectors the first time it is
+	// expanded), so morsel-parallel workers expanding different slots at once
+	// would otherwise write the map concurrently, a fatal access. delta and
+	// degTail need no lock: they are written only on the write path, which holds
+	// the engine's exclusive lock, and read-only under a snapshot.
+	cacheMu sync.Mutex
+	cache   map[uint32]*base // opened base arrays, cleared on checkpoint
 	// degTail is the net live-degree change since the last checkpoint, per slot
 	// and source: edges inserted into the tail (counted +1) minus edges removed
 	// (counted -1, whether they sat in the base or the tail). A slot's degree is
@@ -340,9 +348,17 @@ func (a *Adj) openBase(s uint32) (*base, uint64, error) {
 	if c.offLen == 0 {
 		return nil, 0, nil
 	}
+	a.cacheMu.Lock()
 	if b, ok := a.cache[s]; ok {
+		a.cacheMu.Unlock()
 		return b, c.offLen, nil
 	}
+	a.cacheMu.Unlock()
+
+	// Decode the slot's compressed vectors without the lock: OpenLog walks the page
+	// chain and the colcodec decode is pure CPU, so holding the lock across them would
+	// serialize cold expands of different slots. The decoded arrays hold no pins, so a
+	// duplicate built by a peer racing the same slot is cheap to discard.
 	total := int(c.offBytes + c.nbrBytes + c.edgBytes)
 	log, err := store.OpenLog(a.p, c.logHead, total)
 	if err != nil {
@@ -365,6 +381,14 @@ func (a *Adj) openBase(s uint32) (*base, uint64, error) {
 		return nil, 0, err
 	}
 	b := &base{off: off, nbr: nbr, edg: edg}
+
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	// A peer may have opened the same slot while this call walked the chain; if so,
+	// keep theirs so every reader shares one base per slot.
+	if existing, ok := a.cache[s]; ok {
+		return existing, c.offLen, nil
+	}
 	a.cache[s] = b
 	return b, c.offLen, nil
 }

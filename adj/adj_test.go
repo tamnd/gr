@@ -441,6 +441,55 @@ func crashCampaign(t *testing.T, mode vfs.TripMode, label string) {
 	}
 }
 
+// TestCheckpointReclaimsOldCSR is the W4d gate: a checkpoint frees the old base
+// CSR vectors it rebuilds, so a run of checkpoints over an unchanging graph reuses
+// those pages instead of growing the file. Without the frees each checkpoint leaks
+// a fresh offset, neighbor, and edge vector per slot and the page count climbs.
+func TestCheckpointReclaimsOldCSR(t *testing.T) {
+	fsys := vfs.NewMem()
+	pg, ns, rs, a := open(t, fsys, path, true)
+	defer pg.Close()
+
+	// A small fixed graph across two relationship types, so the checkpoint rebuilds
+	// several slots and a leak shows up in the page count.
+	const n = 32
+	for range n {
+		if _, err := ns.Create(nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range uint64(n) {
+		addEdge(t, rs, a, 0, i, (i+1)%n)
+		addEdge(t, rs, a, 1, i, (i+2)%n)
+	}
+
+	// Warm up to steady state, then hold the page count across many more passes.
+	for range 3 {
+		if err := a.Checkpoint(uint64(ns.Count())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := pg.Header().PageCount
+	for range 20 {
+		if err := a.Checkpoint(uint64(ns.Count())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after := pg.Header().PageCount
+	if after != before {
+		t.Fatalf("page count grew across checkpoints: %d -> %d (old CSR not reclaimed)", before, after)
+	}
+
+	// Adjacency still reads back after all the page reuse.
+	out, err := a.Expand(0, 0, adj.Out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nodes(out); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("expand after reuse = %v, want [1]", got)
+	}
+}
+
 func TestAdjCrashCampaignCrash(t *testing.T) { crashCampaign(t, vfs.TripCrash, "crash") }
 func TestAdjCrashCampaignTorn(t *testing.T)  { crashCampaign(t, vfs.TripTear, "torn") }
 func TestAdjCrashCampaignFsync(t *testing.T) { crashCampaign(t, vfs.TripFsyncFail, "fsync") }

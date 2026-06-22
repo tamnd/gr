@@ -32,7 +32,7 @@ func TestSessionExecuteWriteThenRead(t *testing.T) {
 	}
 
 	got, err := s.ExecuteRead(ctx, func(tx *Tx) (any, error) {
-		res, err := tx.Run("MATCH (p:Person) RETURN count(p) AS c", nil)
+		res, err := tx.Run(context.Background(), "MATCH (p:Person) RETURN count(p) AS c", nil)
 		if err != nil {
 			return nil, err
 		}
@@ -95,7 +95,7 @@ func TestSessionNestingRejected(t *testing.T) {
 
 	// An auto-commit Run nested inside a managed closure.
 	err = s.Update(func(tx *Tx) error {
-		_, rerr := s.Run("MATCH (n) RETURN n", nil)
+		_, rerr := s.Run(context.Background(), "MATCH (n) RETURN n", nil)
 		return rerr
 	})
 	if !errors.Is(err, ErrTxnNested) {
@@ -103,7 +103,7 @@ func TestSessionNestingRejected(t *testing.T) {
 	}
 
 	// A managed transaction started inside an explicit one.
-	tx, err := s.Begin(Write)
+	tx, err := s.Begin(context.Background(), Write)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestSessionExplicitBeginCommitClearsActive(t *testing.T) {
 	s := db.Session()
 	defer func() { _ = s.Close() }()
 
-	tx, err := s.Begin(Write)
+	tx, err := s.Begin(context.Background(), Write)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}

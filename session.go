@@ -3,8 +3,6 @@ package gr
 import (
 	"context"
 	"errors"
-
-	"github.com/tamnd/gr/value"
 )
 
 // ErrTxnNested is returned when a transaction is started inside another
@@ -87,14 +85,14 @@ func (s *Session) Close() error {
 // View or Update, or an auto-commit Run on this session returns ErrTxnNested. The
 // caller drives the transaction with Run and Exec and finishes it with Commit or
 // Rollback, exactly as with the database-level Begin.
-func (s *Session) Begin(mode AccessMode) (*Tx, error) {
+func (s *Session) Begin(ctx context.Context, mode AccessMode) (*Tx, error) {
 	if s.db == nil {
 		return nil, ErrSessionClosed
 	}
 	if s.active {
 		return nil, ErrTxnNested
 	}
-	tx, err := s.db.Begin(mode)
+	tx, err := s.db.Begin(ctx, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -108,6 +106,12 @@ func (s *Session) Begin(mode AccessMode) (*Tx, error) {
 // guard so a managed transaction started inside another transaction's scope is
 // rejected rather than left to deadlock.
 func (s *Session) View(fn func(tx *Tx) error) error {
+	return s.ViewContext(context.Background(), fn)
+}
+
+// ViewContext is View with an explicit context (doc 16 §6.2). The context is passed
+// through to the underlying transaction so a cancellation is honoured at begin.
+func (s *Session) ViewContext(ctx context.Context, fn func(tx *Tx) error) error {
 	if s.db == nil {
 		return ErrSessionClosed
 	}
@@ -116,7 +120,7 @@ func (s *Session) View(fn func(tx *Tx) error) error {
 	}
 	s.active = true
 	defer func() { s.active = false }()
-	return s.db.View(fn)
+	return s.db.ViewContext(ctx, fn)
 }
 
 // Update runs fn inside a read-write transaction scoped to the session, retrying on
@@ -124,6 +128,12 @@ func (s *Session) View(fn func(tx *Tx) error) error {
 // session's nesting guard. The closure must be re-runnable, since a conflict on the
 // concurrent-writer path re-runs it against a fresh snapshot.
 func (s *Session) Update(fn func(tx *Tx) error) error {
+	return s.UpdateContext(context.Background(), fn)
+}
+
+// UpdateContext is Update with an explicit context (doc 16 §6.2, §6.4). The context
+// bounds the retry loop and is honoured at each begin.
+func (s *Session) UpdateContext(ctx context.Context, fn func(tx *Tx) error) error {
 	if s.db == nil {
 		return ErrSessionClosed
 	}
@@ -132,7 +142,7 @@ func (s *Session) Update(fn func(tx *Tx) error) error {
 	}
 	s.active = true
 	defer func() { s.active = false }()
-	return s.db.Update(fn)
+	return s.db.UpdateContext(ctx, fn)
 }
 
 // Run executes a single statement in an implicit transaction scoped to the session
@@ -141,14 +151,14 @@ func (s *Session) Update(fn func(tx *Tx) error) error {
 // the access mode inferred from the statement. The session's nesting guard rejects
 // an auto-commit Run while an explicit transaction is open in the session, since
 // that would start a second transaction against the single-writer slot.
-func (s *Session) Run(cypher string, params map[string]value.Value) (*Result, error) {
+func (s *Session) Run(ctx context.Context, cypher string, params Params) (*Result, error) {
 	if s.db == nil {
 		return nil, ErrSessionClosed
 	}
 	if s.active {
 		return nil, ErrTxnNested
 	}
-	return s.db.Run(cypher, params)
+	return s.db.Run(ctx, cypher, params)
 }
 
 // ExecuteRead runs fn inside a managed read transaction and returns the value fn
@@ -190,7 +200,7 @@ func (s *Session) execute(ctx context.Context, mode AccessMode, fn func(tx *Tx) 
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		tx, err := s.db.Begin(Read)
+		tx, err := s.db.Begin(ctx, Read)
 		if err != nil {
 			return nil, err
 		}
@@ -200,7 +210,7 @@ func (s *Session) execute(ctx context.Context, mode AccessMode, fn func(tx *Tx) 
 
 	var out any
 	err := Retry(ctx, s.db.maxRetries, func() error {
-		tx, err := s.db.Begin(Write)
+		tx, err := s.db.Begin(ctx, Write)
 		if err != nil {
 			return err
 		}

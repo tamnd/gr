@@ -10,6 +10,7 @@
 package gr
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -302,13 +303,22 @@ func cloneRow(row eval.Row) eval.Row {
 // schema command runs through execSchema and reports its change through Summary. This
 // is the seam the CLI and server marshal one statement at a time onto (doc 16 §6.7).
 //
-// params supplies the values for the statement's $-parameters; a nil map is fine for
-// a parameterless statement. The caller must Close the result; for a write or schema
-// result Close has nothing to release, since the implicit transaction has already
-// committed.
-func (db *DB) Run(cypher string, params map[string]value.Value) (*Result, error) {
+// params supplies the values for the statement's $-parameters as plain Go values
+// (doc 16 §9); a nil map is fine for a parameterless statement, and a value the model
+// cannot represent fails with ErrParam before the statement runs. The ctx is honoured
+// at entry: a context already cancelled when Run is called returns its error without
+// touching the engine. The caller must Close the result; for a write or schema result
+// Close has nothing to release, since the implicit transaction has already committed.
+func (db *DB) Run(ctx context.Context, cypher string, params Params) (*Result, error) {
 	if db.eng == nil {
 		return nil, ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	vals, err := toValues(params)
+	if err != nil {
+		return nil, err
 	}
 	q, err := parse.Parse(cypher)
 	if err != nil {
@@ -325,9 +335,9 @@ func (db *DB) Run(cypher string, params map[string]value.Value) (*Result, error)
 		return &Result{summary: s}, nil
 	}
 	if queryHasWrites(q) {
-		return db.runAutoWrite(q, params)
+		return db.runAutoWrite(q, vals)
 	}
-	return db.Query(cypher, params)
+	return db.Query(cypher, vals)
 }
 
 // runAutoWrite executes a write statement in an implicit write transaction and

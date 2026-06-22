@@ -189,6 +189,17 @@ var sessionDurationBuckets = []float64{
 // that will fill them.
 var metricIndexKinds = []string{"unique", "range", "point", "label", "fulltext"}
 
+// metricConstraintKinds is the bounded domain of the constraint label on gr_constraint_checks_total
+// (doc 20 §6.4): the constraint class the commit-path check enforced. unique is a uniqueness check,
+// exists a node-existence check, type a property-type check. The label is the kind, not the
+// constraint name, so the series stay bounded however many constraints a schema declares.
+var metricConstraintKinds = []string{"unique", "exists", "type"}
+
+// metricConstraintResults is the bounded domain of the result label on gr_constraint_checks_total
+// (doc 20 §6.4): whether a check passed or found a violation. The violation rate read off these two
+// is the data-quality signal, the share of writes the schema turned away.
+var metricConstraintResults = []string{"pass", "violation"}
+
 // metricAuthResults is the bounded domain of the result label on gr_auth_attempts_total (doc 20
 // §3.3): whether an authentication attempt was allowed (ok) or rejected (denied). Both are
 // pre-registered so a server that has only ever seen successes still exposes the denied series at
@@ -232,6 +243,11 @@ type queryMetrics struct {
 
 	authAttempts map[string]*metric.Counter // gr_auth_attempts_total by [result]
 
+	// constraintChecks holds gr_constraint_checks_total keyed by (kind, result). The domain is three
+	// kinds times two results, six bounded series, so every one is pre-registered at open and a check
+	// is a map read and an atomic add. The key is the constraint class and the pass/violation result.
+	constraintChecks map[constraintCheckKey]*metric.Counter
+
 	indexLookupSeconds map[string]*metric.Histogram // gr_index_lookup_seconds by [kind]
 
 	// indexNameOf resolves an indexed (label, property) token pair to the index name for the
@@ -267,6 +283,14 @@ type queryMetrics struct {
 	// handles and every later one is a lock-free load. The key space is bounded by the schema's
 	// relationship types times three directions, so the cache stays small (§7.2).
 	expandHandles sync.Map // expandKey -> *expandHandles
+}
+
+// constraintCheckKey identifies one gr_constraint_checks_total series: the constraint kind (unique,
+// exists, type) and the result (pass, violation). Both are small bounded strings, so the key is a
+// cheap comparable map key.
+type constraintCheckKey struct {
+	kind   string
+	result string
 }
 
 // indexKey identifies the lookup counter for one index access: the indexed label and property
@@ -330,11 +354,22 @@ func newQueryMetrics() *queryMetrics {
 
 		authAttempts: make(map[string]*metric.Counter, len(metricAuthResults)),
 
+		constraintChecks: make(map[constraintCheckKey]*metric.Counter,
+			len(metricConstraintKinds)*len(metricConstraintResults)),
+
 		indexLookupSeconds: make(map[string]*metric.Histogram, len(metricIndexKinds)),
 	}
 	for _, r := range metricAuthResults {
 		m.authAttempts[r] = reg.Counter("gr_auth_attempts_total",
 			"Authentication attempts, by result", "attempts", metric.Labels{"result": r})
+	}
+	for _, k := range metricConstraintKinds {
+		for _, r := range metricConstraintResults {
+			m.constraintChecks[constraintCheckKey{kind: k, result: r}] = reg.Counter(
+				"gr_constraint_checks_total",
+				"Constraint enforcement checks, by constraint kind and result", "checks",
+				metric.Labels{"constraint": k, "result": r})
+		}
 	}
 	for _, k := range metricIndexKinds {
 		m.indexLookupSeconds[k] = reg.Histogram("gr_index_lookup_seconds",
@@ -910,6 +945,28 @@ func (m *queryMetrics) recordAuth(ok bool) {
 	if c := m.authAttempts[result]; c != nil {
 		c.Inc()
 	}
+}
+
+// recordConstraintCheck counts one commit-path constraint check by kind and result (doc 20 §6.4):
+// ok is true when the check passed, false when it found a violation. All six (kind, result) series
+// are pre-registered, so this is a map read and an atomic increment.
+func (m *queryMetrics) recordConstraintCheck(kind string, ok bool) {
+	result := "violation"
+	if ok {
+		result = "pass"
+	}
+	if c := m.constraintChecks[constraintCheckKey{kind: kind, result: result}]; c != nil {
+		c.Inc()
+	}
+}
+
+// constraintObserver implements engine.ConstraintObserver against the query metrics (doc 20 §6.4):
+// it forwards each commit-path constraint check to gr_constraint_checks_total. One value serves the
+// engine for a database's life, since it holds only the shared metric handles.
+type constraintObserver struct{ m *queryMetrics }
+
+func (o constraintObserver) ConstraintCheck(kind string, ok bool) {
+	o.m.recordConstraintCheck(kind, ok)
 }
 
 // scanLoad reads a scan counter, treating a nil counter (a result with no execution, such as a

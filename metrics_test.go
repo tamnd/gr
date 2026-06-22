@@ -789,3 +789,28 @@ func TestMetricsIndexSeek(t *testing.T) {
 		t.Errorf("index lookup seconds count = %d, want 1", h.Count)
 	}
 }
+
+func TestMetricsConstraintChecks(t *testing.T) {
+	db := openMem(t, "mxcons.gr")
+	defer db.Close()
+
+	mustExec(t, db, "CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE", nil)
+	// A clean insert runs the uniqueness check and it passes.
+	mustExec(t, db, "CREATE (:Person {email: 'a@x'})", nil)
+	// A duplicate runs the check and it fails, aborting the write.
+	if _, err := db.Exec("CREATE (:Person {email: 'a@x'})", nil); err == nil {
+		t.Fatal("duplicate insert was accepted")
+	}
+
+	snap := db.Metrics()
+	if c := snap.Counter("gr_constraint_checks_total", Labels{"constraint": "unique", "result": "pass"}); c != 1 {
+		t.Errorf("unique pass checks = %d, want 1", c)
+	}
+	if c := snap.Counter("gr_constraint_checks_total", Labels{"constraint": "unique", "result": "violation"}); c != 1 {
+		t.Errorf("unique violation checks = %d, want 1", c)
+	}
+	// The other kinds are registered at zero, present before any check of that kind runs.
+	if c := snap.Counter("gr_constraint_checks_total", Labels{"constraint": "exists", "result": "violation"}); c != 0 {
+		t.Errorf("exists violation checks = %d, want 0", c)
+	}
+}

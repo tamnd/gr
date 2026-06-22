@@ -40,6 +40,28 @@ func (e *ConstraintError) Error() string {
 	}
 }
 
+// ConstraintObserver receives one report per constraint check the commit path runs (doc 20 §6.4),
+// so a higher layer can count enforcement without the engine importing a metric registry. kind is
+// the constraint class (unique, exists, or type) and ok is whether the check passed. A violation
+// reports ok=false for the offending constraint and then aborts, so the failing check is counted
+// before the transaction unwinds.
+type ConstraintObserver interface {
+	ConstraintCheck(kind string, ok bool)
+}
+
+// SetConstraintObserver installs the observer the commit path reports constraint checks to (doc 20
+// §6.4). It is set once at Open and not meant to change under concurrent commits.
+func (e *DiskEngine) SetConstraintObserver(o ConstraintObserver) { e.conObs = o }
+
+// reportConstraint reports one constraint check to the observer if one is set (doc 20 §6.4). It is
+// nil-safe so the validate functions call it unconditionally and a database with no observer pays
+// nothing.
+func (e *DiskEngine) reportConstraint(kind string, ok bool) {
+	if e.conObs != nil {
+		e.conObs.ConstraintCheck(kind, ok)
+	}
+}
+
 // uniqueKey is the comparison key for a uniqueness constraint: the value's type
 // tag and its canonical text, so values of different types never collide (an
 // integer 1 and a string \"1\" are distinct keys). Null values are exempt from
@@ -285,7 +307,9 @@ func (t *diskTx) validateUnique() error {
 		if con.Kind != catalog.UniqueNode || len(con.Props) != 1 {
 			continue
 		}
-		if err := t.e.checkUniqueData(con.Name, con.Label, con.Props[0]); err != nil {
+		err := t.e.checkUniqueData(con.Name, con.Label, con.Props[0])
+		t.e.reportConstraint("unique", err == nil)
+		if err != nil {
 			return err
 		}
 	}
@@ -342,7 +366,9 @@ func (t *diskTx) validateExistence() error {
 			continue
 		}
 		pname, _ := t.e.cat.Name(catalog.KindPropKey, con.Props[0])
-		if err := t.e.checkExistenceData(con.Name, pname, con.Label, con.Props[0], true); err != nil {
+		err := t.e.checkExistenceData(con.Name, pname, con.Label, con.Props[0], true)
+		t.e.reportConstraint("exists", err == nil)
+		if err != nil {
 			return err
 		}
 	}
@@ -397,7 +423,9 @@ func (t *diskTx) validateType() error {
 		if con.Kind != catalog.TypedNode || len(con.Props) != 1 {
 			continue
 		}
-		if err := t.e.checkTypeData(con.Name, con.Label, con.Props[0], value.Type(con.ValueType)); err != nil {
+		err := t.e.checkTypeData(con.Name, con.Label, con.Props[0], value.Type(con.ValueType))
+		t.e.reportConstraint("type", err == nil)
+		if err != nil {
 			return err
 		}
 	}

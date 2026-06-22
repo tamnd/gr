@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/tamnd/gr"
 )
 
 // metrics is the server's running counters and gauges (doc 18 §13.5, doc 20). It records
@@ -111,8 +113,26 @@ func (s *server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "gr_server_auth_total{outcome=\"failure\"} %d\n", s.metrics.authFail.Load())
 	fmt.Fprintf(&b, "gr_server_auth_total{outcome=\"lockout\"} %d\n", s.metrics.authLockout.Load())
 
+	// The database's own metric registry (doc 20 §3 to §6) renders below the server-plane
+	// metrics: the query, storage, MVCC, and graph catalogue, the gr_ namespace the server
+	// metrics (gr_server_) do not collide with. One scrape returns both planes.
+	_ = gr.WritePrometheus(&b, s.db.Metrics())
+
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	_, _ = w.Write([]byte(b.String()))
+}
+
+// handleVars serves GET /debug/vars in the expvar JSON shape (doc 20 §7.6, §33.2): the same
+// database registry the Prometheus endpoint renders, encoded as a JSON tree for an operator on
+// the Go expvar convention. Like the metrics and health endpoints it stays open, since it is
+// part of the operational plane and carries no per-user data.
+func (s *server) handleVars(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = gr.WriteExpvar(w, s.db.Metrics())
 }
 
 // writeMetric writes a single-sample metric with its HELP and TYPE lines.

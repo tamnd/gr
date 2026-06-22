@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/tamnd/gr/ast"
@@ -75,6 +76,12 @@ var queryLatencyBuckets = []float64{
 	1, 2.5, 5, 10,
 }
 
+// rowCountBuckets is the bucket layout for gr_query_rows_returned and gr_query_rows_scanned
+// (doc 20 §3.1): powers of ten from one row to ten million, so the output cardinality and the
+// scan work an operator reads span the orders of magnitude a graph query ranges over. A query
+// that touches no rows lands in the first bucket; the +Inf catch-all is added by the histogram.
+var rowCountBuckets = []float64{1, 10, 100, 1000, 10000, 100000, 1000000, 10000000}
+
 // metricQueryKinds is the bounded domain of the kind label on the query metrics (doc 20 §3.1,
 // §7.2): the statement classes a query falls into. The handles for every kind are pre-resolved
 // at open so recording one is a map read and an atomic add, never a registry lock.
@@ -100,6 +107,8 @@ type queryMetrics struct {
 	duration map[string]*metric.Histogram          // gr_query_duration_seconds by [kind]
 	inflight map[string]*metric.Gauge              // gr_query_inflight by [kind]
 	errors   map[string]*metric.Counter            // gr_query_errors_total by [class]
+	returned *metric.Histogram                     // gr_query_rows_returned (output cardinality)
+	scanned  *metric.Histogram                     // gr_query_rows_scanned (scan and expand work)
 }
 
 // newQueryMetrics builds the registry and pre-resolves every query-metric handle (doc 20
@@ -133,7 +142,24 @@ func newQueryMetrics() *queryMetrics {
 			"Currently executing queries, by kind", "queries",
 			metric.Labels{"kind": k})
 	}
+	m.returned = reg.Histogram("gr_query_rows_returned",
+		"Rows in the result set, the output cardinality", "rows", rowCountBuckets, nil)
+	m.scanned = reg.Histogram("gr_query_rows_scanned",
+		"Rows touched by scans and expands, the work the query did", "rows", rowCountBuckets, nil)
 	return m
+}
+
+// recordRows observes one finished query's output cardinality and scan work (doc 20 §3.1): the
+// rows it returned and the rows its scans and expands touched. The ratio scanned/returned is
+// the amplification an inefficient query reveals, so the two are always observed together at the
+// same completion point a query's latency is recorded.
+func (m *queryMetrics) recordRows(returned, scanned int64) {
+	if m.returned != nil {
+		m.returned.Observe(float64(returned))
+	}
+	if m.scanned != nil {
+		m.scanned.Observe(float64(scanned))
+	}
 }
 
 // begin records that a query of the given kind started, raising the in-flight gauge (doc 20
@@ -258,6 +284,26 @@ func (db *DB) measureQuery(kind string, start time.Time, res *Result, err error)
 		res.mstart = start
 		return res, nil
 	}
+	// An eager result is complete now: its returned count is the buffered row count and its
+	// scan work is final on the counter, so record the amplification pair alongside the
+	// latency (doc 20 §3.1). A write with no RETURN has no output columns and buffers a single
+	// effect row the caller never reads, so its output cardinality is zero, not that row.
+	if res != nil {
+		returned := int64(len(res.buf))
+		if len(res.cols) == 0 {
+			returned = 0
+		}
+		db.metrics.recordRows(returned, scanLoad(res.mscan))
+	}
 	db.metrics.finish(kind, "ok", time.Since(start))
 	return res, nil
+}
+
+// scanLoad reads a scan counter, treating a nil counter (a result with no execution, such as a
+// schema or EXPLAIN result) as zero scanned rows.
+func scanLoad(c *atomic.Int64) int64 {
+	if c == nil {
+		return 0
+	}
+	return c.Load()
 }

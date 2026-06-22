@@ -87,6 +87,7 @@ func (o *intersectOp) build(in eval.Row) error {
 	// of matches is the same whichever side builds.
 	side := map[engine.NodeID][]engine.Neighbor{}
 	err := o.ctx.Tx.Expand(engine.NodeID(from0), o.leg[0].tok, o.leg[0].dir, func(nb engine.Neighbor) error {
+		o.ctx.countScan(1)
 		if o.accept(0, nb) {
 			side[nb.Node] = append(side[nb.Node], nb)
 		}
@@ -99,6 +100,7 @@ func (o *intersectOp) build(in eval.Row) error {
 		return nil
 	}
 	return o.ctx.Tx.Expand(engine.NodeID(from1), o.leg[1].tok, o.leg[1].dir, func(nb engine.Neighbor) error {
+		o.ctx.countScan(1)
 		if !o.accept(1, nb) {
 			return nil
 		}

@@ -127,6 +127,7 @@ func (o *shortestPathOp) searchAll(row eval.Row, src, dst engine.NodeID, forbidd
 		var nextFront []engine.NodeID
 		for _, n := range frontier {
 			err := o.ctx.Tx.Expand(n, o.relTok, dir, func(nb engine.Neighbor) error {
+				o.ctx.countScan(1)
 				if o.allow != nil && !o.allow[nb.Type] {
 					return nil
 				}
@@ -233,6 +234,7 @@ func (o *shortestPathOp) searchBidi(row eval.Row, src, dst engine.NodeID, forbid
 			var nf []engine.NodeID
 			for _, n := range ff {
 				err := o.ctx.Tx.Expand(n, o.relTok, dir, func(nb engine.Neighbor) error {
+					o.ctx.countScan(1)
 					if o.allow != nil && !o.allow[nb.Type] {
 						return nil
 					}
@@ -256,6 +258,7 @@ func (o *shortestPathOp) searchBidi(row eval.Row, src, dst engine.NodeID, forbid
 			var nb2 []engine.NodeID
 			for _, n := range bf {
 				err := o.ctx.Tx.Expand(n, o.relTok, rev, func(nb engine.Neighbor) error {
+					o.ctx.countScan(1)
 					if o.allow != nil && !o.allow[nb.Type] {
 						return nil
 					}

@@ -496,7 +496,7 @@ func (db *DB) query(cypher string, params map[string]value.Value, lazy bool) (*R
 		_ = tx.Abort()
 		return nil, err
 	}
-	return &Result{cols: cur.Cols(), cursor: cur, tx: tx, ownTx: true, mat: db.materializer(tx, lazy)}, nil
+	return &Result{cols: cur.Cols(), cursor: cur, tx: tx, ownTx: true, mat: db.materializer(tx, lazy), mscan: cur.ScanCount()}, nil
 }
 
 // execCtx builds the execution context shared by every run of a statement: the
@@ -511,6 +511,10 @@ func (db *DB) execCtx(etx engine.Tx, b *bind.Bound, params map[string]value.Valu
 		LabelName:   db.tokenNamer(catalog.KindLabel),
 		RelTypeName: db.tokenNamer(catalog.KindRelType),
 		PropKeyName: db.tokenNamer(catalog.KindPropKey),
+		// Arm the scanned-rows counter so the scan and expand operators record their work
+		// for gr_query_rows_scanned (doc 20 §3.1). It is a cheap atomic the library reads
+		// after the cursor drains, the amplification numerator paired with rows returned.
+		Scanned: new(atomic.Int64),
 	}
 	// Arm spilling only when a budget is configured. With the default zero budget
 	// the executor never spills, so leaving TempFile unset keeps the in-memory path.
@@ -531,20 +535,20 @@ func (db *DB) execCtx(etx engine.Tx, b *bind.Bound, params map[string]value.Valu
 // lands before the caller sees a row, so a half-consumed result cannot leave the
 // statement partly applied at commit. It does not begin, commit, or abort the
 // transaction; the caller owns that.
-func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]value.Value) ([]string, []eval.Row, Summary, error) {
+func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]value.Value) ([]string, []eval.Row, Summary, *atomic.Int64, error) {
 	if err := internWriteNames(etx, q); err != nil {
-		return nil, nil, Summary{}, err
+		return nil, nil, Summary{}, nil, err
 	}
 	b, err := bind.Bind(q, bind.NewEngineCatalog(etx), false)
 	if err != nil {
-		return nil, nil, Summary{}, err
+		return nil, nil, Summary{}, nil, err
 	}
 	eff := &exec.SideEffects{}
 	ctx := db.execCtx(etx, b, params)
 	ctx.Effects = eff
 	cur, err := exec.Open(plan.Plan(b), ctx)
 	if err != nil {
-		return nil, nil, Summary{}, err
+		return nil, nil, Summary{}, nil, err
 	}
 	cols := cur.Cols()
 	var buf []eval.Row
@@ -552,7 +556,7 @@ func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]v
 		row, ok, err := cur.Next()
 		if err != nil {
 			_ = cur.Close()
-			return nil, nil, Summary{}, err
+			return nil, nil, Summary{}, nil, err
 		}
 		if !ok {
 			break
@@ -560,9 +564,11 @@ func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]v
 		buf = append(buf, cloneRow(row))
 	}
 	if err := cur.Close(); err != nil {
-		return nil, nil, Summary{}, err
+		return nil, nil, Summary{}, nil, err
 	}
-	return cols, buf, summaryOf(eff), nil
+	// The scan counter is final now the cursor is drained and closed, so the caller stores it
+	// on the eager result and measureQuery reads it for gr_query_rows_scanned (doc 20 §3.1).
+	return cols, buf, summaryOf(eff), ctx.Scanned, nil
 }
 
 // cloneRow copies a row map so a buffered write result does not alias a row the
@@ -657,7 +663,7 @@ func (db *DB) runAutoWrite(q *ast.Query, params map[string]value.Value, lazy boo
 	if err != nil {
 		return nil, err
 	}
-	cols, buf, summary, err := db.execWriteBuffered(tx, q, params)
+	cols, buf, summary, scanned, err := db.execWriteBuffered(tx, q, params)
 	if err != nil {
 		_ = tx.Abort()
 		return nil, err
@@ -665,7 +671,7 @@ func (db *DB) runAutoWrite(q *ast.Query, params map[string]value.Value, lazy boo
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	res := &Result{cols: cols, buf: buf, summary: summary}
+	res := &Result{cols: cols, buf: buf, summary: summary, mscan: scanned}
 	// A write commits before returning, so its buffered rows have no live snapshot to
 	// materialize their graph objects against. When the result carries rows, open a
 	// fresh read transaction over the just-committed state and let the result own it,
@@ -1309,6 +1315,13 @@ type Result struct {
 	mkind  string
 	mstart time.Time
 	mdone  bool
+	// mscan is the shared executor scan counter (doc 20 §3.1), the rows the query's scans
+	// and expands touched, read at the recording point for gr_query_rows_scanned. It is nil
+	// for a result with no execution (a schema or EXPLAIN result). rowsReturned counts the
+	// rows a streaming read yielded, the output cardinality for gr_query_rows_returned; an
+	// eager result reads its returned count from the buffer length instead.
+	mscan        *atomic.Int64
+	rowsReturned int64
 }
 
 // Columns returns the result's output column names in order. It is the same column
@@ -1373,7 +1386,14 @@ func (r *Result) Row() ([]value.Value, bool, error) {
 // for a read, or the materialized buffer for an eagerly executed write.
 func (r *Result) next() (eval.Row, bool, error) {
 	if r.cursor != nil {
-		return r.cursor.Next()
+		row, ok, err := r.cursor.Next()
+		if ok {
+			// Count the rows a streaming read yields for gr_query_rows_returned (doc 20
+			// §3.1); Close reads the total when the stream ends. An eager result reads its
+			// returned count from the buffer length, so it does not count here.
+			r.rowsReturned++
+		}
+		return row, ok, err
 	}
 	if r.bufIdx >= len(r.buf) {
 		return nil, false, nil
@@ -1416,6 +1436,7 @@ func (r *Result) Close() error {
 		if r.err != nil {
 			r.mdb.metrics.recordError(r.err)
 		}
+		r.mdb.metrics.recordRows(r.rowsReturned, scanLoad(r.mscan))
 		r.mdb.metrics.finish(r.mkind, metricStatusOf(r.err), time.Since(r.mstart))
 	}
 	if cerr != nil {

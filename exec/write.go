@@ -818,6 +818,7 @@ func (o *deleteOp) deleteNode(id uint64) error {
 func (o *deleteOp) detach(id uint64) error {
 	var inc []uint64
 	err := o.ctx.Tx.Expand(engine.NodeID(id), 0, engine.Both, func(nb engine.Neighbor) error {
+		o.ctx.countScan(1)
 		inc = append(inc, uint64(nb.Rel))
 		return nil
 	})

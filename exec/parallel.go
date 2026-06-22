@@ -241,8 +241,13 @@ func (o *aggregateOp) runParallel(ns *plan.NodeScan) error {
 	}
 	w := parallelWorkers(len(ids))
 	if w < 2 {
+		// The serial fallback re-scans through the nodeScan operator, which counts its
+		// own work, so the scan is counted there, not here.
 		return o.runSerial()
 	}
+	// The morsel workers walk this already-scanned id slice rather than scanning again,
+	// so the scan work is counted once here (doc 20 §3.1) instead of per worker.
+	o.ctx.countScan(int64(len(ids)))
 	src := &morselSource{ids: ids, chunk: morselChunk}
 	partials := make([][]windowResult, w)
 	errs := make([]error, w)

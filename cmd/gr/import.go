@@ -12,29 +12,32 @@ import (
 	"github.com/tamnd/gr"
 )
 
-// importOptions controls what .import / gr import loads (doc 17 §6.10, §7.2). This
-// slice imports CSV/TSV rows as nodes; the relationship form (--as-rel/--from/--to)
-// and Parquet are parsed and rejected with a clear message until their slices land.
+// importOptions controls what .import / gr import loads (doc 17 §6.10, §7.2). It loads
+// CSV/TSV rows as nodes (--as) or as relationships (--as-rel with --from/--to);
+// Parquet is parsed and rejected with a clear message until its slice lands.
 type importOptions struct {
-	file      string
-	labels    []string          // --as (repeatable for multi-label)
-	relType   string            // --as-rel TYPE
-	from, to  string            // --from NS:COL / --to NS:COL
-	idCol     string            // --id-col COL
-	format    string            // csv|tsv|parquet (inferred from the extension)
-	header    bool              // first row is a header (default yes)
-	separator string            // field delimiter
-	skip      int               // skip leading data rows
-	limit     int               // cap rows imported (0 = no cap)
-	types     map[string]string // --type COL:TYPE
-	null      string            // --null STR
-	merge     bool              // MERGE instead of CREATE
-	batch     int               // commit every N rows
+	file           string
+	labels         []string          // --as (repeatable for multi-label)
+	relType        string            // --as-rel TYPE
+	from, to       string            // --from LABEL:COL / --to LABEL:COL
+	fromKey, toKey string            // --from-key / --to-key (node property to match)
+	idCol          string            // --id-col COL
+	format         string            // csv|tsv|parquet (inferred from the extension)
+	header         bool              // first row is a header (default yes)
+	separator      string            // field delimiter
+	skip           int               // skip leading data rows
+	limit          int               // cap rows imported (0 = no cap)
+	types          map[string]string // --type COL:TYPE
+	null           string            // --null STR
+	merge          bool              // MERGE instead of CREATE
+	batch          int               // commit every N rows
 }
 
 // importResult reports what an import wrote.
 type importResult struct {
-	nodes int
+	nodes    int
+	rels     int
+	dangling int // relationship rows whose endpoints were not found
 }
 
 // parseImportArgs parses the import flags shared by the dot-command and the subcommand
@@ -64,6 +67,10 @@ func parseImportArgs(args []string) (importOptions, error) {
 			opt.from, err = next()
 		case "--to":
 			opt.to, err = next()
+		case "--from-key":
+			opt.fromKey, err = next()
+		case "--to-key":
+			opt.toKey, err = next()
 		case "--id-col":
 			opt.idCol, err = next()
 		case "--format":
@@ -110,14 +117,30 @@ func parseImportArgs(args []string) (importOptions, error) {
 	if opt.file == "" {
 		return opt, fmt.Errorf("a source file is required")
 	}
-	if opt.relType != "" || opt.from != "" || opt.to != "" {
-		return opt, fmt.Errorf("relationship import (--as-rel/--from/--to) is not yet supported; nodes only for now")
-	}
-	if len(opt.labels) == 0 {
-		return opt, fmt.Errorf("--as LABEL is required")
-	}
-	if opt.merge && opt.idCol == "" {
-		return opt, fmt.Errorf("--merge needs --id-col to key the upsert")
+	isRel := opt.relType != "" || opt.from != "" || opt.to != ""
+	if isRel {
+		if len(opt.labels) > 0 {
+			return opt, fmt.Errorf("use --as for nodes or --as-rel for relationships, not both")
+		}
+		if opt.relType == "" {
+			return opt, fmt.Errorf("--as-rel TYPE is required for relationship import")
+		}
+		if opt.from == "" || opt.to == "" {
+			return opt, fmt.Errorf("relationship import needs --from LABEL:COL and --to LABEL:COL")
+		}
+		if _, _, ok := strings.Cut(opt.from, ":"); !ok {
+			return opt, fmt.Errorf("--from wants LABEL:COL, got %q", opt.from)
+		}
+		if _, _, ok := strings.Cut(opt.to, ":"); !ok {
+			return opt, fmt.Errorf("--to wants LABEL:COL, got %q", opt.to)
+		}
+	} else {
+		if len(opt.labels) == 0 {
+			return opt, fmt.Errorf("--as LABEL or --as-rel TYPE is required")
+		}
+		if opt.merge && opt.idCol == "" {
+			return opt, fmt.Errorf("--merge needs --id-col to key the upsert")
+		}
 	}
 	opt.format = resolveFormat(opt.format, opt.file)
 	if opt.format == "parquet" {
@@ -151,6 +174,9 @@ func runImport(db *gr.DB, opt importOptions) (importResult, error) {
 		return importResult{}, err
 	}
 	defer func() { _ = f.Close() }()
+	if opt.relType != "" {
+		return importRels(db, opt, f)
+	}
 	return importNodes(db, opt, f)
 }
 
@@ -226,6 +252,221 @@ func importNodes(db *gr.DB, opt importOptions, r io.Reader) (importResult, error
 		}
 	}
 	return res, nil
+}
+
+// importRels reads CSV/TSV rows and writes a relationship per row (doc 17 §6.10, doc 19
+// §7.3). Each row names its two endpoints by the external-id columns --from and --to;
+// the relationship is created between the nodes whose match key holds those ids, and the
+// remaining columns become its properties. A row whose endpoints are not found is a
+// dangling endpoint (doc 19 §11.3): it is counted and skipped, not an error.
+func importRels(db *gr.DB, opt importOptions, r io.Reader) (importResult, error) {
+	cr := csv.NewReader(r)
+	cr.Comma = importComma(opt)
+	cr.FieldsPerRecord = -1
+
+	header, err := importHeader(cr, opt)
+	if err != nil {
+		return importResult{}, err
+	}
+
+	plan, err := opt.relPlan(header)
+	if err != nil {
+		return importResult{}, err
+	}
+
+	ctx := context.Background()
+	var res importResult
+	skipped := 0
+	tx, err := db.Begin(ctx, gr.Write)
+	if err != nil {
+		return res, err
+	}
+	inBatch := 0
+	abort := func() {
+		if tx != nil {
+			_ = tx.Rollback()
+			tx = nil
+		}
+	}
+	rowNum := 0
+	for {
+		row, err := cr.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			abort()
+			return res, err
+		}
+		rowNum++
+		if skipped < opt.skip {
+			skipped++
+			continue
+		}
+		if opt.limit > 0 && res.rels+res.dangling >= opt.limit {
+			break
+		}
+
+		stmt, params, ok := plan.statement(row)
+		if !ok {
+			res.dangling++ // an endpoint id column was blank
+			continue
+		}
+		out, err := tx.Run(ctx, stmt, params)
+		created := false
+		if err == nil {
+			for out.Next() {
+				created = true
+			}
+			err = out.Err()
+			_ = out.Close()
+		}
+		if err != nil {
+			abort()
+			return res, fmt.Errorf("row %d: %w", rowNum, err)
+		}
+		if created {
+			res.rels++
+		} else {
+			res.dangling++ // MATCH found no endpoint
+		}
+		inBatch++
+		if inBatch >= opt.batch {
+			if err := tx.Commit(); err != nil {
+				return res, err
+			}
+			if tx, err = db.Begin(ctx, gr.Write); err != nil {
+				return res, err
+			}
+			inBatch = 0
+		}
+	}
+	if tx != nil {
+		if err := tx.Commit(); err != nil {
+			return res, err
+		}
+	}
+	return res, nil
+}
+
+// relPlan holds the per-file facts a relationship import resolves once: the endpoint
+// labels, the columns that carry the endpoint ids, the node properties to match those
+// ids against, and the columns that become relationship properties.
+type relPlan struct {
+	opt                importOptions
+	fromLabel, toLabel string
+	fromIdx, toIdx     int
+	fromKey, toKey     string
+	header             []string
+}
+
+// relPlan resolves the endpoint columns and keys against the header (doc 19 §7.3). The
+// match key is --from-key/--to-key, falling back to --id-col, then to the endpoint
+// column name, so the common case (the rel column and the stored node property share a
+// name) needs no extra flags.
+func (opt importOptions) relPlan(header []string) (relPlan, error) {
+	fromLabel, fromCol, _ := strings.Cut(opt.from, ":")
+	toLabel, toCol, _ := strings.Cut(opt.to, ":")
+	fromIdx, ok := columnIndex(header, fromCol)
+	if !ok {
+		return relPlan{}, fmt.Errorf("--from column %q not found in the header", fromCol)
+	}
+	toIdx, ok := columnIndex(header, toCol)
+	if !ok {
+		return relPlan{}, fmt.Errorf("--to column %q not found in the header", toCol)
+	}
+	return relPlan{
+		opt:       opt,
+		fromLabel: fromLabel,
+		toLabel:   toLabel,
+		fromIdx:   fromIdx,
+		toIdx:     toIdx,
+		fromKey:   firstNonEmpty(opt.fromKey, opt.idCol, fromCol),
+		toKey:     firstNonEmpty(opt.toKey, opt.idCol, toCol),
+		header:    header,
+	}, nil
+}
+
+// statement builds the Cypher and parameters for one relationship row. It returns ok
+// false when an endpoint id cell is blank, so the caller can count the row as dangling
+// without running a query. The values are parameters, never spliced, and the labels,
+// keys, and type are fixed text (backtick-quoted).
+func (p relPlan) statement(row []string) (string, gr.Params, bool) {
+	if p.fromIdx >= len(row) || p.toIdx >= len(row) {
+		return "", nil, false
+	}
+	fromVal, toVal := row[p.fromIdx], row[p.toIdx]
+	if fromVal == "" || toVal == "" {
+		return "", nil, false
+	}
+	params := gr.Params{"from": fromVal, "to": toVal}
+	match := fmt.Sprintf("MATCH (a:%s {%s: $from}), (b:%s {%s: $to})",
+		quoteIdent(p.fromLabel), quoteIdent(p.fromKey),
+		quoteIdent(p.toLabel), quoteIdent(p.toKey))
+
+	var props []string
+	for i, cell := range row {
+		if i == p.fromIdx || i == p.toIdx {
+			continue
+		}
+		name := columnName(p.header, i)
+		if name == "" || p.opt.isNull(cell) {
+			continue
+		}
+		pn := "p_" + name
+		props = append(props, fmt.Sprintf("%s = $%s", quoteIdent(name), pn))
+		params[pn] = p.opt.coerce(name, cell)
+	}
+
+	var b strings.Builder
+	b.WriteString(match)
+	if p.opt.merge {
+		fmt.Fprintf(&b, " MERGE (a)-[r:%s]->(b)", quoteIdent(p.opt.relType))
+		if len(props) > 0 {
+			fmt.Fprintf(&b, " SET %s", joinSet(props))
+		}
+	} else {
+		fmt.Fprintf(&b, " CREATE (a)-[r:%s]->(b)", quoteIdent(p.opt.relType))
+		if len(props) > 0 {
+			fmt.Fprintf(&b, " SET %s", joinSet(props))
+		}
+	}
+	b.WriteString(" RETURN r")
+	return b.String(), params, true
+}
+
+// joinSet joins "n.x = $p_x" fragments for a SET clause.
+func joinSet(frags []string) string {
+	for i, f := range frags {
+		frags[i] = "r." + f
+	}
+	return strings.Join(frags, ", ")
+}
+
+// firstNonEmpty returns the first non-empty string of its arguments.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// columnIndex returns the position of a named column: its header index, or, for a
+// headerless import, the parsed N-1 of a positional colN name.
+func columnIndex(header []string, name string) (int, bool) {
+	for i, h := range header {
+		if h == name {
+			return i, true
+		}
+	}
+	if len(header) == 0 && strings.HasPrefix(name, "col") {
+		if n, err := strconv.Atoi(name[len("col"):]); err == nil && n >= 1 {
+			return n - 1, true
+		}
+	}
+	return 0, false
 }
 
 // importComma resolves the field delimiter: an explicit --separator, else a tab for
@@ -367,14 +608,26 @@ func (s *shell) dotImport(args []string) {
 		s.code = worst(s.code, classify(err))
 		return
 	}
-	fmt.Fprintf(s.errw, "imported %d nodes\n", res.nodes)
+	fmt.Fprintln(s.errw, importSummary(opt, res))
+}
+
+// importSummary phrases what an import wrote: a node count, or a relationship count with
+// a note when some rows were dangling (an endpoint was not found).
+func importSummary(opt importOptions, res importResult) string {
+	if opt.relType == "" {
+		return fmt.Sprintf("imported %d nodes", res.nodes)
+	}
+	if res.dangling > 0 {
+		return fmt.Sprintf("imported %d relationships (%d rows skipped: endpoint not found)", res.rels, res.dangling)
+	}
+	return fmt.Sprintf("imported %d relationships", res.rels)
 }
 
 // runImportCmd implements the `gr import` subcommand (doc 17 §7.2): it opens a database
 // read-write and loads CSV/TSV rows as nodes.
 func runImportCmd(args []string, stdout, stderr io.Writer) int {
 	if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
-		fmt.Fprintln(stderr, "Usage: gr import DATABASE FILE --as LABEL [--id-col COL] [--type COL:TYPE] [--merge] [--no-header]")
+		fmt.Fprintln(stderr, "Usage: gr import DATABASE FILE (--as LABEL | --as-rel TYPE --from LABEL:COL --to LABEL:COL) [--id-col COL] [--from-key COL] [--to-key COL] [--type COL:TYPE] [--merge] [--no-header]")
 		return exitUsage
 	}
 	if len(args) < 1 {
@@ -398,6 +651,6 @@ func runImportCmd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "gr:", err)
 		return classify(err)
 	}
-	fmt.Fprintf(stderr, "imported %d nodes\n", res.nodes)
+	fmt.Fprintln(stderr, importSummary(opt, res))
 	return exitOK
 }

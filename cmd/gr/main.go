@@ -201,7 +201,7 @@ Usage:
   gr serve [flags] [database]
   gr dump  [flags] database
   gr load  [flags] database
-  gr import database file --as label
+  gr import database file --as label | --as-rel type --from L:col --to L:col
   gr export database --nodes|--rels|--query ... --to file
   gr info  database
   gr backup source dest

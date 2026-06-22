@@ -2,6 +2,7 @@ package exec
 
 import (
 	"math"
+	"time"
 
 	"github.com/tamnd/gr/engine"
 	"github.com/tamnd/gr/eval"
@@ -60,6 +61,10 @@ func (o *nodeIndexSeekOp) open(ctx *Ctx) error {
 	if !pointProbe {
 		return ctx.Tx.ScanLabel(label, o.collect)
 	}
+	// Time the index descent so the lookup reports its anchor cost (doc 20 §6.4). The probe may
+	// touch more than one key for the cross-type numeric case, but it is one logical lookup, so the
+	// whole descent is timed and reported once below.
+	dstart := time.Now()
 	for _, k := range keys {
 		served, err := ctx.Tx.IndexSeek(label, key, k, o.collect)
 		if err != nil {
@@ -67,11 +72,13 @@ func (o *nodeIndexSeekOp) open(ctx *Ctx) error {
 		}
 		if !served {
 			// The index was dropped between planning and execution; fall back to the
-			// scan so the query still answers correctly.
+			// scan so the query still answers correctly. This took the scan path, not the
+			// index, so it is not reported as an index lookup.
 			o.buf = nil
 			return ctx.Tx.ScanLabel(label, o.collect)
 		}
 	}
+	o.ctx.countIndexSeek(label, key, "point", time.Since(dstart))
 	return nil
 }
 

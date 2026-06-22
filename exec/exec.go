@@ -111,6 +111,12 @@ type GraphObserver interface {
 	// compression factorization achieved; a high ratio is a many-to-many expansion it kept from
 	// blowing up (doc 20 §6.3).
 	FactorizationRatio(ratio float64)
+	// IndexSeek reports one index lookup that served a query's anchor, descending in dur (doc 20
+	// §6.4). label and prop are the indexed label and property tokens, which the observer resolves
+	// to the index name; kind is the access kind (point, range), the anchor-selection view the
+	// planner's choice produced. A lookup that fell back to a full scan does not report here, since
+	// it took the scan path, not the index.
+	IndexSeek(label, prop engine.Token, kind string, dur time.Duration)
 }
 
 // countScan adds n to the scanned-rows counter when one is armed (doc 20 §3.1). It is the
@@ -177,6 +183,15 @@ func (c *Ctx) countFactorized() {
 func (c *Ctx) countFactorizationRatio(ratio float64) {
 	if c.Graph != nil {
 		c.Graph.FactorizationRatio(ratio)
+	}
+}
+
+// countIndexSeek reports one index-served anchor lookup to the observer when one is wired (doc 20
+// §6.4), called once as the seek operator opens after its index descent. With no observer set it is
+// a nil check and nothing more.
+func (c *Ctx) countIndexSeek(label, prop engine.Token, kind string, dur time.Duration) {
+	if c.Graph != nil {
+		c.Graph.IndexSeek(label, prop, kind, dur)
 	}
 }
 

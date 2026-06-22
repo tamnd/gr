@@ -215,6 +215,9 @@ func Open(path string, opt Options) (*DB, error) {
 	// token-to-name resolver (doc 20 §6.1). Wire it now the engine exists; an expand before this
 	// would fall back to the all-types bucket, but no query runs during Open.
 	db.metrics.relTypeName = db.tokenNamer(catalog.KindRelType)
+	// The index-lookup metric labels by index name, so the observer needs the (label, property)
+	// to index-name resolver (doc 20 §6.4). Wire it now the engine exists.
+	db.metrics.indexNameOf = db.indexNamer()
 	// The open event reports the file's real geometry and whether this open recovered a
 	// committed WAL prefix after a crash (doc 20 §11.3). StorageInfo reads the header the
 	// engine just mounted, so the format version and page size are the file's own.
@@ -1313,6 +1316,32 @@ func (s engineStats) RelTypeCount(relType uint32) float64 {
 func (db *DB) tokenNamer(kind catalog.Kind) func(t engine.Token) (string, bool) {
 	return func(t engine.Token) (string, bool) {
 		return db.eng.TokenName(kind, t)
+	}
+}
+
+// indexNamer returns a resolver from an indexed (label, property) token pair to the index name,
+// for the index-lookup metric's index label (doc 20 §6.4). It resolves the tokens to their names
+// and finds the index over that label whose first property matches, returning its declared name; an
+// unresolved pair (no such index, or an unnamed token) returns the empty string, which the metric
+// renders as a derived name so a count is never lost.
+func (db *DB) indexNamer() func(label, prop engine.Token) string {
+	labelName := db.tokenNamer(catalog.KindLabel)
+	propName := db.tokenNamer(catalog.KindPropKey)
+	return func(label, prop engine.Token) string {
+		ln, ok := labelName(label)
+		if !ok {
+			return ""
+		}
+		pn, ok := propName(prop)
+		if !ok {
+			return ""
+		}
+		for _, ix := range db.eng.IndexInfos() {
+			if ix.Label == ln && len(ix.Props) > 0 && ix.Props[0] == pn {
+				return ix.Name
+			}
+		}
+		return ""
 	}
 }
 

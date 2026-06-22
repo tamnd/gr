@@ -3,6 +3,7 @@ package gr
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,6 +32,7 @@ const defaultAdmitWait = 100 * time.Millisecond
 type Admission struct {
 	slots chan struct{}
 	wait  time.Duration
+	shed  atomic.Int64
 }
 
 // NewAdmission builds an admission gate that allows maxInFlight queries to execute at
@@ -65,6 +67,7 @@ func (a *Admission) Acquire(ctx context.Context) (func(), error) {
 	case a.slots <- struct{}{}:
 		return func() { <-a.slots }, nil
 	case <-t.C:
+		a.shed.Add(1)
 		return nil, ErrOverloaded
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -78,4 +81,15 @@ func (a *Admission) InFlight() int {
 		return 0
 	}
 	return len(a.slots)
+}
+
+// Shed reports how many queries the gate has shed under overload since it was created
+// (doc 18 §13.5). A nonzero value means clients hit the in-flight bound and were asked to
+// retry, the signal an operator reads to decide whether to raise the limit. A nil gate
+// reports zero.
+func (a *Admission) Shed() int64 {
+	if a == nil {
+		return 0
+	}
+	return a.shed.Load()
 }

@@ -1,6 +1,7 @@
 package httpd
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -124,6 +125,48 @@ func TestMetricsEndpoint(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics missing %q\nbody:\n%s", want, body)
 		}
+	}
+}
+
+// TestMetricsAdmission confirms the gate metrics appear when a gate is configured: the
+// in-flight gauge reflects a held slot and the shed counter counts a shed query.
+func TestMetricsAdmission(t *testing.T) {
+	gate := gr.NewAdmission(1, 10*time.Millisecond)
+	release, err := gate.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("pre-acquire: %v", err)
+	}
+	defer release()
+	h := Handler(newTestDB(t), Options{Admission: gate})
+
+	// The held slot makes this query shed, lifting the shed counter.
+	if rec := post(t, h, `{"statement":"RETURN 1 AS n"}`); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("query status = %d, want 503", rec.Code)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		"# TYPE gr_server_in_flight_queries gauge",
+		"gr_server_in_flight_queries 1",
+		"# TYPE gr_server_queries_shed_total counter",
+		"gr_server_queries_shed_total 1",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q\nbody:\n%s", want, body)
+		}
+	}
+}
+
+// TestMetricsNoAdmission confirms an ungated server does not emit the gate metrics, so a
+// scraper does not read a misleading constant zero.
+func TestMetricsNoAdmission(t *testing.T) {
+	h := Handler(newTestDB(t), Options{})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if strings.Contains(rec.Body.String(), "gr_server_in_flight_queries") {
+		t.Error("ungated server emitted the in-flight gauge")
 	}
 }
 

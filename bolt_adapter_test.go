@@ -279,3 +279,29 @@ func TestBoltAdapterAuth(t *testing.T) {
 		t.Errorf("none scheme rejected while auth is off: %v", err)
 	}
 }
+
+// TestBoltAdapterAuthFunc confirms WithBoltAuthFunc routes authentication through the
+// given verifier, so the Bolt and HTTP transports can share one auth provider (doc 18
+// §10.4). The verifier sees the scheme, principal, and credentials, and its result
+// decides the connection.
+func TestBoltAdapterAuthFunc(t *testing.T) {
+	db := boltDB(t)
+	var sawScheme, sawPrincipal, sawCreds string
+	h := db.BoltHandler(WithBoltAuthFunc(func(scheme, principal, credentials string) error {
+		sawScheme, sawPrincipal, sawCreds = scheme, principal, credentials
+		if principal == "ada" && credentials == "letmein" {
+			return nil
+		}
+		return errors.New("denied")
+	}))
+
+	if err := h.Authenticate("basic", "ada", "letmein"); err != nil {
+		t.Errorf("verifier-approved credentials rejected: %v", err)
+	}
+	if sawScheme != "basic" || sawPrincipal != "ada" || sawCreds != "letmein" {
+		t.Errorf("verifier saw (%q,%q,%q), want (basic,ada,letmein)", sawScheme, sawPrincipal, sawCreds)
+	}
+	if err := h.Authenticate("basic", "ada", "nope"); err == nil {
+		t.Error("verifier-denied credentials accepted")
+	}
+}

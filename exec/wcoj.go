@@ -1,6 +1,8 @@
 package exec
 
 import (
+	"time"
+
 	"github.com/tamnd/gr/engine"
 	"github.com/tamnd/gr/eval"
 	"github.com/tamnd/gr/plan"
@@ -59,9 +61,11 @@ func (o *intersectOp) next() (eval.Row, bool, error) {
 		if err != nil || !ok {
 			return nil, false, err
 		}
+		istart := time.Now()
 		if err := o.build(in); err != nil {
 			return nil, false, err
 		}
+		o.ctx.countWCOJIntersect(time.Since(istart))
 	}
 }
 

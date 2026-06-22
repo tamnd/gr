@@ -180,6 +180,11 @@ type queryMetrics struct {
 	wcoj         *metric.Counter // gr_wcoj_total
 	binaryJoin   *metric.Counter // gr_binary_join_total
 
+	wcojIntersect      *metric.Histogram // gr_wcoj_intersect_seconds
+	joinBuild          *metric.Histogram // gr_join_build_seconds
+	factorized         *metric.Counter   // gr_factorized_total
+	factorizationRatio *metric.Histogram // gr_factorization_ratio
+
 	// relTypeName resolves a relationship-type token to its name for the expand metrics' type
 	// label. It is wired at Open once the engine exists; until then it is nil and an expand is
 	// attributed to the all-types bucket. The expand metrics are labelled by type, so a token
@@ -296,6 +301,15 @@ func newQueryMetrics() *queryMetrics {
 		"Worst-case-optimal joins executed (cyclic-pattern evaluation)", "joins", nil)
 	m.binaryJoin = reg.Counter("gr_binary_join_total",
 		"Binary hash joins executed (tree-pattern evaluation)", "joins", nil)
+	m.wcojIntersect = reg.Histogram("gr_wcoj_intersect_seconds",
+		"Time in the worst-case-optimal multi-way intersection", "seconds", queryLatencyBuckets, nil)
+	m.joinBuild = reg.Histogram("gr_join_build_seconds",
+		"Time building binary hash-join build sides", "seconds", queryLatencyBuckets, nil)
+	m.factorized = reg.Counter("gr_factorized_total",
+		"Operators that produced or consumed factorized intermediates", "operators", nil)
+	m.factorizationRatio = reg.Histogram("gr_factorization_ratio",
+		"Flat size over factorized size of intermediates, the compression factorization achieved",
+		"ratio", rowCountBuckets, nil)
 	m.returned = reg.Histogram("gr_query_rows_returned",
 		"Rows in the result set, the output cardinality", "rows", rowCountBuckets, nil)
 	m.scanned = reg.Histogram("gr_query_rows_scanned",
@@ -589,6 +603,30 @@ func (g graphObserver) BinaryJoin() {
 
 func (g graphObserver) Expand(relType engine.Token, dir engine.Direction, fanout int, dur time.Duration) {
 	g.m.recordExpand(relType, dir, fanout, dur)
+}
+
+func (g graphObserver) WCOJIntersect(dur time.Duration) {
+	if g.m.wcojIntersect != nil {
+		g.m.wcojIntersect.Observe(dur.Seconds())
+	}
+}
+
+func (g graphObserver) JoinBuild(dur time.Duration) {
+	if g.m.joinBuild != nil {
+		g.m.joinBuild.Observe(dur.Seconds())
+	}
+}
+
+func (g graphObserver) Factorized() {
+	if g.m.factorized != nil {
+		g.m.factorized.Inc()
+	}
+}
+
+func (g graphObserver) FactorizationRatio(ratio float64) {
+	if g.m.factorizationRatio != nil {
+		g.m.factorizationRatio.Observe(ratio)
+	}
 }
 
 // recordExpand records one source position expanded (doc 20 §6.1): it bumps the per-(type,dir)

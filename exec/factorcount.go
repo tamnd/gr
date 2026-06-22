@@ -63,6 +63,12 @@ func (o *expandCountOp) next() (eval.Row, bool, error) {
 			total += n
 		}
 	}
+	// One tally row stands in for total flat rows, so the factorization ratio is total: an
+	// Expand+Aggregate would have built total rows to count, this built one (doc 20 §6.3).
+	o.ctx.countFactorized()
+	if total > 0 {
+		o.ctx.countFactorizationRatio(float64(total))
+	}
 	return eval.Row{o.spec.Col: value.Int(total)}, true, nil
 }
 
@@ -164,6 +170,12 @@ func (o *productCountOp) next() (eval.Row, bool, error) {
 			return nil, false, err
 		}
 		total += n
+	}
+	// One tally row stands in for the cross-product's total rows, so the ratio is total: the
+	// naive plan would have built total product rows, this built one (doc 20 §6.3).
+	o.ctx.countFactorized()
+	if total > 0 {
+		o.ctx.countFactorizationRatio(float64(total))
 	}
 	return eval.Row{o.spec.Col: value.Int(total)}, true, nil
 }

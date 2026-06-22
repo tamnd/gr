@@ -2,6 +2,7 @@ package exec
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/eval"
@@ -134,6 +135,8 @@ func (o *joinOp) open(ctx *Ctx) error {
 // product, which has no key to partition on) spills the build side to one file that
 // next streams per probe row.
 func (o *joinOp) build() error {
+	bstart := time.Now()
+	defer func() { o.ctx.countJoinBuild(time.Since(bstart)) }()
 	// Parallel build path: with no memory budget the table lives in memory anyway, so
 	// when the build side is a scan-rooted independent pipeline, construct it across
 	// cores. The probe below is unchanged and serial, so the output and its order match

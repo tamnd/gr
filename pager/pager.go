@@ -89,6 +89,7 @@ type Pager struct {
 
 	headerDirty bool
 	closed      bool
+	recovered   bool // true if open redid committed WAL frames after a crash
 }
 
 func (o Options) withDefaults() Options {
@@ -211,6 +212,13 @@ func (p *Pager) recover(saltSeed uint64) error {
 		return err
 	}
 	if res.Committed {
+		// A committed WAL prefix means the previous process crashed after the
+		// commit fsync but before the checkpoint folded it into the file, so this
+		// open is a crash recovery, not a clean reopen (doc 20 §11.3, the open
+		// event's recovered flag).
+		if len(res.Frames) > 0 {
+			p.recovered = true
+		}
 		// Redo committed frames into the database file (idempotent: full images).
 		for _, fr := range res.Frames {
 			off := int64(fr.PageID) * int64(p.pageSize)
@@ -270,6 +278,11 @@ func (p *Pager) SetSectionDir(id format.PageID) {
 
 // PageSize returns the file's page size.
 func (p *Pager) PageSize() uint32 { return p.pageSize }
+
+// Recovered reports whether opening the file redid a committed WAL prefix, which
+// means the previous process crashed between a commit's fsync and its checkpoint.
+// It feeds the open event's recovered flag (doc 20 §11.3).
+func (p *Pager) Recovered() bool { return p.recovered }
 
 // PayloadSize returns usable payload bytes per page.
 func (p *Pager) PayloadSize() int { return format.PayloadSize(p.pageSize) }

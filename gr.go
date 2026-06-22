@@ -97,6 +97,11 @@ type DB struct {
 	memBudget int64
 	tmpSeq    atomic.Uint64
 
+	// events is the structured operational-event log (doc 20 §11): open, close, and the
+	// rest of the taxonomy. A nil log is disabled, the embedded default, so every emit
+	// site calls it without a guard. It is set at Open and read for the close event.
+	events *EventLog
+
 	// lazyProps is the open-time default for property materialization (doc 16 §10.6):
 	// false (the default) materializes a graph object's properties eagerly when its
 	// record is produced, so the object outlives its transaction; true defers each
@@ -149,6 +154,12 @@ type Options struct {
 	// transaction's lifetime. A single statement can override this with
 	// WithLazyProperties.
 	LazyProperties bool
+	// EventLog receives the structured operational-event stream (doc 20 §11): the open
+	// and close events, and (as the subsystems gain hooks) recovery, checkpoint, and the
+	// rest of the taxonomy. nil, the default, disables it, so an embedded database logs
+	// nothing until the embedder points it at an slog handler. Build one with
+	// [NewEventLog].
+	EventLog *EventLog
 }
 
 // Open opens the database at path, creating it with a fresh graph structure if it
@@ -176,7 +187,7 @@ func Open(path string, opt Options) (*DB, error) {
 	if driftFactor == 0 {
 		driftFactor = plan.DefaultDriftFactor
 	}
-	return &DB{
+	db := &DB{
 		path:        path,
 		eng:         eng,
 		cache:       plan.NewCache(opt.PlanCacheSize),
@@ -186,7 +197,17 @@ func Open(path string, opt Options) (*DB, error) {
 		memBudget:   opt.MemBudget,
 		lazyProps:   opt.LazyProperties,
 		readOnly:    opt.ReadOnly,
-	}, nil
+		events:      opt.EventLog,
+	}
+	// The open event reports the file's real geometry and whether this open recovered a
+	// committed WAL prefix after a crash (doc 20 §11.3). StorageInfo reads the header the
+	// engine just mounted, so the format version and page size are the file's own.
+	if info, err := eng.StorageInfo(); err == nil {
+		db.events.Open(path, info.FormatVersion, info.PageSize, eng.Recovered())
+	} else {
+		db.events.Open(path, 0, eng.PageSize(), eng.Recovered())
+	}
+	return db, nil
 }
 
 // RunOption tunes one statement run without changing the database's open-time
@@ -1362,5 +1383,9 @@ func (db *DB) Close() error {
 	}
 	err := db.eng.Close()
 	db.eng = nil
+	// The close is clean when the engine closed without error; a failed close left work
+	// undone, which the clean flag records for an operator reading the event stream (doc
+	// 20 §11.3).
+	db.events.Close(db.path, err == nil)
 	return err
 }

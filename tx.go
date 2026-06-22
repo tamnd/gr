@@ -179,13 +179,14 @@ func (db *DB) UpdateContext(ctx context.Context, fn func(tx *Tx) error) error {
 // writes (read-your-writes, doc 06 §2.3) and binds against the transaction's
 // catalog view, so it resolves names the transaction has interned but not yet
 // committed. A write in a read transaction is rejected with ErrReadOnly.
-func (tx *Tx) Run(ctx context.Context, cypher string, params Params) (*Result, error) {
+func (tx *Tx) Run(ctx context.Context, cypher string, params Params, opts ...RunOption) (*Result, error) {
 	if tx.done {
 		return nil, ErrTxnDone
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	cfg := tx.db.resolveRun(opts)
 	vals, err := toValues(params)
 	if err != nil {
 		return nil, err
@@ -212,9 +213,9 @@ func (tx *Tx) Run(ctx context.Context, cypher string, params Params) (*Result, e
 		if !tx.write {
 			return nil, ErrReadOnly
 		}
-		return tx.runWrite(q, vals)
+		return tx.runWrite(q, vals, cfg.lazy)
 	}
-	return tx.runRead(cypher, q, vals)
+	return tx.runRead(cypher, q, vals, cfg.lazy)
 }
 
 // runRead opens a read statement over the transaction's snapshot and returns a
@@ -223,7 +224,7 @@ func (tx *Tx) Run(ctx context.Context, cypher string, params Params) (*Result, e
 // transaction holds no write lock); a write transaction binds against its own
 // catalog view, since it holds the engine lock (an engine lookup would deadlock)
 // and must see its own uncommitted interned names.
-func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value) (*Result, error) {
+func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
 	var b *bind.Bound
 	var op plan.Op
 	if tx.write {
@@ -243,7 +244,7 @@ func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value
 	if err != nil {
 		return nil, err
 	}
-	return &Result{cols: cur.Cols(), cursor: cur, tx: tx.etx, ownTx: false}, nil
+	return &Result{cols: cur.Cols(), cursor: cur, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy)}, nil
 }
 
 // runWrite executes a write statement eagerly and returns a result over its
@@ -253,12 +254,12 @@ func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value
 // Names are interned inside the transaction and the bind resolves against its
 // catalog view (doc 13 §9), so the write takes no lock it does not already hold and
 // leaves no orphan token on rollback (doc 13 §16).
-func (tx *Tx) runWrite(q *ast.Query, params map[string]value.Value) (*Result, error) {
+func (tx *Tx) runWrite(q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
 	cols, buf, summary, err := tx.db.execWriteBuffered(tx.etx, q, params)
 	if err != nil {
 		return nil, err
 	}
-	return &Result{cols: cols, buf: buf, summary: summary, tx: tx.etx, ownTx: false}, nil
+	return &Result{cols: cols, buf: buf, summary: summary, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy)}, nil
 }
 
 // Exec runs a Cypher write statement against the transaction and returns a summary
@@ -306,6 +307,55 @@ func (tx *Tx) Exec(cypher string, params map[string]value.Value) (Summary, error
 		return Summary{}, err
 	}
 	return summaryOf(eff), nil
+}
+
+// NodeByElementId fetches a single node by its element id under the transaction's
+// snapshot (doc 16 §10.7). It is the lookup a program uses to turn an id it stored
+// earlier back into a node, the round trip behind a node's ElementId. It returns
+// ErrNotFound when no such node is visible at the snapshot, and the same for an id
+// that is not a node element id (a malformed string, or a relationship id), so a
+// caller need not distinguish a deleted node from a wrong id. The returned node reads
+// from this transaction, so fetch it within the transaction; under eager
+// materialization, the default, its properties stay valid after the transaction ends.
+func (tx *Tx) NodeByElementId(id string) (Node, error) {
+	if tx.done {
+		return Node{}, ErrTxnDone
+	}
+	kind, raw, err := decodeElementID(id)
+	if err != nil || kind != elemNode {
+		return Node{}, ErrNotFound
+	}
+	ok, err := tx.etx.NodeExists(engine.NodeID(raw))
+	if err != nil {
+		return Node{}, err
+	}
+	if !ok {
+		return Node{}, ErrNotFound
+	}
+	return tx.db.materializer(tx.etx, tx.db.lazyProps).node(raw), nil
+}
+
+// RelationshipByElementId fetches a single relationship by its element id under the
+// transaction's snapshot (doc 16 §10.7). Like NodeByElementId it returns ErrNotFound
+// for an absent relationship and for an id that is not a relationship element id. The
+// returned relationship reads from this transaction, so fetch it within the
+// transaction.
+func (tx *Tx) RelationshipByElementId(id string) (Relationship, error) {
+	if tx.done {
+		return Relationship{}, ErrTxnDone
+	}
+	kind, raw, err := decodeElementID(id)
+	if err != nil || kind != elemRel {
+		return Relationship{}, ErrNotFound
+	}
+	ok, err := tx.etx.RelExists(engine.RelID(raw))
+	if err != nil {
+		return Relationship{}, err
+	}
+	if !ok {
+		return Relationship{}, ErrNotFound
+	}
+	return tx.db.materializer(tx.etx, tx.db.lazyProps).rel(raw), nil
 }
 
 // readCtx builds the execution context for a statement run against this

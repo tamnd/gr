@@ -159,16 +159,19 @@ func TestRecordBeforeFirstNext(t *testing.T) {
 	}
 }
 
-// TestFromValueGraphTypes confirms the graph value types map to their Go shapes.
+// TestFromValueGraphTypes confirms the graph value types map to their Go shapes. The
+// snapshot-free package-level fromValue builds bare handles, so it carries the element
+// id (under the kind-tagged ElementId) but no labels, type, or properties; those come
+// from a materializer with a live snapshot.
 func TestFromValueGraphTypes(t *testing.T) {
-	if n, ok := fromValue(value.Node(5)).(Node); !ok || n.ID != 5 {
+	if n, ok := fromValue(value.Node(5)).(Node); !ok || n.ElementId() != "n5" {
 		t.Fatalf("node maps to %#v", fromValue(value.Node(5)))
 	}
-	if r, ok := fromValue(value.Rel(6)).(Relationship); !ok || r.ID != 6 {
+	if r, ok := fromValue(value.Rel(6)).(Relationship); !ok || r.ElementId() != "r6" {
 		t.Fatalf("rel maps to %#v", fromValue(value.Rel(6)))
 	}
 	p, ok := fromValue(value.Path(value.Node(1), value.Rel(2), value.Node(3))).(Path)
-	if !ok || len(p.Elements) != 3 {
+	if !ok || p.Length() != 1 || len(p.Nodes()) != 2 {
 		t.Fatalf("path maps to %#v", fromValue(value.Path(value.Node(1), value.Rel(2), value.Node(3))))
 	}
 }

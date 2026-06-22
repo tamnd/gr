@@ -37,20 +37,10 @@ var ErrNoColumn = errors.New("gr: no such column")
 // and the value the column actually holds.
 var ErrType = errors.New("gr: value is not of the requested type")
 
-// Node is a node value read from a result (doc 16 §9.3, §10). It carries the node's
-// identity; the lazily-fetched labels and properties are a later slice (the
-// graph-object model, §10.6), so v1's Node exposes the id the executor binds.
-type Node struct{ ID uint64 }
-
-// Relationship is a relationship value read from a result (doc 16 §9.3, §10). Like
-// Node it carries identity now; its type and properties follow with the graph-object
-// model.
-type Relationship struct{ ID uint64 }
-
-// Path is a path value read from a result: an alternating sequence of node and
-// relationship values, node first (doc 16 §9.3). It mirrors the executor's runtime
-// path handle.
-type Path struct{ Elements []Value }
+// The graph-object types Node, Relationship, and Path, the Entity interface, and the
+// objectMaterializer that builds them live in graphobject.go (doc 16 §10). The
+// conversion from an internal value.Value to a Go Value is a method on the
+// materializer there; the package-level fromValue below is the snapshot-free path.
 
 // toValue converts a Go parameter value to a Cypher value (doc 16 §7.3, §9). It
 // mirrors the result mapping in reverse: a Go int of any width becomes an Integer, a
@@ -135,58 +125,12 @@ func toValues(params Params) (map[string]value.Value, error) {
 }
 
 // fromValue converts an internal Cypher value to the Go value a record hands out
-// (doc 16 §9.2, §9.3). It is the result-side mapping: null to nil, the scalars to
-// their Go types, a list to []Value and a map to map[string]Value (recursively), and
-// the graph types to Node/Relationship/Path.
+// (doc 16 §9.2, §9.3) with no snapshot to materialize graph objects against, so a
+// node or relationship comes back as a bare id-only handle. It is the path for a
+// parameter round-trip and any context that has no transaction; a record carrying a
+// live snapshot materializes through its own objectMaterializer instead.
 func fromValue(v value.Value) Value {
-	switch v.Type() {
-	case value.TypeNull:
-		return nil
-	case value.TypeBool:
-		b, _ := v.AsBool()
-		return b
-	case value.TypeInt:
-		i, _ := v.AsInt()
-		return i
-	case value.TypeFloat:
-		f, _ := v.AsFloat()
-		return f
-	case value.TypeString:
-		s, _ := v.AsString()
-		return s
-	case value.TypeBytes:
-		b, _ := v.AsBytes()
-		return b
-	case value.TypeList:
-		l, _ := v.AsList()
-		out := make([]Value, len(l))
-		for i, e := range l {
-			out[i] = fromValue(e)
-		}
-		return out
-	case value.TypeMap:
-		m, _ := v.AsMap()
-		out := make(map[string]Value, len(m))
-		for k, e := range m {
-			out[k] = fromValue(e)
-		}
-		return out
-	case value.TypeNode:
-		id, _ := v.AsNode()
-		return Node{ID: id}
-	case value.TypeRel:
-		id, _ := v.AsRel()
-		return Relationship{ID: id}
-	case value.TypePath:
-		el, _ := v.AsPath()
-		out := make([]Value, len(el))
-		for i, e := range el {
-			out[i] = fromValue(e)
-		}
-		return Path{Elements: out}
-	default:
-		return nil
-	}
+	return (*objectMaterializer)(nil).fromValue(v)
 }
 
 // Record is one row of a result, with columns accessible by name and by index (doc
@@ -196,17 +140,20 @@ type Record struct {
 	keys []string
 	keep map[string]struct{}
 	row  eval.Row
+	mat  *objectMaterializer
 }
 
-// newRecord wraps a result row in a record over the result's column names. The key
-// set lets Get distinguish a column that is absent from the result (a programming
-// error) from one that is present but null (a query-level null).
-func newRecord(keys []string, row eval.Row) *Record {
+// newRecord wraps a result row in a record over the result's column names and the
+// materializer that turns its graph handles into self-describing objects (doc 16
+// §10.2). A nil materializer yields bare id-only graph objects. The key set lets Get
+// distinguish a column that is absent from the result (a programming error) from one
+// that is present but null (a query-level null).
+func newRecord(keys []string, row eval.Row, mat *objectMaterializer) *Record {
 	keep := make(map[string]struct{}, len(keys))
 	for _, k := range keys {
 		keep[k] = struct{}{}
 	}
-	return &Record{keys: keys, keep: keep, row: row}
+	return &Record{keys: keys, keep: keep, row: row, mat: mat}
 }
 
 // Keys returns the record's column names in the order the RETURN or WITH clause
@@ -218,7 +165,7 @@ func (r *Record) Keys() []string { return r.keys }
 func (r *Record) Values() []Value {
 	out := make([]Value, len(r.keys))
 	for i, k := range r.keys {
-		out[i] = fromValue(r.row[k])
+		out[i] = r.mat.fromValue(r.row[k])
 	}
 	return out
 }
@@ -230,7 +177,7 @@ func (r *Record) Get(key string) (Value, bool) {
 	if _, ok := r.keep[key]; !ok {
 		return nil, false
 	}
-	return fromValue(r.row[key]), true
+	return r.mat.fromValue(r.row[key]), true
 }
 
 // GetByIndex reads the i-th column positionally, for code that iterates columns
@@ -239,14 +186,14 @@ func (r *Record) GetByIndex(i int) Value {
 	if i < 0 || i >= len(r.keys) {
 		return nil
 	}
-	return fromValue(r.row[r.keys[i]])
+	return r.mat.fromValue(r.row[r.keys[i]])
 }
 
 // AsMap returns the record as a name-to-value map (doc 16 §8.3).
 func (r *Record) AsMap() map[string]Value {
 	out := make(map[string]Value, len(r.keys))
 	for _, k := range r.keys {
-		out[k] = fromValue(r.row[k])
+		out[k] = r.mat.fromValue(r.row[k])
 	}
 	return out
 }
@@ -376,7 +323,7 @@ func Single(res *Result) (*Record, error) {
 	// The next Next may reuse the row buffer, so clone the record's row before the
 	// lookahead that checks for a second row, or the returned record could alias a
 	// later row.
-	rec = newRecord(rec.keys, cloneRow(rec.row))
+	rec = newRecord(rec.keys, cloneRow(rec.row), rec.mat)
 	if res.Next() {
 		return nil, errors.New("gr: Single: result has more than one row")
 	}

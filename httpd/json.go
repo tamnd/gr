@@ -57,9 +57,9 @@ func toJSON(v gr.Value, intAsString bool) any {
 		}
 		return out
 	case gr.Node:
-		return nodeJSON(x)
+		return nodeJSON(x, intAsString)
 	case gr.Relationship:
-		return relJSON(x)
+		return relJSON(x, intAsString)
 	case gr.Path:
 		return pathJSON(x, intAsString)
 	default:
@@ -77,36 +77,58 @@ func intJSON(x int64, intAsString bool) any {
 	return x
 }
 
-// nodeJSON renders a node (doc 18 §9.4). The library value model carries only the
-// node id today; labels and properties await the lazily-fetched graph-object surface
-// (doc 16 §10.6), so they are not emitted yet rather than emitted empty and wrong.
-func nodeJSON(n gr.Node) map[string]any {
-	return map[string]any{"elementId": strconv.FormatUint(n.ID, 10)}
+// nodeJSON renders a node as its element id, labels, and properties (doc 18 §9.4).
+// The labels are always present (an empty array for an unlabeled node) and the
+// properties are rendered through toJSON so they pick up the same integer encoding as
+// the rest of the response.
+func nodeJSON(n gr.Node, intAsString bool) map[string]any {
+	return map[string]any{
+		"elementId":  n.ElementId(),
+		"labels":     n.Labels(),
+		"properties": propsJSON(n.Props(), intAsString),
+	}
 }
 
-// relJSON renders a relationship (doc 18 §9.4). Like a node it carries only the id
-// today; the type and endpoints await the lazily-fetched graph-object surface.
-func relJSON(r gr.Relationship) map[string]any {
-	return map[string]any{"elementId": strconv.FormatUint(r.ID, 10)}
+// relJSON renders a relationship as its element id, type, endpoint element ids, and
+// properties (doc 18 §9.4). The endpoint ids are node element ids, so a client links
+// a relationship to its nodes without the nodes being inlined.
+func relJSON(r gr.Relationship, intAsString bool) map[string]any {
+	return map[string]any{
+		"elementId":          r.ElementId(),
+		"startNodeElementId": r.StartElementId(),
+		"endNodeElementId":   r.EndElementId(),
+		"type":               r.Type(),
+		"properties":         propsJSON(r.Props(), intAsString),
+	}
+}
+
+// propsJSON renders a property map through toJSON, so each value gets the response's
+// integer encoding. An empty map renders as an empty JSON object, not null.
+func propsJSON(props map[string]gr.Value, intAsString bool) map[string]any {
+	out := make(map[string]any, len(props))
+	for k, v := range props {
+		out[k] = toJSON(v, intAsString)
+	}
+	return out
 }
 
 // pathJSON renders a path as a start node plus alternating relationship/end-node
-// segments (doc 18 §9.4). The path elements alternate node, relationship, node, so
-// each segment pairs the relationship with the node that follows it.
+// segments (doc 18 §9.4). It zips the path's nodes and relationships: segment i pairs
+// the i-th relationship with the node that follows it.
 func pathJSON(p gr.Path, intAsString bool) map[string]any {
-	if len(p.Elements) == 0 {
+	nodes := p.Nodes()
+	if len(nodes) == 0 {
 		return map[string]any{"start": nil, "segments": []any{}}
 	}
-	out := map[string]any{"start": toJSON(p.Elements[0], intAsString)}
-	var segs []any
-	for i := 1; i+1 < len(p.Elements); i += 2 {
-		segs = append(segs, map[string]any{
-			"relationship": toJSON(p.Elements[i], intAsString),
-			"end":          toJSON(p.Elements[i+1], intAsString),
-		})
-	}
-	if segs == nil {
-		segs = []any{}
+	out := map[string]any{"start": nodeJSON(nodes[0], intAsString)}
+	rels := p.Relationships()
+	segs := make([]any, 0, len(rels))
+	for i, rel := range rels {
+		seg := map[string]any{"relationship": relJSON(rel, intAsString)}
+		if i+1 < len(nodes) {
+			seg["end"] = nodeJSON(nodes[i+1], intAsString)
+		}
+		segs = append(segs, seg)
 	}
 	out["segments"] = segs
 	return out

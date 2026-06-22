@@ -21,7 +21,9 @@ type Pos struct {
 // UNION, or a schema command. For a read/write query First is the leading part
 // and Rest holds the UNION-joined tails in order. For a schema command (CREATE
 // CONSTRAINT, DROP CONSTRAINT) Schema is set and First is nil: a schema command
-// is a whole statement on its own, not a clause inside a query (doc 08 §6.1).
+// is a whole statement on its own, not a clause inside a query (doc 08 §6.1). For
+// an administrative statement (CREATE USER, GRANT ROLE, doc 18 §10) Admin is set
+// and First is nil, likewise a whole statement on its own.
 //
 // Explain marks a statement the EXPLAIN prefix introduced: the planner builds its
 // operator tree but the engine never runs it, so the result is the plan listing
@@ -32,6 +34,7 @@ type Query struct {
 	First   *SingleQuery
 	Rest    []UnionTail
 	Schema  SchemaCommand
+	Admin   AdminCommand
 	Explain bool
 }
 

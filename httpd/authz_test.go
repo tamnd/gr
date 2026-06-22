@@ -48,6 +48,7 @@ const (
 	readStmt   = "RETURN 1 AS n"
 	writeStmt  = "CREATE (:Person {name: 'a'})"
 	schemaStmt = "CREATE INDEX FOR (p:Person) ON (p.email)"
+	adminStmt  = "CREATE USER ada SET PASSWORD 'pw'"
 )
 
 func TestAuthzReaderRoles(t *testing.T) {
@@ -60,6 +61,9 @@ func TestAuthzReaderRoles(t *testing.T) {
 	}
 	if rec := queryAs(t, h, "r", schemaStmt); rec.Code != http.StatusForbidden {
 		t.Errorf("reader schema = %d, want 403", rec.Code)
+	}
+	if rec := queryAs(t, h, "r", adminStmt); rec.Code != http.StatusForbidden {
+		t.Errorf("reader admin = %d, want 403", rec.Code)
 	}
 }
 
@@ -74,6 +78,9 @@ func TestAuthzEditorRoles(t *testing.T) {
 	if rec := queryAs(t, h, "e", schemaStmt); rec.Code != http.StatusForbidden {
 		t.Errorf("editor schema = %d, want 403", rec.Code)
 	}
+	if rec := queryAs(t, h, "e", adminStmt); rec.Code != http.StatusForbidden {
+		t.Errorf("editor admin = %d, want 403", rec.Code)
+	}
 }
 
 func TestAuthzPublisherRoles(t *testing.T) {
@@ -83,14 +90,36 @@ func TestAuthzPublisherRoles(t *testing.T) {
 			t.Errorf("publisher %q = %d, want 200, body = %s", s, rec.Code, rec.Body.String())
 		}
 	}
+	// A publisher may change schema but not manage users: the administrative statements
+	// sit one level above publisher (doc 18 §12.3).
+	if rec := queryAs(t, h, "p", adminStmt); rec.Code != http.StatusForbidden {
+		t.Errorf("publisher admin = %d, want 403", rec.Code)
+	}
 }
 
 func TestAuthzAdminRoles(t *testing.T) {
 	h := roleHandler(t, map[string][]string{"a": {"admin"}})
-	for _, s := range []string{readStmt, writeStmt, schemaStmt} {
+	for _, s := range []string{readStmt, writeStmt, schemaStmt, adminStmt} {
 		if rec := queryAs(t, h, "a", s); rec.Code != http.StatusOK {
 			t.Errorf("admin %q = %d, want 200, body = %s", s, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+// TestAuthzAdminShowUsers confirms an admin can run SHOW USERS over HTTP and the created
+// user comes back in the rows, the proof the administrative read reaches the same
+// credential store the CREATE USER statement wrote (doc 18 §12.3).
+func TestAuthzAdminShowUsers(t *testing.T) {
+	h := roleHandler(t, map[string][]string{"a": {"admin"}})
+	if rec := queryAs(t, h, "a", adminStmt); rec.Code != http.StatusOK {
+		t.Fatalf("admin create user = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+	rec := queryAs(t, h, "a", "SHOW USERS")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin show users = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "ada") {
+		t.Errorf("SHOW USERS body does not list the created user: %s", body)
 	}
 }
 

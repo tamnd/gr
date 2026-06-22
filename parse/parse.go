@@ -178,6 +178,24 @@ func (p *parser) queryBody() (*ast.Query, error) {
 	if p.atWord("DROP") && p.wordIs(p.peek(1), "INDEX") {
 		return p.dropIndex()
 	}
+	if p.at(lex.Create) && p.wordIs(p.peek(1), "USER") {
+		return p.createUser()
+	}
+	if p.atWord("ALTER") && p.wordIs(p.peek(1), "USER") {
+		return p.alterUser()
+	}
+	if p.atWord("DROP") && p.wordIs(p.peek(1), "USER") {
+		return p.dropUser()
+	}
+	if p.atWord("SHOW") && p.wordIs(p.peek(1), "USERS") {
+		return p.showUsers()
+	}
+	if p.atWord("GRANT") {
+		return p.grantRole()
+	}
+	if p.atWord("REVOKE") {
+		return p.revokeRole()
+	}
 	start := p.cur()
 	first, err := p.singleQuery()
 	if err != nil {

@@ -79,6 +79,13 @@ type QueryLog struct {
 	level  QueryLogLevel
 	redact RedactPolicy
 	slow   time.Duration
+	// events, when set, receives a query_slow event for a slow query and a query_error
+	// event for a failed one (doc 20 §11.3), the lighter signals an operator alerts on
+	// alongside the full query-log record. nil leaves the event stream untouched, so the
+	// query log works without an event log. It fires on the event log's own threshold,
+	// independent of the query-log level, so a failed query at QueryLogOff still raises a
+	// query_error event even though its full record is not written.
+	events *EventLog
 }
 
 // NewQueryLog builds a query log that writes through logger at the given level and
@@ -94,6 +101,17 @@ func NewQueryLog(logger *slog.Logger, level QueryLogLevel, redact RedactPolicy, 
 	return &QueryLog{logger: logger, level: level, redact: redact, slow: slow}
 }
 
+// WithEvents links the query log to an event log so a slow query raises a query_slow event
+// and a failed one a query_error event (doc 20 §11.3), in addition to the full query-log
+// record. It returns the log for chaining. A nil query log is left nil. The event log fires
+// on its own threshold, independent of the query-log level.
+func (l *QueryLog) WithEvents(e *EventLog) *QueryLog {
+	if l != nil {
+		l.events = e
+	}
+	return l
+}
+
 // Record logs one query execution if the level and slow-query rules call for it (doc 20
 // §10.4, §10.6). A nil log records nothing, so a caller always calls Record without first
 // checking whether a log is configured.
@@ -103,6 +121,25 @@ func (l *QueryLog) Record(r QueryRecord) {
 	}
 	slow := l.slow > 0 && r.Duration >= l.slow
 	failed := r.Status != "" && r.Status != "ok"
+
+	// The event log carries the lighter query_slow/query_error signals (doc 20 §11.3),
+	// fired here so they are independent of the query-log level: a failed query at
+	// QueryLogOff still raises query_error even though its full record below is suppressed.
+	// A failure dominates a slow query, matching the query-log severity, so a slow failure
+	// is one query_error, not also a query_slow.
+	if l.events != nil {
+		switch {
+		case failed:
+			errText := ""
+			if r.Err != nil {
+				errText = r.Err.Error()
+			}
+			l.events.QueryError(r.QueryID, r.Kind, r.Status, errText)
+		case slow:
+			l.events.QuerySlow(r.QueryID, r.Kind, r.Duration, l.slow)
+		}
+	}
+
 	if !l.shouldLog(slow, failed) {
 		return
 	}

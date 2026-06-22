@@ -146,6 +146,32 @@ func (l *EventLog) ConfigChange(setting, oldValue, newValue, who string) {
 	)
 }
 
+// QuerySlow records that a query crossed the slow threshold (doc 20 §11.3): the query id
+// that correlates it to the full query-log entry, the statement kind, how long it ran, and
+// the threshold it crossed. It is a warn so a log-based alert can watch the slow tail. The
+// full record (the cypher, the parameters, the row count) is in the query log; this is the
+// lighter signal an operator alerts on.
+func (l *EventLog) QuerySlow(queryID, kind string, d, threshold time.Duration) {
+	l.Event(slog.LevelWarn, EventQuerySlow, "slow query",
+		slog.String("query_id", queryID),
+		slog.String("kind", kind),
+		slog.Float64("duration_ms", float64(d)/float64(time.Millisecond)),
+		slog.Float64("threshold_ms", float64(threshold)/float64(time.Millisecond)),
+	)
+}
+
+// QueryError records that a query failed (doc 20 §11.3): the query id, the kind, the
+// query-log status (error, timeout, killed), and the error text. It is an error so a log
+// pipeline alerts on it. The full record is in the query log; this is the lighter signal.
+func (l *EventLog) QueryError(queryID, kind, status, errText string) {
+	l.Event(slog.LevelError, EventQueryError, "query failed",
+		slog.String("query_id", queryID),
+		slog.String("kind", kind),
+		slog.String("status", status),
+		slog.String("error", errText),
+	)
+}
+
 // AuthFailure records a failed authentication attempt (doc 20 §11.3): the user, the client
 // address, and the reason, at warn so a log-based alert can watch a rising rate of failures.
 func (l *EventLog) AuthFailure(user, client, reason string) {

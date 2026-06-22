@@ -147,6 +147,10 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 		fmt.Fprintln(stderr, "gr:", err)
 		return exitUsage
 	}
+	// Link the query log to the event log so a slow or failed query also raises the lighter
+	// query_slow/query_error event an operator alerts on (doc 20 §11.3), independent of the
+	// query-log level.
+	qlog.WithEvents(elog)
 	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL, Impersonation: *impersonation, Admission: admission, QueryMaxTime: *queryMaxTime, RateLimiter: limiter, QueryLog: qlog, EventLog: elog})
 	defer srv.Close()
 	fmt.Fprintf(stderr, "gr serving %s on %s (database %q, TLS %s)\n", describeDB(path), *addr, *name, *httpTLS)

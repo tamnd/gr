@@ -33,6 +33,12 @@ type Admission struct {
 	slots chan struct{}
 	wait  time.Duration
 	shed  atomic.Int64
+
+	// onWait, if set, is called once for every query that did not get a slot immediately, with
+	// the time it spent queued, whether it was then admitted, shed, or cancelled (doc 20 §3.1).
+	// db.InstrumentAdmission wires it to the admission metrics. A query that found a free slot at
+	// once never calls it, so it counts only true queueing.
+	onWait func(wait time.Duration)
 }
 
 // NewAdmission builds an admission gate that allows maxInFlight queries to execute at
@@ -61,17 +67,50 @@ func (a *Admission) Acquire(ctx context.Context) (func(), error) {
 	if a == nil || a.slots == nil {
 		return func() {}, nil
 	}
+	// Fast path: a free slot means no queueing, the common case, which records nothing so the
+	// queued metric counts only genuine waits (doc 20 §3.1).
+	select {
+	case a.slots <- struct{}{}:
+		return func() { <-a.slots }, nil
+	default:
+	}
+	// Slow path: the gate is full, so the query queues for a slot. Time the wait and report it
+	// however the wait ends, admitted, shed, or cancelled.
+	start := time.Now()
 	t := time.NewTimer(a.wait)
 	defer t.Stop()
 	select {
 	case a.slots <- struct{}{}:
+		a.reportWait(start)
 		return func() { <-a.slots }, nil
 	case <-t.C:
 		a.shed.Add(1)
+		a.reportWait(start)
 		return nil, ErrOverloaded
 	case <-ctx.Done():
+		a.reportWait(start)
 		return nil, ctx.Err()
 	}
+}
+
+// reportWait fires the queue-wait hook with the time since start, if a hook is wired.
+func (a *Admission) reportWait(start time.Time) {
+	if a.onWait != nil {
+		a.onWait(time.Since(start))
+	}
+}
+
+// InstrumentAdmission wires a gate's queue-wait hook to this database's admission metrics (doc 20
+// §3.1): once wired, a query that waits for a slot counts in gr_query_queued_total and its wait
+// lands in gr_query_queue_wait_seconds, rendered by the same db.Metrics surface the rest of the
+// catalogue is. A server that shares one gate across its HTTP and Bolt surfaces wires it once, so
+// the queueing both surfaces drive is counted in the one registry. A nil gate (admission
+// disabled) is a no-op.
+func (db *DB) InstrumentAdmission(a *Admission) {
+	if a == nil {
+		return
+	}
+	a.onWait = func(wait time.Duration) { db.metrics.recordQueued(wait) }
 }
 
 // InFlight reports how many slots are currently claimed, for metrics and tests (doc 18

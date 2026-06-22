@@ -321,6 +321,27 @@ type Aggregate struct {
 	Distinct  bool
 }
 
+// ExpandCount is the factorized form of a grouping-free count(*) over a single
+// expand (doc 11 §7, §8; ADR-8). The naive plan materializes one row per edge the
+// expand produces and counts them; ExpandCount instead counts the edges each input
+// row would expand to without ever building those rows, so a fan-out-heavy
+// expansion is counted as a product rather than enumerated. Input is the expand's
+// own input (the source rows), From the source variable whose edges are counted,
+// Rel the relationship variable the counted edge would have bound (kept so the
+// relationship-uniqueness check against sibling edges in the same pattern still
+// applies), Types and Dir the edge type set and direction, and Col the output
+// column the count binds. It only stands in for an expand with no target-label
+// constraint, no expand-into, and no variable length, so counting the matching
+// edges is exactly the row count the aggregate would have produced.
+type ExpandCount struct {
+	Input Op
+	From  string
+	Rel   string
+	Types []bind.NameRef
+	Dir   ast.Direction
+	Col   string
+}
+
 // Join combines two row streams. On lists the shared variable names the rows
 // must agree on; an empty On is a cartesian product.
 type Join struct {
@@ -394,6 +415,7 @@ func (*BindPath) op()      {}
 func (*ShortestPath) op()  {}
 func (*Project) op()       {}
 func (*Aggregate) op()     {}
+func (*ExpandCount) op()   {}
 func (*Join) op()          {}
 func (*Optional) op()      {}
 func (*Unwind) op()        {}
@@ -475,6 +497,8 @@ func outputVars(o Op) map[string]bool {
 			s[n] = true
 		}
 		return s
+	case *ExpandCount:
+		return map[string]bool{x.Col: true}
 	case *Join:
 		s := outputVars(x.Left)
 		for n := range outputVars(x.Right) {
@@ -586,6 +610,8 @@ func nodeLabel(o Op) string {
 		return "Project" + distinct(x.Distinct) + " " + colList(x.Cols)
 	case *Aggregate:
 		return "Aggregate" + distinct(x.Distinct) + " by[" + colList(x.GroupKeys) + "] agg[" + colList(x.Aggs) + "]"
+	case *ExpandCount:
+		return "ExpandCount " + x.Col + " = count " + expandCountLabel(x)
 	case *Join:
 		return "Join on[" + strings.Join(x.On, ",") + "]"
 	case *Optional:
@@ -637,6 +663,8 @@ func nodeChildren(o Op) []Op {
 	case *Project:
 		return []Op{x.Input}
 	case *Aggregate:
+		return []Op{x.Input}
+	case *ExpandCount:
 		return []Op{x.Input}
 	case *Join:
 		return []Op{x.Left, x.Right}
@@ -706,6 +734,21 @@ func expandLabel(x *Expand) string {
 		tail += " (into)"
 	}
 	return x.From + " " + left + "[" + rel + typeSuffix(x.Types) + "]" + right + " " + x.To + tail
+}
+
+// expandCountLabel renders an ExpandCount the same way expandLabel renders the Expand
+// it replaced, minus the target variable: the source node, the relationship arrow with
+// its type, so a factorized count reads as the expand it counts without naming a row it
+// never builds.
+func expandCountLabel(x *ExpandCount) string {
+	left, right := "-", "-"
+	switch x.Dir {
+	case ast.DirOut:
+		right = "->"
+	case ast.DirIn:
+		left = "<-"
+	}
+	return x.From + " " + left + "[" + x.Rel + typeSuffix(x.Types) + "]" + right
 }
 
 // intersectLabel renders an Intersect: the apex variable with its labels, then the

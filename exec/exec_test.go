@@ -265,6 +265,62 @@ func TestTwoHopRelUniqueness(t *testing.T) {
 	}
 }
 
+// countOf runs a count(*) query (which the planner factorizes into an ExpandCount)
+// and returns the single tally it emits, failing if the result is not one row of
+// one integer.
+func countOf(t *testing.T, e *engine.MemEngine, cypher string) int64 {
+	t.Helper()
+	rows, cols := run(t, e, cypher, nil)
+	if len(rows) != 1 || len(cols) != 1 {
+		t.Fatalf("count %q: got %d rows %d cols, want 1x1", cypher, len(rows), len(cols))
+	}
+	n, ok := rows[0][cols[0]].AsInt()
+	if !ok {
+		t.Fatalf("count %q: result %v is not an int", cypher, rows[0][cols[0]])
+	}
+	return n
+}
+
+// TestFactorizedCountMatchesEnumeration checks the factorized count(*) over an
+// expand produces the same tally as enumerating the expand and counting the rows.
+// The count query is rewritten to an ExpandCount; the enumeration query returns
+// variables so it keeps the naive Expand+rows path, and the two must agree.
+func TestFactorizedCountMatchesEnumeration(t *testing.T) {
+	e, _ := graph(t)
+	got := countOf(t, e, "MATCH (a:Person)-[:KNOWS]->(b) RETURN count(*)")
+	rows, _ := run(t, e, "MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name AS a, b.name AS b", nil)
+	if got != int64(len(rows)) {
+		t.Fatalf("factorized count = %d, enumeration = %d", got, len(rows))
+	}
+	if got != 3 {
+		t.Fatalf("count = %d, want 3 KNOWS edges", got)
+	}
+}
+
+// TestFactorizedCountUniqueness checks the factorized count honors
+// relationship-uniqueness against a sibling edge, the same as enumeration. The
+// undirected two-hop pattern can traverse an edge and then traverse it back, which
+// uniqueness forbids; the ExpandCount must skip the reused edge exactly as the
+// Expand it replaced would, so its tally matches the enumerated row count.
+func TestFactorizedCountUniqueness(t *testing.T) {
+	e, _ := graph(t)
+	got := countOf(t, e, "MATCH (a:Person)-[r1:KNOWS]-(b)-[r2:KNOWS]-(c) RETURN count(*)")
+	rows, _ := run(t, e, "MATCH (a:Person)-[r1:KNOWS]-(b)-[r2:KNOWS]-(c) RETURN a.name AS a, b.name AS b, c.name AS c", nil)
+	if got != int64(len(rows)) {
+		t.Fatalf("factorized count = %d, enumeration = %d", got, len(rows))
+	}
+}
+
+// TestFactorizedCountEmpty checks a count over an empty source still emits one
+// tally row carrying zero, the empty-group rule a grouping-free aggregate follows.
+// There are no City nodes, so the expand's input is empty.
+func TestFactorizedCountEmpty(t *testing.T) {
+	e, _ := graph(t)
+	if got := countOf(t, e, "MATCH (a:City)-[:KNOWS]->(b) RETURN count(*)"); got != 0 {
+		t.Fatalf("count over empty source = %d, want 0", got)
+	}
+}
+
 func TestPropertyConstraint(t *testing.T) {
 	e, _ := graph(t)
 	rows, _ := run(t, e, `MATCH (n:Person {name: "Bob"}) RETURN n.age AS age`, nil)

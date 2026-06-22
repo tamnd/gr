@@ -361,6 +361,62 @@ func TestSegmentedBaseCrossesSegmentBoundary(t *testing.T) {
 	}
 }
 
+// TestCheckpointReclaimsOldBase is the W4c gate: a checkpoint frees the old
+// segmented base and the old naive delta it replaces, so a steady stream of
+// checkpoints over an unchanging graph reuses those pages instead of growing the
+// file. Without the frees each checkpoint leaks a fresh base plus fresh delta and
+// the page count climbs without bound; with them it holds flat.
+func TestCheckpointReclaimsOldBase(t *testing.T) {
+	fsys := vfs.NewMem()
+	e := openDisk(t, fsys, "reclaim.gr")
+	defer e.Close()
+
+	name, _ := e.Intern(catalog.KindPropKey, "name")
+	age, _ := e.Intern(catalog.KindPropKey, "age")
+
+	// A small fixed graph: enough columns and positions that a fold allocates real
+	// base and delta pages, so a leak would be visible in the page count.
+	tx, _ := e.Begin(true)
+	var first NodeID
+	for i := range 64 {
+		n, _ := tx.CreateNode(nil)
+		if i == 0 {
+			first = n
+		}
+		tx.SetNodeProperty(n, name, value.String("node"))
+		tx.SetNodeProperty(n, age, value.Int(int64(i)))
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Warm up to steady state: the first checkpoints fill the free list and the
+	// fresh stores start drawing from it, so the page count settles.
+	for range 3 {
+		if err := e.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := e.p.Header().PageCount
+
+	// Many more checkpoints over the same graph must not grow the file: every fresh
+	// base and delta reuses the pages the prior checkpoint freed.
+	for range 20 {
+		if err := e.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after := e.p.Header().PageCount
+	if after != before {
+		t.Fatalf("page count grew across checkpoints: %d -> %d (old base or delta not reclaimed)", before, after)
+	}
+
+	// The data still reads back correctly after all the page reuse.
+	pos := nodePosFor(t, e, first)
+	wantPresent(t, e, toCat(name), pos, value.String("node"))
+	wantPresent(t, e, toCat(age), pos, value.Int(0))
+}
+
 // wantPresent asserts the segmented base for the node element kind holds value v
 // at (key, pos).
 func wantPresent(t *testing.T, e *DiskEngine, key uint32, pos uint64, want value.Value) {

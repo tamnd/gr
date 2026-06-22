@@ -811,6 +811,30 @@ func TestMetricsIndexEntries(t *testing.T) {
 	}
 }
 
+func TestMetricsIndexMemoryBytes(t *testing.T) {
+	db := openMem(t, "mxbytes.gr")
+	defer db.Close()
+
+	mustExec(t, db, "CREATE INDEX person_email FOR (p:Person) ON (p.email)", nil)
+	// An empty index has no entries, so its footprint estimate is zero.
+	if g := db.Metrics().Gauge("gr_index_memory_bytes", Labels{"index": "person_email"}); g != 0 {
+		t.Errorf("empty index bytes = %d, want 0", g)
+	}
+
+	mustExec(t, db, "CREATE (:Person {email: 'a@x'})", nil)
+	one := db.Metrics().Gauge("gr_index_memory_bytes", Labels{"index": "person_email"})
+	if one <= 0 {
+		t.Fatalf("one-entry index bytes = %d, want > 0", one)
+	}
+
+	// A second distinct value adds a bucket, so the footprint grows.
+	mustExec(t, db, "CREATE (:Person {email: 'b@x'})", nil)
+	two := db.Metrics().Gauge("gr_index_memory_bytes", Labels{"index": "person_email"})
+	if two <= one {
+		t.Errorf("two-entry index bytes = %d, want > %d", two, one)
+	}
+}
+
 func TestMetricsConstraintChecks(t *testing.T) {
 	db := openMem(t, "mxcons.gr")
 	defer db.Close()

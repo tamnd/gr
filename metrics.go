@@ -50,18 +50,18 @@ const (
 // programmatic exposition surface, the one the CLI's .metrics command and a test read; the
 // server renders the same registry as Prometheus text and expvar JSON.
 func (db *DB) Metrics() MetricsSnapshot {
-	db.syncIndexEntryGauges()
+	db.syncIndexGauges()
 	return db.metrics.reg.Snapshot()
 }
 
-// syncIndexEntryGauges ensures a gr_index_entries computed gauge exists for every declared index
-// (doc 20 §6.4), registering one the first time the index is seen. The gauge reads the index's live
-// entry count from the engine at snapshot time, so the value tracks data writes without the write
-// path touching the registry. A dropped index keeps its gauge, which then reads zero, the standard
-// way a gone series settles. It is called before each snapshot, so a newly created index appears on
-// the next scrape; registration is idempotent through the seen-set, so a steady schema costs only a
-// sync.Map load per index.
-func (db *DB) syncIndexEntryGauges() {
+// syncIndexGauges ensures the per-index computed gauges exist for every declared index (doc 20 §6.4),
+// registering them the first time the index is seen: gr_index_entries for the live key count and
+// gr_index_memory_bytes for the in-memory footprint estimate. Both read from the engine at snapshot
+// time, so the values track data writes without the write path touching the registry. A dropped index
+// keeps its gauges, which then read zero, the standard way a gone series settles. It is called before
+// each snapshot, so a newly created index appears on the next scrape; registration is idempotent
+// through the seen-set, so a steady schema costs only a sync.Map load per index.
+func (db *DB) syncIndexGauges() {
 	if db.eng == nil {
 		return
 	}
@@ -73,6 +73,10 @@ func (db *DB) syncIndexEntryGauges() {
 			"Indexed entries per index, the live key count", "entries",
 			metric.Labels{"index": name},
 			func() int64 { return int64(db.eng.IndexEntryCount(name)) })
+		db.metrics.reg.ComputedGauge("gr_index_memory_bytes",
+			"Estimated in-memory footprint per index", "bytes",
+			metric.Labels{"index": name},
+			func() int64 { return int64(db.eng.IndexMemoryBytes(name)) })
 	}
 }
 

@@ -135,6 +135,10 @@ func EstimateRows(o Op, st Statistics) float64 {
 		}
 		// Without per-key distinct counts the group count is bounded by the input.
 		return EstimateRows(x.Input, st)
+	case *ExpandCount:
+		// A grouping-free count collapses its whole input to a single tally row, the
+		// same one row the aggregate it replaced would emit.
+		return 1
 	case *Join:
 		return joinRows(x, st)
 	case *Optional:

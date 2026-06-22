@@ -337,6 +337,11 @@ func mapChildren(o Op, f func(Op) Op) Op {
 		return &Project{Input: f(x.Input), Cols: x.Cols, Distinct: x.Distinct}
 	case *Aggregate:
 		return &Aggregate{Input: f(x.Input), GroupKeys: x.GroupKeys, Aggs: x.Aggs, Distinct: x.Distinct}
+	case *ExpandCount:
+		return &ExpandCount{
+			Input: f(x.Input), From: x.From, Rel: x.Rel,
+			Types: x.Types, Dir: x.Dir, Col: x.Col,
+		}
 	case *Join:
 		return &Join{Left: f(x.Left), Right: f(x.Right), On: x.On}
 	case *Optional:

@@ -37,7 +37,7 @@ func Plan(b *bind.Bound) Op { return PlanWithStats(b, nil) }
 // one path and the structural choice is the cost path's fallback, not a separate
 // planner.
 func PlanWithStats(b *bind.Bound, st Statistics) Op {
-	return JoinOrder(Normalize(Optimize(Build(b), st)), st)
+	return FactorizeCount(JoinOrder(Normalize(Optimize(Build(b), st)), st))
 }
 
 // builder carries the per-build state: the bound query (for resolved tokens) and

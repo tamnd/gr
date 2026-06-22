@@ -121,6 +121,8 @@ func Columns(root plan.Op) []string {
 		return colNames(x.Cols)
 	case *plan.Aggregate:
 		return append(colNames(x.GroupKeys), colNames(x.Aggs)...)
+	case *plan.ExpandCount:
+		return []string{x.Col}
 	case *plan.Sort:
 		return Columns(x.Input)
 	case *plan.Skip:
@@ -271,6 +273,17 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 			return nil, nil, err
 		}
 		return &aggregateOp{spec: x, input: input}, nil, nil
+	case *plan.ExpandCount:
+		// The count stands in for an Aggregate over an Expand, so its input is
+		// compiled in a fresh pattern scope (peers nil), exactly as the aggregate
+		// compiled the expand's input. The rel-variable names that input binds are
+		// the peers the counted edge must stay distinct from, the same sibling set
+		// the replaced Expand carried.
+		input, inPeers, err := compileRel(x.Input, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &expandCountOp{spec: x, input: input, peers: inPeers}, nil, nil
 	case *plan.Unwind:
 		var input operator
 		if x.Input != nil {

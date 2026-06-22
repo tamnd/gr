@@ -3,6 +3,7 @@ package plan
 import (
 	"testing"
 
+	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/bind"
 	"github.com/tamnd/gr/engine"
 	"github.com/tamnd/gr/parse"
@@ -113,6 +114,84 @@ func TestPlanKeepsSourceLabels(t *testing.T) {
 	}
 	if len(exp.FromLabels) != 1 || !exp.FromLabels[0].Known || exp.FromLabels[0].Token != 1 {
 		t.Fatalf("planned expand FromLabels = %+v, want [Person(#1)] to survive the pipeline", exp.FromLabels)
+	}
+}
+
+// findExpandCount returns the single ExpandCount in a plan, or nil when there is
+// none, so a rewrite test can assert the factorized operator is present (or absent)
+// without depending on the printed plan's column naming.
+func findExpandCount(o Op) *ExpandCount {
+	if ec, ok := o.(*ExpandCount); ok {
+		return ec
+	}
+	for _, c := range nodeChildren(o) {
+		if ec := findExpandCount(c); ec != nil {
+			return ec
+		}
+	}
+	return nil
+}
+
+// TestFactorizeCountFires checks a grouping-free count(*) directly over a plain
+// expand is rewritten to an ExpandCount that counts the expand's edges without
+// materializing a row per edge. The rewritten operator keeps the source variable,
+// relationship variable, type, and direction the expand carried, the inputs its
+// executor needs to count exactly the edges the expand would have emitted.
+func TestFactorizeCountFires(t *testing.T) {
+	b := bound(t, "MATCH (a:Person)-[r:KNOWS]->(b) RETURN count(*)")
+	ec := findExpandCount(Plan(b))
+	if ec == nil {
+		t.Fatalf("count(*) over an expand did not factorize:\n%s", String(Plan(b)))
+	}
+	if ec.From != "a" || ec.Rel != "r" || ec.Dir != ast.DirOut {
+		t.Fatalf("ExpandCount = %+v, want From=a Rel=r Dir=out", ec)
+	}
+	if len(ec.Types) != 1 || ec.Types[0].Token != 1 {
+		t.Fatalf("ExpandCount types = %+v, want [KNOWS(#1)]", ec.Types)
+	}
+	// The factorized plan must not also keep the Expand it replaced.
+	if e := findFirstExpand(Plan(b)); e != nil {
+		t.Fatalf("plan still has an Expand after factorizing: %+v", e)
+	}
+}
+
+func findFirstExpand(o Op) *Expand {
+	if e, ok := o.(*Expand); ok {
+		return e
+	}
+	for _, c := range nodeChildren(o) {
+		if e := findFirstExpand(c); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+// TestFactorizeCountGuards pins the shapes the rewrite must leave alone: a grouped
+// count keeps its grouping rows, count(r) skips null edges so it is not the row
+// count, a variable-length expand fans out per trail, an expand-into and a
+// target-label constraint each drop edges the bare count would keep, and a count
+// over a scan has no expand to factor. Each must keep its Aggregate and grow no
+// ExpandCount.
+func TestFactorizeCountGuards(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"grouped", "MATCH (a:Person)-[r:KNOWS]->(b) RETURN a, count(*)"},
+		{"count-var", "MATCH (a:Person)-[r:KNOWS]->(b) RETURN count(r)"},
+		{"distinct", "MATCH (a:Person)-[r:KNOWS]->(b) RETURN count(DISTINCT b)"},
+		{"varlen", "MATCH (a:Person)-[r:KNOWS*1..2]->(b) RETURN count(*)"},
+		{"to-labels", "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN count(*)"},
+		{"scan-only", "MATCH (a:Person) RETURN count(*)"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b := bound(t, c.src)
+			if ec := findExpandCount(Plan(b)); ec != nil {
+				t.Fatalf("%s factorized but should not have:\n%s", c.name, String(Plan(b)))
+			}
+		})
 	}
 }
 

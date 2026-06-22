@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/tamnd/gr"
 	"github.com/tamnd/gr/httpd"
@@ -66,16 +67,42 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 		fmt.Fprintln(stderr, "gr:", err)
 		return exitUsage
 	}
-	h := httpd.Handler(db, httpd.Options{Name: *name, Auth: auth})
+	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth})
+	defer srv.Close()
 	fmt.Fprintf(stderr, "gr serving %s on %s (database %q)\n", describeDB(path), *addr, *name)
 	if auth == nil {
 		fmt.Fprintln(stderr, "gr: WARNING authentication is off, every request is anonymous; pass --user to require auth")
 	}
-	if err := listen(*addr, h); err != nil {
+
+	// Reap transactions whose client vanished, so a dead HTTP client cannot pin the
+	// writer until someone touches its id (doc 18 §8.7). The ticker stops when the
+	// listener returns, so the goroutine does not outlive the server.
+	stop := make(chan struct{})
+	go sweepLoop(srv, stop)
+	err = listen(*addr, srv)
+	close(stop)
+	if err != nil {
 		fmt.Fprintln(stderr, "gr:", err)
 		return exitIO
 	}
 	return exitOK
+}
+
+// sweepInterval is how often the serve command reaps expired transactions.
+const sweepInterval = 10 * time.Second
+
+// sweepLoop reaps expired transactions on a ticker until stop is closed.
+func sweepLoop(srv *httpd.Server, stop <-chan struct{}) {
+	t := time.NewTicker(sweepInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case now := <-t.C:
+			srv.Sweep(now)
+		}
+	}
 }
 
 // openServeDB opens the database serve will host. An empty or :memory: path opens a

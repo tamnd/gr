@@ -208,6 +208,7 @@ func TestTxSingleFlight(t *testing.T) {
 		txns:      newTxStore(),
 		now:       func() time.Time { return clock },
 		txTimeout: time.Minute,
+		metrics:   newMetrics(),
 	}
 	tx, err := db.Begin(context.Background(), gr.Write)
 	if err != nil {

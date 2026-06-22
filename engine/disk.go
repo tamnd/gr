@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/tamnd/gr/adj"
 	"github.com/tamnd/gr/blockcache"
@@ -113,6 +114,14 @@ type DiskEngine struct {
 	gcReclaimedNode atomic.Uint64
 	gcReclaimedRel  atomic.Uint64
 
+	// gcDurMu guards gcDurations, the per-pass GC durations in seconds buffered since the metrics path
+	// last drained them (doc 20 §5.1). A histogram cannot be delta-mirrored from a cumulative pair the
+	// way the GC counts are, so each pass appends its duration here under the engine lock the checkpoint
+	// holds, and DrainGCDurations hands the buffer to the metrics path under gcDurMu alone, never the
+	// engine lock, so the snapshot path observes each pass's duration exactly once.
+	gcDurMu     sync.Mutex
+	gcDurations []float64
+
 	// bc fronts the segmented-base read with decoded segments, so a repeated point
 	// read in a segment does not re-decode it (doc 14 §4). It is an in-memory cache,
 	// never a source of truth: every cached segment carries the checkpoint epoch it
@@ -204,6 +213,22 @@ func (e *DiskEngine) VersionsResident() int64 { return int64(e.ov.Len()) }
 // delta-style, so this never takes the engine lock and is safe off the snapshot path.
 func (e *DiskEngine) GCStats() (runs, reclaimedNode, reclaimedRel uint64) {
 	return e.gcRunsTotal.Load(), e.gcReclaimedNode.Load(), e.gcReclaimedRel.Load()
+}
+
+// DrainGCDurations returns and clears the per-pass GC durations in seconds buffered since the last
+// drain (doc 20 §5.1), for the gr_mvcc_gc_duration_seconds histogram. A histogram cannot be
+// delta-mirrored from a cumulative pair the way the GC counts are, so the engine buffers each pass's
+// duration and the metrics path drains it here. It takes only gcDurMu, never the engine lock, so the
+// snapshot path stays clear of a long-held write transaction; returning nil when empty avoids an alloc.
+func (e *DiskEngine) DrainGCDurations() []float64 {
+	e.gcDurMu.Lock()
+	defer e.gcDurMu.Unlock()
+	if len(e.gcDurations) == 0 {
+		return nil
+	}
+	out := e.gcDurations
+	e.gcDurations = nil
+	return out
 }
 
 // WatermarkLag returns the commit versions between the newest commit and the GC watermark (doc 20
@@ -614,12 +639,18 @@ func (e *DiskEngine) Checkpoint() error {
 	if _, err := e.commitPager(); err != nil {
 		return err
 	}
+	gcStart := time.Now()
 	gc := e.ov.GC(e.oracle.Watermark())
-	// Record the GC pass and what it reclaimed for the MVCC metrics (doc 20 §5.1), under the
-	// engine lock the checkpoint holds; the metrics path mirrors these cumulative totals.
+	gcDur := time.Since(gcStart).Seconds()
+	// Record the GC pass, what it reclaimed, and how long it took for the MVCC metrics (doc 20 §5.1),
+	// under the engine lock the checkpoint holds; the metrics path mirrors the cumulative totals and
+	// drains the buffered durations.
 	e.gcRunsTotal.Add(1)
 	e.gcReclaimedNode.Add(gc.Node)
 	e.gcReclaimedRel.Add(gc.Rel)
+	e.gcDurMu.Lock()
+	e.gcDurations = append(e.gcDurations, gcDur)
+	e.gcDurMu.Unlock()
 	return nil
 }
 

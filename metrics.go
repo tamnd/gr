@@ -207,12 +207,13 @@ func (db *DB) syncCheckpointMetrics() {
 
 // syncMvccGCMetrics mirrors the engine's cumulative version-GC totals into the registry at snapshot
 // time (doc 20 §5.1): it advances gr_mvcc_gc_runs_total by the GC passes run since the last sync and
-// gr_mvcc_gc_reclaimed_total{element} by the pre-images each pass dropped, split by element. The
-// engine owns the authoritative counts, bumped under its lock when GC runs at checkpoint, so the GC
-// path never touches the registry; the bridge runs only on a scrape. The delta add keeps the
-// counters monotonic, and gcMu serializes two concurrent scrapes so neither double-counts. Reading
-// the totals is a lock-free atomic load, never the engine lock, so a long-held write transaction
-// cannot deadlock a snapshot.
+// gr_mvcc_gc_reclaimed_total{element} by the pre-images each pass dropped, split by element, and it
+// drains the engine's buffered per-pass durations into gr_mvcc_gc_duration_seconds. The engine owns
+// the authoritative counts, bumped under its lock when GC runs at checkpoint, so the GC path never
+// touches the registry; the bridge runs only on a scrape. The delta add keeps the counters monotonic,
+// and gcMu serializes two concurrent scrapes so neither double-counts nor double-observes a duration.
+// Reading the totals and draining the buffer take a lock-free atomic load and the engine's own small
+// lock respectively, never the engine lock, so a long-held write transaction cannot deadlock a snapshot.
 func (db *DB) syncMvccGCMetrics() {
 	if db.eng == nil {
 		return
@@ -232,6 +233,11 @@ func (db *DB) syncMvccGCMetrics() {
 	if c := m.gcReclaimed["rel"]; c != nil && rel > m.lastGCRel {
 		c.Add(rel - m.lastGCRel)
 		m.lastGCRel = rel
+	}
+	if m.gcDuration != nil {
+		for _, d := range db.eng.DrainGCDurations() {
+			m.gcDuration.Observe(d)
+		}
 	}
 }
 
@@ -539,6 +545,12 @@ type queryMetrics struct {
 	lastGCNode  uint64
 	lastGCRel   uint64
 
+	// gcDuration holds gr_mvcc_gc_duration_seconds, the per-pass GC duration distribution (doc 20
+	// §5.1). A histogram cannot be delta-mirrored from a cumulative pair the way the GC counts are, so
+	// the engine buffers each pass's duration and the sync step drains the buffer into this histogram
+	// under gcMu, the same lock that guards the GC count mirror, so one scrape observes each pass once.
+	gcDuration *metric.Histogram
+
 	// indexEntryGauges records which index names already have a gr_index_entries computed gauge, so
 	// the sync registers each at most once. The value is unused, only the key (the index name)
 	// matters; the gauge itself lives in the registry and reads its count at snapshot time.
@@ -700,6 +712,8 @@ func newQueryMetrics() *queryMetrics {
 		m.gcReclaimed[element] = reg.Counter("gr_mvcc_gc_reclaimed_total",
 			"Versions reclaimed by GC, by element", "versions", metric.Labels{"element": element})
 	}
+	m.gcDuration = reg.Histogram("gr_mvcc_gc_duration_seconds",
+		"Wall-clock duration of a version-GC pass", "seconds", txDurationBuckets, nil)
 	for _, r := range metricAuthResults {
 		m.authAttempts[r] = reg.Counter("gr_auth_attempts_total",
 			"Authentication attempts, by result", "attempts", metric.Labels{"result": r})

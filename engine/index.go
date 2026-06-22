@@ -57,6 +57,7 @@ func (e *DiskEngine) rebuildIndexes() error {
 	}
 	e.idx = set
 	if len(set.defs) == 0 {
+		e.publishIndexCounts()
 		return nil
 	}
 	n := uint64(e.nodes.Count())
@@ -83,13 +84,67 @@ func (e *DiskEngine) rebuildIndexes() error {
 			bucket[k] = append(bucket[k], pos)
 		}
 	}
+	e.publishIndexCounts()
 	return nil
+}
+
+// publishIndexCounts snapshots the per-index entry count into idxCounts as a fresh map (doc 20
+// §6.4), so the gr_index_entries gauge reads a live count without taking the engine lock. The caller
+// holds the engine lock (every rebuildIndexes caller does, and Open is exclusive), so reading the
+// catalog and the index buckets here is safe. Each count is the total indexed positions across the
+// index's value buckets; an index with no served buckets reports zero. The whole map is swapped in
+// atomically, so a concurrent reader sees either the old map or the new one, never a half-built one.
+func (e *DiskEngine) publishIndexCounts() {
+	counts := make(map[string]uint64, len(e.idx.defs))
+	for _, ix := range e.cat.Indexes() {
+		if len(ix.Props) != 1 {
+			counts[ix.Name] = 0
+			continue
+		}
+		var n uint64
+		if bucket, ok := e.idx.defs[indexDefKey{label: ix.Label, prop: ix.Props[0]}]; ok {
+			for _, positions := range bucket {
+				n += uint64(len(positions))
+			}
+		}
+		counts[ix.Name] = n
+	}
+	e.idxCounts.Store(&counts)
 }
 
 // hasIndexes reports whether any property index is declared, so the write commit
 // path can skip the rebuild when there is nothing to maintain.
 func (e *DiskEngine) hasIndexes() bool {
 	return e.idx != nil && len(e.idx.defs) > 0
+}
+
+// IndexEntryCount returns the number of indexed positions a named single-property index holds in
+// the committed base (doc 20 §6.4): the count of live label-nodes carrying a non-null value for the
+// indexed property. It reads the count map last published under the engine lock, so it takes no lock
+// itself and is safe to call from the metrics snapshot even while a write transaction holds the
+// engine lock. An unknown name (including a dropped index) returns zero, so a gone index's gauge
+// reads zero rather than going stale.
+func (e *DiskEngine) IndexEntryCount(name string) uint64 {
+	if m := e.idxCounts.Load(); m != nil {
+		return (*m)[name]
+	}
+	return 0
+}
+
+// IndexNames returns the names of every declared index, read lock-free from the published count map
+// (doc 20 §6.4). The metrics layer uses it to decide which gr_index_entries gauges to register, so
+// like IndexEntryCount it must not take the engine lock: a snapshot can run while a write
+// transaction holds it.
+func (e *DiskEngine) IndexNames() []string {
+	m := e.idxCounts.Load()
+	if m == nil {
+		return nil
+	}
+	out := make([]string, 0, len(*m))
+	for name := range *m {
+		out = append(out, name)
+	}
+	return out
 }
 
 // HasNodeIndex reports whether a single-property node index is declared on the

@@ -790,6 +790,27 @@ func TestMetricsIndexSeek(t *testing.T) {
 	}
 }
 
+func TestMetricsIndexEntries(t *testing.T) {
+	db := openMem(t, "mxentries.gr")
+	defer db.Close()
+
+	mustExec(t, db, "CREATE INDEX person_email FOR (p:Person) ON (p.email)", nil)
+	mustExec(t, db, "CREATE (:Person {email: 'a@x'})", nil)
+	mustExec(t, db, "CREATE (:Person {email: 'b@x'})", nil)
+	// A Person with no email value is not an index entry, so it does not count.
+	mustExec(t, db, "CREATE (:Person {name: 'c'})", nil)
+
+	if g := db.Metrics().Gauge("gr_index_entries", Labels{"index": "person_email"}); g != 2 {
+		t.Errorf("index entries = %d, want 2", g)
+	}
+
+	// The gauge reads the live count at snapshot, so a delete lowers it.
+	mustExec(t, db, "MATCH (p:Person {email: 'a@x'}) DELETE p", nil)
+	if g := db.Metrics().Gauge("gr_index_entries", Labels{"index": "person_email"}); g != 1 {
+		t.Errorf("index entries after delete = %d, want 1", g)
+	}
+}
+
 func TestMetricsConstraintChecks(t *testing.T) {
 	db := openMem(t, "mxcons.gr")
 	defer db.Close()

@@ -50,7 +50,30 @@ const (
 // programmatic exposition surface, the one the CLI's .metrics command and a test read; the
 // server renders the same registry as Prometheus text and expvar JSON.
 func (db *DB) Metrics() MetricsSnapshot {
+	db.syncIndexEntryGauges()
 	return db.metrics.reg.Snapshot()
+}
+
+// syncIndexEntryGauges ensures a gr_index_entries computed gauge exists for every declared index
+// (doc 20 §6.4), registering one the first time the index is seen. The gauge reads the index's live
+// entry count from the engine at snapshot time, so the value tracks data writes without the write
+// path touching the registry. A dropped index keeps its gauge, which then reads zero, the standard
+// way a gone series settles. It is called before each snapshot, so a newly created index appears on
+// the next scrape; registration is idempotent through the seen-set, so a steady schema costs only a
+// sync.Map load per index.
+func (db *DB) syncIndexEntryGauges() {
+	if db.eng == nil {
+		return
+	}
+	for _, name := range db.eng.IndexNames() {
+		if _, seen := db.metrics.indexEntryGauges.LoadOrStore(name, struct{}{}); seen {
+			continue
+		}
+		db.metrics.reg.ComputedGauge("gr_index_entries",
+			"Indexed entries per index, the live key count", "entries",
+			metric.Labels{"index": name},
+			func() int64 { return int64(db.eng.IndexEntryCount(name)) })
+	}
 }
 
 // RecordAuthAttempt counts one authentication attempt against the shared metric registry (doc 20
@@ -249,6 +272,11 @@ type queryMetrics struct {
 	constraintChecks map[constraintCheckKey]*metric.Counter
 
 	indexLookupSeconds map[string]*metric.Histogram // gr_index_lookup_seconds by [kind]
+
+	// indexEntryGauges records which index names already have a gr_index_entries computed gauge, so
+	// the sync registers each at most once. The value is unused, only the key (the index name)
+	// matters; the gauge itself lives in the registry and reads its count at snapshot time.
+	indexEntryGauges sync.Map // string index name -> struct{}
 
 	// indexNameOf resolves an indexed (label, property) token pair to the index name for the
 	// gr_index_lookups_total index label. It is wired at Open once the engine exists; until then it

@@ -222,6 +222,10 @@ func Open(path string, opt Options) (*DB, error) {
 	// feeds gr_constraint_checks_total (doc 20 §6.4). A database with no declared constraints never
 	// calls it, so this costs nothing until a constraint exists.
 	db.eng.SetConstraintObserver(constraintObserver{db.metrics})
+	// Register the per-index entry gauge for any index this open already carries (doc 20 §6.4), so a
+	// reopened database with indexes exposes their sizes from the first scrape. New indexes register
+	// lazily on the next snapshot.
+	db.syncIndexEntryGauges()
 	// The open event reports the file's real geometry and whether this open recovered a
 	// committed WAL prefix after a crash (doc 20 §11.3). StorageInfo reads the header the
 	// engine just mounted, so the format version and page size are the file's own.

@@ -1062,6 +1062,32 @@ func TestMetricsCheckpointSegments(t *testing.T) {
 	}
 }
 
+func TestMetricsVersionsResident(t *testing.T) {
+	db := openMem(t, "mxversions.gr")
+	defer db.Close()
+
+	// A fresh database carries no version history.
+	if g := db.Metrics().Gauge("gr_mvcc_versions_resident", nil); g != 0 {
+		t.Fatalf("versions resident on fresh db = %d, want 0", g)
+	}
+
+	mustExec(t, db, "CREATE (:Counter {n: 0})", nil)
+	// Each overwrite of the committed value records a pre-image, the version history GC reclaims.
+	for i := 0; i < 20; i++ {
+		mustExec(t, db, "MATCH (c:Counter) SET c.n = c.n + 1", nil)
+	}
+	if g := db.Metrics().Gauge("gr_mvcc_versions_resident", nil); g <= 0 {
+		t.Fatalf("versions resident after updates = %d, want > 0", g)
+	}
+
+	// With no open reader the watermark reaches the latest commit, so a checkpoint's GC reclaims
+	// every retained pre-image and the version store drains.
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+	if g := db.Metrics().Gauge("gr_mvcc_versions_resident", nil); g != 0 {
+		t.Fatalf("versions resident after GC = %d, want 0", g)
+	}
+}
+
 func TestMetricsConstraintChecks(t *testing.T) {
 	db := openMem(t, "mxcons.gr")
 	defer db.Close()

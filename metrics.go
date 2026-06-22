@@ -52,6 +52,7 @@ const (
 func (db *DB) Metrics() MetricsSnapshot {
 	db.syncIndexGauges()
 	db.syncColcacheMetrics()
+	db.syncBufferPoolMetrics()
 	return db.metrics.reg.Snapshot()
 }
 
@@ -110,6 +111,39 @@ func (db *DB) syncIndexGauges() {
 			"Estimated in-memory footprint per index", "bytes",
 			metric.Labels{"index": name},
 			func() int64 { return int64(db.eng.IndexMemoryBytes(name)) })
+	}
+}
+
+// syncBufferPoolMetrics mirrors the pager's buffer-pool counts into the registry at snapshot time
+// (doc 20 §4.1): it advances gr_bufferpool_accesses_total by the hits and misses since the last sync
+// and sets the resident-frame and memory gauges to the current fill level. The pager owns the
+// authoritative counts, bumped under its pool lock on the read path, so the read path never touches
+// the registry; this bridge runs only on a scrape. The delta add keeps the counter monotonic, and
+// bufferpoolMu serializes two concurrent scrapes so neither double-counts. Reading the stats takes
+// only the pager's pool lock, never the engine lock, so a long-held write transaction cannot
+// deadlock a snapshot. The pool is a CLOCK ring today, so the 2Q eviction and admission metrics in
+// §4.1 wait on the two-queue pool; this lands the hit rate and the fill level.
+func (db *DB) syncBufferPoolMetrics() {
+	if db.eng == nil {
+		return
+	}
+	s := db.eng.BufferPoolStats()
+	m := db.metrics
+	m.bufferpoolMu.Lock()
+	if c := m.bufferpoolAccesses["hit"]; c != nil && s.Hits > m.lastBufferpoolHits {
+		c.Add(s.Hits - m.lastBufferpoolHits)
+		m.lastBufferpoolHits = s.Hits
+	}
+	if c := m.bufferpoolAccesses["miss"]; c != nil && s.Misses > m.lastBufferpoolMisses {
+		c.Add(s.Misses - m.lastBufferpoolMisses)
+		m.lastBufferpoolMisses = s.Misses
+	}
+	m.bufferpoolMu.Unlock()
+	if m.bufferpoolResident != nil {
+		m.bufferpoolResident.Set(int64(s.Resident))
+	}
+	if m.bufferpoolBytes != nil {
+		m.bufferpoolBytes.Set(int64(s.Bytes))
 	}
 }
 
@@ -260,6 +294,14 @@ var metricConstraintKinds = []string{"unique", "exists", "type"}
 // is the data-quality signal, the share of writes the schema turned away.
 var metricConstraintResults = []string{"pass", "violation"}
 
+// metricBufferpoolResults is the bounded domain of the result label on gr_bufferpool_accesses_total
+// (doc 20 §4.1): whether a page-table lookup found the page resident (hit) or faulted it from disk
+// (miss). The hit rate, hit / (hit + miss), is the headline buffer-pool efficiency, the single most
+// important storage metric: a low rate means the working set does not fit and every miss is a disk
+// read on the hot path. Both series are pre-registered so a fresh database exposes the miss series
+// at zero from the start.
+var metricBufferpoolResults = []string{"hit", "miss"}
+
 // metricColcacheResults is the bounded domain of the result label on gr_colcache_accesses_total
 // (doc 20 §4.4): whether a property-block lookup found the decoded vector resident (hit) or had to
 // decode the segment (miss). The hit rate, hit / (hit + miss), is the property-read warmth, the
@@ -330,6 +372,19 @@ type queryMetrics struct {
 	colcacheMu         sync.Mutex
 	lastColcacheHits   uint64
 	lastColcacheMisses uint64
+
+	// bufferpoolAccesses holds gr_bufferpool_accesses_total keyed by result (hit, miss), and
+	// bufferpoolResident and bufferpoolBytes the fill-level gauges. The pager owns the
+	// authoritative cumulative counts; the sync step mirrors them into the registry at snapshot
+	// time, the same bridge the column cache uses (doc 20 §4.1). bufferpoolMu guards the mirror so
+	// two concurrent scrapes do not double-count, and lastBufferpoolHits and lastBufferpoolMisses
+	// hold the last mirrored values, the basis for the monotonic delta add.
+	bufferpoolAccesses   map[string]*metric.Counter
+	bufferpoolResident   *metric.Gauge
+	bufferpoolBytes      *metric.Gauge
+	bufferpoolMu         sync.Mutex
+	lastBufferpoolHits   uint64
+	lastBufferpoolMisses uint64
 
 	// indexEntryGauges records which index names already have a gr_index_entries computed gauge, so
 	// the sync registers each at most once. The value is unused, only the key (the index name)
@@ -455,6 +510,15 @@ func newQueryMetrics() *queryMetrics {
 		"Decoded property blocks currently cached", "blocks", nil)
 	m.colcacheBytes = reg.Gauge("gr_colcache_memory_bytes",
 		"Memory held by decoded property blocks", "bytes", nil)
+	m.bufferpoolAccesses = make(map[string]*metric.Counter, len(metricBufferpoolResults))
+	for _, r := range metricBufferpoolResults {
+		m.bufferpoolAccesses[r] = reg.Counter("gr_bufferpool_accesses_total",
+			"Buffer-pool page-table lookups, by result", "accesses", metric.Labels{"result": r})
+	}
+	m.bufferpoolResident = reg.Gauge("gr_bufferpool_resident_frames",
+		"Frames currently holding a page", "frames", nil)
+	m.bufferpoolBytes = reg.Gauge("gr_bufferpool_memory_bytes",
+		"Memory held by the buffer pool, resident frames times page size", "bytes", nil)
 	for _, r := range metricAuthResults {
 		m.authAttempts[r] = reg.Counter("gr_auth_attempts_total",
 			"Authentication attempts, by result", "attempts", metric.Labels{"result": r})

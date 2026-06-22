@@ -87,6 +87,14 @@ type Pager struct {
 	maxPool  int
 	saltNext uint64
 
+	// hits and misses are the cumulative buffer-pool lookup outcomes since open, the page-table
+	// hit rate that is the single most important storage metric (doc 20 §4.1). A hit is a ReadPage
+	// that found the page resident; a miss is one that faulted it from disk. They are bumped under
+	// mu on the ReadPage paths, so a snapshot reads a consistent pair under the one lock the pool
+	// already uses, and the pager never reaches up into the metric registry.
+	hits   uint64
+	misses uint64
+
 	headerDirty bool
 	closed      bool
 	recovered   bool // true if open redid committed WAL frames after a crash

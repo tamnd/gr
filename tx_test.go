@@ -15,7 +15,7 @@ func personCount(t *testing.T, db *DB) int64 {
 		t.Fatalf("count query: %v", err)
 	}
 	defer func() { _ = res.Close() }()
-	row, ok, err := res.Next()
+	row, ok, err := res.Row()
 	if err != nil || !ok {
 		t.Fatalf("count next: ok=%v err=%v", ok, err)
 	}

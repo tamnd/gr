@@ -299,7 +299,7 @@ func TestQuery(t *testing.T) {
 	if cols := res.Columns(); len(cols) != 1 || cols[0] != "n" {
 		t.Fatalf("columns = %v, want [n]", cols)
 	}
-	row, ok, err := res.Next()
+	row, ok, err := res.Row()
 	if err != nil {
 		t.Fatalf("next: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestQuery(t *testing.T) {
 	if n, ok := row[0].AsInt(); !ok || n != 3 {
 		t.Fatalf("row[0] = %v, want 3", row[0])
 	}
-	if _, ok, _ := res.Next(); ok {
+	if _, ok, _ := res.Row(); ok {
 		t.Fatal("expected exactly one row")
 	}
 }
@@ -330,7 +330,7 @@ func TestQueryParams(t *testing.T) {
 	}
 	defer func() { _ = res.Close() }()
 
-	row, ok, err := res.Next()
+	row, ok, err := res.Row()
 	if err != nil || !ok {
 		t.Fatalf("next: ok=%v err=%v", ok, err)
 	}
@@ -356,7 +356,7 @@ func TestQueryPlanCache(t *testing.T) {
 			t.Fatalf("query %q: %v", q, err)
 		}
 		for {
-			if _, ok, err := res.Next(); err != nil {
+			if _, ok, err := res.Row(); err != nil {
 				t.Fatal(err)
 			} else if !ok {
 				break
@@ -418,7 +418,7 @@ func collectRows(t *testing.T, db *DB, q string, params map[string]value.Value) 
 	cols := res.Columns()
 	var out []map[string]value.Value
 	for {
-		row, ok, err := res.Next()
+		row, ok, err := res.Row()
 		if err != nil {
 			t.Fatalf("next: %v", err)
 		}

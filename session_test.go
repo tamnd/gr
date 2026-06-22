@@ -36,13 +36,11 @@ func TestSessionExecuteWriteThenRead(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		defer func() { _ = res.Close() }()
-		row, ok, err := res.Next()
-		if err != nil || !ok {
+		rec, err := Single(res)
+		if err != nil {
 			return nil, err
 		}
-		n, _ := row[0].AsInt()
-		return n, nil
+		return rec.GetInt("c")
 	})
 	if err != nil {
 		t.Fatalf("execute read: %v", err)

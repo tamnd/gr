@@ -225,7 +225,7 @@ func Open(path string, opt Options) (*DB, error) {
 	// Register the per-index entry gauge for any index this open already carries (doc 20 §6.4), so a
 	// reopened database with indexes exposes their sizes from the first scrape. New indexes register
 	// lazily on the next snapshot.
-	db.syncIndexEntryGauges()
+	db.syncIndexGauges()
 	// The open event reports the file's real geometry and whether this open recovered a
 	// committed WAL prefix after a crash (doc 20 §11.3). StorageInfo reads the header the
 	// engine just mounted, so the format version and page size are the file's own.

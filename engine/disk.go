@@ -73,12 +73,14 @@ type DiskEngine struct {
 	// caller sets it, and every report goes through the nil-safe reportConstraint helper.
 	conObs ConstraintObserver
 
-	// idxCounts holds the per-index entry count, published as a whole map under the engine lock
-	// whenever the indexes are rebuilt and read lock-free for the gr_index_entries gauge (doc 20
-	// §6.4). It is a pointer swap, never mutated in place, so a reader sees one consistent map even
-	// while a writer holds the engine lock, which is what keeps the metrics snapshot off the engine
-	// lock and out of a deadlock with a long-held write transaction.
+	// idxCounts holds the per-index entry count, and idxBytes the per-index in-memory footprint
+	// estimate, each published as a whole map under the engine lock whenever the indexes are rebuilt
+	// and read lock-free for the gr_index_entries and gr_index_memory_bytes gauges (doc 20 §6.4). They
+	// are pointer swaps, never mutated in place, so a reader sees one consistent map even while a
+	// writer holds the engine lock, which is what keeps the metrics snapshot off the engine lock and
+	// out of a deadlock with a long-held write transaction.
 	idxCounts atomic.Pointer[map[string]uint64]
+	idxBytes  atomic.Pointer[map[string]uint64]
 
 	// bc fronts the segmented-base read with decoded segments, so a repeated point
 	// read in a segment does not re-decode it (doc 14 §4). It is an in-memory cache,

@@ -57,7 +57,7 @@ func (e *DiskEngine) rebuildIndexes() error {
 	}
 	e.idx = set
 	if len(set.defs) == 0 {
-		e.publishIndexCounts()
+		e.publishIndexStats()
 		return nil
 	}
 	n := uint64(e.nodes.Count())
@@ -84,32 +84,47 @@ func (e *DiskEngine) rebuildIndexes() error {
 			bucket[k] = append(bucket[k], pos)
 		}
 	}
-	e.publishIndexCounts()
+	e.publishIndexStats()
 	return nil
 }
 
-// publishIndexCounts snapshots the per-index entry count into idxCounts as a fresh map (doc 20
-// §6.4), so the gr_index_entries gauge reads a live count without taking the engine lock. The caller
-// holds the engine lock (every rebuildIndexes caller does, and Open is exclusive), so reading the
-// catalog and the index buckets here is safe. Each count is the total indexed positions across the
-// index's value buckets; an index with no served buckets reports zero. The whole map is swapped in
-// atomically, so a concurrent reader sees either the old map or the new one, never a half-built one.
-func (e *DiskEngine) publishIndexCounts() {
+// indexEntryOverheadBytes is the per-value-bucket constant in the footprint estimate: a Go string
+// header (a pointer and a length) plus a slice header (a pointer, a length, and a capacity), the
+// fixed cost each distinct indexed value carries on top of its key bytes and its position list. It is
+// an estimate of the dominant terms, not an exact heap measurement, which is all an operator needs to
+// compare indexes and watch one grow (doc 20 §6.4).
+const indexEntryOverheadBytes = 16 + 24
+
+// publishIndexStats snapshots the per-index entry count into idxCounts and the per-index in-memory
+// footprint estimate into idxBytes, each as a fresh map (doc 20 §6.4), so the gr_index_entries and
+// gr_index_memory_bytes gauges read a live value without taking the engine lock. The caller holds the
+// engine lock (every rebuildIndexes caller does, and Open is exclusive), so reading the catalog and
+// the index buckets here is safe. The count is the total indexed positions across the index's value
+// buckets; the byte estimate adds, per distinct value, its key bytes, the fixed header overhead, and
+// eight bytes per indexed position. An index with no served buckets reports zero for both. Each map is
+// swapped in atomically, so a concurrent reader sees either the old map or the new one, never a
+// half-built one.
+func (e *DiskEngine) publishIndexStats() {
 	counts := make(map[string]uint64, len(e.idx.defs))
+	bytes := make(map[string]uint64, len(e.idx.defs))
 	for _, ix := range e.cat.Indexes() {
 		if len(ix.Props) != 1 {
 			counts[ix.Name] = 0
+			bytes[ix.Name] = 0
 			continue
 		}
-		var n uint64
+		var n, b uint64
 		if bucket, ok := e.idx.defs[indexDefKey{label: ix.Label, prop: ix.Props[0]}]; ok {
-			for _, positions := range bucket {
+			for k, positions := range bucket {
 				n += uint64(len(positions))
+				b += uint64(len(k)) + indexEntryOverheadBytes + uint64(len(positions))*8
 			}
 		}
 		counts[ix.Name] = n
+		bytes[ix.Name] = b
 	}
 	e.idxCounts.Store(&counts)
+	e.idxBytes.Store(&bytes)
 }
 
 // hasIndexes reports whether any property index is declared, so the write commit
@@ -126,6 +141,18 @@ func (e *DiskEngine) hasIndexes() bool {
 // reads zero rather than going stale.
 func (e *DiskEngine) IndexEntryCount(name string) uint64 {
 	if m := e.idxCounts.Load(); m != nil {
+		return (*m)[name]
+	}
+	return 0
+}
+
+// IndexMemoryBytes returns the estimated in-memory footprint of a named single-property index (doc
+// 20 §6.4): per distinct indexed value, its key bytes plus a fixed header overhead plus eight bytes
+// per indexed position. Like IndexEntryCount it reads the map last published under the engine lock, so
+// it takes no lock and an unknown name returns zero. The value is an estimate of the dominant terms,
+// enough to compare indexes and watch one grow, not an exact heap measurement.
+func (e *DiskEngine) IndexMemoryBytes(name string) uint64 {
+	if m := e.idxBytes.Load(); m != nil {
 		return (*m)[name]
 	}
 	return 0

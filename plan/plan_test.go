@@ -87,6 +87,35 @@ func TestBuildExpandCarriesSourceLabels(t *testing.T) {
 	}
 }
 
+// TestPlanKeepsSourceLabels guards that the source-label cost metadata survives the
+// whole planning pipeline, not just Build. The optimizer and join-order passes
+// rebuild operators through mapChildren, and an Expand rebuild that listed its
+// fields by hand used to drop FromLabels, silently reverting the source-label
+// degree conditioning to the all-node average before the cost model ever read it.
+// Person is the only labeled node here, so the anchor stays put and the natural
+// chain reaches join ordering and drift with its source label intact.
+func TestPlanKeepsSourceLabels(t *testing.T) {
+	b := bound(t, "MATCH (a:Person)-[:KNOWS]->(b) RETURN b")
+	st := fakeStats{nodes: 1000, rels: 300, label: map[uint32]float64{1: 200}, relType: map[uint32]float64{1: 300}}
+	var exp *Expand
+	var walk func(o Op)
+	walk = func(o Op) {
+		if e, ok := o.(*Expand); ok {
+			exp = e
+		}
+		for _, c := range nodeChildren(o) {
+			walk(c)
+		}
+	}
+	walk(PlanWithStats(b, st))
+	if exp == nil || exp.From != "a" {
+		t.Fatalf("expand = %+v, want one anchored at a", exp)
+	}
+	if len(exp.FromLabels) != 1 || !exp.FromLabels[0].Known || exp.FromLabels[0].Token != 1 {
+		t.Fatalf("planned expand FromLabels = %+v, want [Person(#1)] to survive the pipeline", exp.FromLabels)
+	}
+}
+
 func TestBuildFriendsOfFriends(t *testing.T) {
 	b := bound(t, "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) RETURN c.name AS name")
 	want := `Project c.name AS name

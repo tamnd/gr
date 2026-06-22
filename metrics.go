@@ -115,6 +115,24 @@ var metricCacheEvictReasons = []string{"capacity", "schema_change", "stats_chang
 // plan is recompiled; the ddl and constraint causes wait on their hooks.
 var metricCacheInvalidCauses = []string{"ddl", "stats_refresh", "constraint"}
 
+// metricTxModes is the bounded domain of the mode label on the transaction metrics (doc 20
+// §3.3): a transaction is a read or a write. The write gauge stuck above the single-writer
+// baseline is the long-held-writer leak signal (§16.4).
+var metricTxModes = []string{"read", "write"}
+
+// metricTxOutcomes is the bounded domain of the outcome label on gr_transactions_total (doc 20
+// §3.3): a transaction ends in a commit, an abort (an explicit rollback or a commit that failed
+// for a non-conflict reason and rolled back), or a conflict (a write that lost the optimistic
+// race at commit). The conflict rate is the contention signal (§5, §16.4).
+var metricTxOutcomes = []string{"commit", "abort", "conflict"}
+
+// txDurationBuckets is the bucket layout for gr_transaction_duration_seconds (doc 20 §3.3): like
+// the query latency buckets but stretched to a minute, since a transaction lifetime ranges longer
+// than a single query and the long-tailed write distribution is the symptom worth resolving.
+var txDurationBuckets = []float64{
+	0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60,
+}
+
 // metricErrorClasses is the bounded domain of the class label on gr_query_errors_total (doc 20
 // §3.1): the cause an error falls into. The metric is a sub-view of
 // gr_queries_total{status="error"} broken out by cause, plus the syntax errors that fail before
@@ -142,6 +160,10 @@ type queryMetrics struct {
 
 	queued    *metric.Counter   // gr_query_queued_total (queries that waited for admission)
 	queueWait *metric.Histogram // gr_query_queue_wait_seconds (admission queue wait time)
+
+	txOpen     map[string]*metric.Gauge              // gr_transactions_open by [mode]
+	txTotal    map[string]map[string]*metric.Counter // gr_transactions_total by [mode][outcome]
+	txDuration map[string]*metric.Histogram          // gr_transaction_duration_seconds by [mode]
 }
 
 // newQueryMetrics builds the registry and pre-resolves every query-metric handle (doc 20
@@ -161,6 +183,24 @@ func newQueryMetrics() *queryMetrics {
 		cacheLookups:       make(map[string]*metric.Counter, len(metricCacheResults)),
 		cacheEvictions:     make(map[string]*metric.Counter, len(metricCacheEvictReasons)),
 		cacheInvalidations: make(map[string]*metric.Counter, len(metricCacheInvalidCauses)),
+
+		txOpen:     make(map[string]*metric.Gauge, len(metricTxModes)),
+		txTotal:    make(map[string]map[string]*metric.Counter, len(metricTxModes)),
+		txDuration: make(map[string]*metric.Histogram, len(metricTxModes)),
+	}
+	for _, mode := range metricTxModes {
+		m.txOpen[mode] = reg.Gauge("gr_transactions_open",
+			"Currently open transactions, by mode", "txns", metric.Labels{"mode": mode})
+		byOutcome := make(map[string]*metric.Counter, len(metricTxOutcomes))
+		for _, oc := range metricTxOutcomes {
+			byOutcome[oc] = reg.Counter("gr_transactions_total",
+				"Transactions begun, by mode and outcome", "txns",
+				metric.Labels{"mode": mode, "outcome": oc})
+		}
+		m.txTotal[mode] = byOutcome
+		m.txDuration[mode] = reg.Histogram("gr_transaction_duration_seconds",
+			"Transaction lifetime, begin to commit or rollback", "seconds",
+			txDurationBuckets, metric.Labels{"mode": mode})
 	}
 	for _, r := range metricCacheResults {
 		m.cacheLookups[r] = reg.Counter("gr_plan_cache_lookups_total",
@@ -284,6 +324,54 @@ func (m *queryMetrics) recordQueued(wait time.Duration) {
 	}
 	if m.queueWait != nil {
 		m.queueWait.Observe(wait.Seconds())
+	}
+}
+
+// txBegin records that a transaction of the given mode opened, raising the open-transaction
+// gauge (doc 20 §3.3). Every txBegin is paired with one txFinish, which lowers the gauge and
+// records the outcome and lifetime, so the gauge is the count of transactions open right now.
+func (m *queryMetrics) txBegin(mode string) {
+	if g := m.txOpen[mode]; g != nil {
+		g.Inc()
+	}
+}
+
+// txFinish records that a transaction of the given mode ended with the given outcome after d (doc
+// 20 §3.3): it lowers the open gauge, counts the outcome, and observes the lifetime. The conflict
+// outcome is the contention signal an operator reads off the rate.
+func (m *queryMetrics) txFinish(mode, outcome string, d time.Duration) {
+	if g := m.txOpen[mode]; g != nil {
+		g.Dec()
+	}
+	if byOutcome := m.txTotal[mode]; byOutcome != nil {
+		if c := byOutcome[outcome]; c != nil {
+			c.Inc()
+		}
+	}
+	if h := m.txDuration[mode]; h != nil {
+		h.Observe(d.Seconds())
+	}
+}
+
+// metricTxMode maps a write flag to the transaction mode label (doc 20 §3.3).
+func metricTxMode(write bool) string {
+	if write {
+		return "write"
+	}
+	return "read"
+}
+
+// metricTxOutcome maps a transaction's finishing error to its outcome label (doc 20 §3.3): no
+// error is a commit (or a clean rollback, which the caller passes as abort), a conflict error is
+// conflict, and any other failure rolled the transaction back, so it is an abort.
+func metricTxOutcome(err error) string {
+	switch {
+	case err == nil:
+		return "commit"
+	case errors.Is(err, ErrConflict):
+		return "conflict"
+	default:
+		return "abort"
 	}
 }
 

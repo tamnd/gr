@@ -392,6 +392,68 @@ func TestMetricsAdmissionQueued(t *testing.T) {
 	}
 }
 
+// TestMetricsTransactions confirms the transaction lifecycle metrics track an open transaction,
+// a committed write, and a rolled-back read (doc 20 §3.3).
+func TestMetricsTransactions(t *testing.T) {
+	db, err := Open("mtx.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tx, err := db.Begin(context.Background(), Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := db.Metrics().Gauge("gr_transactions_open", Labels{"mode": "write"}); g != 1 {
+		t.Errorf("open write txns = %d, want 1", g)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	snap := db.Metrics()
+	if g := snap.Gauge("gr_transactions_open", Labels{"mode": "write"}); g != 0 {
+		t.Errorf("open write txns after commit = %d, want 0", g)
+	}
+	if c := snap.Counter("gr_transactions_total", Labels{"mode": "write", "outcome": "commit"}); c != 1 {
+		t.Errorf("write commits = %d, want 1", c)
+	}
+	if h := snap.Histogram("gr_transaction_duration_seconds", Labels{"mode": "write"}); h.Count != 1 {
+		t.Errorf("write tx duration count = %d, want 1", h.Count)
+	}
+
+	// A rolled-back read counts an abort under the read mode.
+	rtx, err := db.Begin(context.Background(), Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rtx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if c := db.Metrics().Counter("gr_transactions_total", Labels{"mode": "read", "outcome": "abort"}); c != 1 {
+		t.Errorf("read aborts = %d, want 1", c)
+	}
+}
+
+// TestMetricsTxOutcomeMapping checks the outcome classifier maps a clean finish, a conflict, and
+// any other failure to their labels (doc 20 §3.3).
+func TestMetricsTxOutcomeMapping(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{nil, "commit"},
+		{ErrConflict, "conflict"},
+		{errors.New("disk gone"), "abort"},
+	}
+	for _, c := range cases {
+		if got := metricTxOutcome(c.err); got != c.want {
+			t.Errorf("metricTxOutcome(%v) = %q, want %q", c.err, got, c.want)
+		}
+	}
+}
+
 // TestMetricsAlwaysOn confirms the registry exists on a plain Open with no logging configured,
 // so the metrics plane is always on (doc 20 §1.2).
 func TestMetricsAlwaysOn(t *testing.T) {

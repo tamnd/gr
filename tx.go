@@ -48,6 +48,9 @@ type Tx struct {
 	etx   engine.Tx
 	write bool
 	done  bool
+	// started is when Begin opened the transaction, the basis for its lifetime in
+	// gr_transaction_duration_seconds, recorded when Commit or Rollback finishes it (doc 20 §3.3).
+	started time.Time
 	// session is set when the transaction was opened through Session.Begin, so that
 	// finishing the transaction (Commit or Rollback) clears the session's active flag
 	// and lets the session host its next transaction. It is nil for a transaction
@@ -70,7 +73,8 @@ func (db *DB) Begin(ctx context.Context, mode AccessMode) (*Tx, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Tx{db: db, etx: etx, write: mode == Write}, nil
+	db.metrics.txBegin(metricTxMode(mode == Write))
+	return &Tx{db: db, etx: etx, write: mode == Write, started: time.Now()}, nil
 }
 
 // Commit makes a write transaction's changes durable and visible, then finishes
@@ -84,7 +88,9 @@ func (tx *Tx) Commit() error {
 	}
 	tx.done = true
 	tx.releaseSession()
-	return tx.etx.Commit()
+	err := tx.etx.Commit()
+	tx.db.metrics.txFinish(metricTxMode(tx.write), metricTxOutcome(err), time.Since(tx.started))
+	return err
 }
 
 // Rollback discards a transaction's uncommitted changes and finishes it (doc 16
@@ -97,7 +103,11 @@ func (tx *Tx) Rollback() error {
 	}
 	tx.done = true
 	tx.releaseSession()
-	return tx.etx.Abort()
+	err := tx.etx.Abort()
+	// A rollback is always an abort outcome, whatever Abort returns; the duration is the lifetime
+	// from Begin (doc 20 §3.3).
+	tx.db.metrics.txFinish(metricTxMode(tx.write), "abort", time.Since(tx.started))
+	return err
 }
 
 // releaseSession clears the active flag of the session that opened this transaction

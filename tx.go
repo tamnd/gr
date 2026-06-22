@@ -3,6 +3,7 @@ package gr
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/bind"
@@ -195,6 +196,20 @@ func (tx *Tx) Run(ctx context.Context, cypher string, params Params, opts ...Run
 	if err != nil {
 		return nil, err
 	}
+	// The query metrics (doc 20 §3.1) wrap the dispatch the same way the database-level Run
+	// does, recording against the database's one registry, so a query run inside a managed
+	// transaction counts the same as an auto-commit one.
+	kind := metricQueryKind(q)
+	start := time.Now()
+	tx.db.metrics.begin(kind)
+	res, err := tx.runDispatch(q, cypher, vals, cfg)
+	return tx.db.measureQuery(kind, start, res, err)
+}
+
+// runDispatch routes a parsed statement inside a managed transaction, the body of Run with
+// the metric instrumentation lifted out so the query metrics record once around the dispatch
+// (doc 20 §3.1).
+func (tx *Tx) runDispatch(q *ast.Query, cypher string, vals map[string]value.Value, cfg runConfig) (*Result, error) {
 	if q.Explain {
 		// A write transaction holds the engine lock, so it must plan against its own
 		// catalog view and skip the seek rewrite (a nil index oracle) and the cost

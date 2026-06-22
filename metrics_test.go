@@ -1,0 +1,133 @@
+package gr
+
+import (
+	"context"
+	"testing"
+
+	"github.com/tamnd/gr/vfs"
+)
+
+// drain consumes and closes a result, so a streaming read records its query metrics (the
+// recording fires at Close, doc 20 §3.1).
+func drainResult(t *testing.T, r *Result) {
+	t.Helper()
+	for r.Next() {
+	}
+	if err := r.Err(); err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// TestMetricsQueryThroughput confirms a read through Run records gr_queries_total and
+// gr_query_duration_seconds under the read kind, and only at Close (the latency ends when the
+// stream is drained).
+func TestMetricsQueryThroughput(t *testing.T) {
+	db, err := Open("m.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	res, err := db.Run(context.Background(), "RETURN 1 AS n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Before Close the read is still in flight: counted in the gauge, not yet in the total.
+	if g := db.Metrics().Gauge("gr_query_inflight", Labels{"kind": "read"}); g != 1 {
+		t.Errorf("in-flight before close = %d, want 1", g)
+	}
+	if c := db.Metrics().Counter("gr_queries_total", Labels{"kind": "read", "status": "ok"}); c != 0 {
+		t.Errorf("total before close = %d, want 0 (latency ends at close)", c)
+	}
+
+	drainResult(t, res)
+
+	snap := db.Metrics()
+	if c := snap.Counter("gr_queries_total", Labels{"kind": "read", "status": "ok"}); c != 1 {
+		t.Errorf("total after close = %d, want 1", c)
+	}
+	if g := snap.Gauge("gr_query_inflight", Labels{"kind": "read"}); g != 0 {
+		t.Errorf("in-flight after close = %d, want 0", g)
+	}
+	h := snap.Histogram("gr_query_duration_seconds", Labels{"kind": "read"})
+	if h.Count != 1 {
+		t.Errorf("duration count = %d, want 1", h.Count)
+	}
+}
+
+// TestMetricsWriteKind confirms an eager write records immediately (no streaming wait) under
+// the write kind.
+func TestMetricsWriteKind(t *testing.T) {
+	db, err := Open("mw.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	res, err := db.Run(context.Background(), "CREATE (:Person {name: 'a'})", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A write executes eagerly, so the total is already recorded before Close.
+	if c := db.Metrics().Counter("gr_queries_total", Labels{"kind": "write", "status": "ok"}); c != 1 {
+		t.Errorf("write total = %d, want 1 (eager)", c)
+	}
+	if g := db.Metrics().Gauge("gr_query_inflight", Labels{"kind": "write"}); g != 0 {
+		t.Errorf("write in-flight = %d, want 0 (eager, already finished)", g)
+	}
+	_ = res.Close()
+}
+
+// TestMetricsErrorStatus confirms a failing query records the error status, and that a parse
+// error (which never reaches a kind) records nothing, the catalogue's bounded-kind discipline.
+func TestMetricsErrorStatus(t *testing.T) {
+	db, err := Open("me.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// A read that fails at runtime: divide is fine, so force a semantic error instead by
+	// referencing an undefined variable, which fails after the kind is known.
+	if _, err := db.Run(context.Background(), "RETURN missing.prop", nil); err == nil {
+		t.Fatal("expected an error for an undefined variable")
+	}
+	if c := db.Metrics().Counter("gr_queries_total", Labels{"kind": "read", "status": "error"}); c != 1 {
+		t.Errorf("read error total = %d, want 1", c)
+	}
+
+	// A parse error never classifies into a kind, so it is not counted in gr_queries_total.
+	if _, err := db.Run(context.Background(), "this is not cypher", nil); err == nil {
+		t.Fatal("expected a parse error")
+	}
+	total := uint64(0)
+	for _, k := range metricQueryKinds {
+		for _, s := range metricQueryStatuses {
+			total += db.Metrics().Counter("gr_queries_total", Labels{"kind": k, "status": s})
+		}
+	}
+	if total != 1 {
+		t.Errorf("total across all series = %d, want 1 (the parse error is not counted)", total)
+	}
+}
+
+// TestMetricsAlwaysOn confirms the registry exists on a plain Open with no logging configured,
+// so the metrics plane is always on (doc 20 §1.2).
+func TestMetricsAlwaysOn(t *testing.T) {
+	db, err := Open("ma.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if db.metrics == nil {
+		t.Fatal("metrics registry should be built at Open")
+	}
+	// db.Metrics() returns a usable snapshot even before any query runs.
+	if got := db.Metrics().Counter("gr_queries_total", Labels{"kind": "read", "status": "ok"}); got != 0 {
+		t.Errorf("fresh counter = %d, want 0", got)
+	}
+}

@@ -80,6 +80,26 @@ func (p *Pager) FreePage(id format.PageID) error {
 	return nil
 }
 
+// FreeCount returns how many pages the free list holds, walking the trunk chain
+// (doc 17 §6.15). Each chain page is itself a free page (the trunk doubles as a
+// freed page, §16.11), so the total is, over every chain page, one for the page
+// itself plus the freed ids it carries.
+func (p *Pager) FreeCount() (uint64, error) {
+	var total uint64
+	id := format.PageID(p.header.FreeListRoot)
+	for id != format.NoPage {
+		hf, err := p.ReadPage(id)
+		if err != nil {
+			return 0, err
+		}
+		body := p.payload(hf)
+		total += 1 + uint64(format.U32(body[flCountOff:]))
+		id = format.PageID(format.U64(body[flNextOff:]))
+		p.Unpin(hf)
+	}
+	return total, nil
+}
+
 // popFree takes one reusable page id from the free list, or reports the list is
 // empty so the caller grows the file. It pops from the head page's id array; when
 // that array is empty it reuses the head page itself and advances the root to the

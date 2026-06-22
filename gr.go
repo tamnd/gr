@@ -301,6 +301,93 @@ func (db *DB) Constraints() ([]ConstraintInfo, error) {
 	return db.eng.ConstraintInfos(), nil
 }
 
+// DBInfo is the database's static and structural nameplate behind `.info` /
+// `gr info` (doc 17 §6.15): the format version and page geometry, the size and
+// free-page count, the catalog token counts, the live element counts, and the
+// index and constraint counts.
+type DBInfo struct {
+	Path          string
+	FormatVersion uint32
+	PageSize      uint32
+	PageCount     uint64
+	FreePages     uint64
+	SizeBytes     int64
+	Labels        int
+	RelTypes      int
+	PropertyKeys  int
+	Nodes         int
+	Relationships int
+	Indexes       int
+	Constraints   int
+	UniqueCons    int
+}
+
+// Info gathers the database's static and structural facts (doc 17 §6.15). The
+// geometry and free-page count come from the engine's storage info, the catalog
+// counts and index and constraint counts from the introspection surface, and the
+// live element counts from a snapshot count query, so a deleted element's slot is
+// not counted.
+func (db *DB) Info() (DBInfo, error) {
+	if db.eng == nil {
+		return DBInfo{}, ErrClosed
+	}
+	si, err := db.eng.StorageInfo()
+	if err != nil {
+		return DBInfo{}, err
+	}
+	info := DBInfo{
+		Path:          db.path,
+		FormatVersion: si.FormatVersion,
+		PageSize:      si.PageSize,
+		PageCount:     si.PageCount,
+		FreePages:     si.FreePages,
+		SizeBytes:     si.SizeBytes,
+		Labels:        len(db.eng.Labels()),
+		RelTypes:      len(db.eng.RelationshipTypes()),
+		PropertyKeys:  len(db.eng.PropertyKeys()),
+		Indexes:       len(db.eng.IndexInfos()),
+	}
+	for _, c := range db.eng.ConstraintInfos() {
+		info.Constraints++
+		if c.Kind == "UNIQUE" {
+			info.UniqueCons++
+		}
+	}
+	err = db.View(func(tx *Tx) error {
+		n, err := countRows(tx, "MATCH (n) RETURN count(n)")
+		if err != nil {
+			return err
+		}
+		r, err := countRows(tx, "MATCH ()-[r]->() RETURN count(r)")
+		if err != nil {
+			return err
+		}
+		info.Nodes, info.Relationships = n, r
+		return nil
+	})
+	if err != nil {
+		return DBInfo{}, err
+	}
+	return info, nil
+}
+
+// countRows runs a single-column count query on a transaction and returns the count.
+func countRows(tx *Tx, cypher string) (int, error) {
+	r, err := tx.Run(context.Background(), cypher, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = r.Close() }()
+	if !r.Next() {
+		return 0, nil
+	}
+	n, err := r.Record().GetInt(r.Keys()[0])
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
 // Query runs a Cypher read query against a snapshot of the database and returns a
 // streaming result. It threads the whole read pipeline: the text is parsed to an
 // AST ([parse]), bound against the catalog ([bind]), planned into a logical

@@ -75,6 +75,39 @@ func TestFreeListReusesPages(t *testing.T) {
 	p.Unpin(f)
 }
 
+// TestFreeCount proves FreeCount tracks the free list: zero on an empty list, the
+// number of freed pages after frees, and back down as allocs reclaim them.
+func TestFreeCount(t *testing.T) {
+	fsys := vfs.NewMem()
+	p, err := Open(fsys, "t.gr", Options{Sync: wal.SyncFull})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	ids := allocN(t, p, 4)
+	if n, err := p.FreeCount(); err != nil || n != 0 {
+		t.Fatalf("FreeCount on empty list = %d, %v; want 0", n, err)
+	}
+	if err := p.FreePage(ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.FreePage(ids[2]); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := p.FreeCount(); err != nil || n != 2 {
+		t.Fatalf("FreeCount after 2 frees = %d, %v; want 2", n, err)
+	}
+	f, err := p.AllocPage(format.PageTypeData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Unpin(f)
+	if n, err := p.FreeCount(); err != nil || n != 1 {
+		t.Fatalf("FreeCount after a reclaiming alloc = %d, %v; want 1", n, err)
+	}
+}
+
 // TestFreeListSpillsAcrossPages frees more pages than one free-list page can hold,
 // so the chain must grow to a second free-list page, then drains them all back.
 func TestFreeListSpillsAcrossPages(t *testing.T) {

@@ -53,6 +53,7 @@ func (db *DB) Metrics() MetricsSnapshot {
 	db.syncIndexGauges()
 	db.syncColcacheMetrics()
 	db.syncBufferPoolMetrics()
+	db.syncCacheMemoryMetrics()
 	return db.metrics.reg.Snapshot()
 }
 
@@ -144,6 +145,35 @@ func (db *DB) syncBufferPoolMetrics() {
 	}
 	if m.bufferpoolBytes != nil {
 		m.bufferpoolBytes.Set(int64(s.Bytes))
+	}
+}
+
+// syncCacheMemoryMetrics sets the unified per-cache memory gauges and the budget-used sum at
+// snapshot time (doc 20 §4.5): gr_cache_memory_bytes{cache} carries one series per cache that
+// accounts its resident bytes today, the buffer pool and the column cache, and
+// gr_cache_budget_used_bytes their sum, the figure an operator reads against the cache budget on a
+// single stacked panel. The values are the same resident-byte counts the per-cache syncs publish,
+// read once more here from the same leaf-locked stats so the unified view matches the
+// gr_bufferpool_memory_bytes and gr_colcache_memory_bytes gauges by construction. Caches without
+// byte accounting yet, the adjacency, plan, catalog, and stats caches, are absent rather than
+// reported as zero, so a cache's series appears only once the cache can measure itself. Reading the
+// stats takes only the leaf locks, never the engine lock, so a long-held write transaction cannot
+// deadlock a snapshot.
+func (db *DB) syncCacheMemoryMetrics() {
+	if db.eng == nil {
+		return
+	}
+	m := db.metrics
+	bufferpool := int64(db.eng.BufferPoolStats().Bytes)
+	column := int64(db.eng.BlockCacheStats().Bytes)
+	if g := m.cacheMemory["bufferpool"]; g != nil {
+		g.Set(bufferpool)
+	}
+	if g := m.cacheMemory["column"]; g != nil {
+		g.Set(column)
+	}
+	if m.cacheBudgetUsed != nil {
+		m.cacheBudgetUsed.Set(bufferpool + column)
 	}
 }
 
@@ -309,6 +339,13 @@ var metricBufferpoolResults = []string{"hit", "miss"}
 // database that has only ever hit still exposes the miss series at zero.
 var metricColcacheResults = []string{"hit", "miss"}
 
+// metricCacheNames is the bounded domain of the cache label on gr_cache_memory_bytes (doc 20
+// §4.5): the caches that account their resident bytes today, the buffer pool of raw pages and the
+// column cache of decoded property blocks. The full §4.5 domain also names the adjacency, plan,
+// catalog, and stats caches; those are left out until each carries a byte count, so the unified
+// panel shows a cache only once the number behind it is real rather than a zero placeholder.
+var metricCacheNames = []string{"bufferpool", "column"}
+
 // metricAuthResults is the bounded domain of the result label on gr_auth_attempts_total (doc 20
 // §3.3): whether an authentication attempt was allowed (ok) or rejected (denied). Both are
 // pre-registered so a server that has only ever seen successes still exposes the denied series at
@@ -385,6 +422,14 @@ type queryMetrics struct {
 	bufferpoolMu         sync.Mutex
 	lastBufferpoolHits   uint64
 	lastBufferpoolMisses uint64
+
+	// cacheMemory holds gr_cache_memory_bytes keyed by cache name, the unified per-cache
+	// resident-memory view (doc 20 §4.5), and cacheBudgetUsed gr_cache_budget_used_bytes, the sum of
+	// those caches' resident bytes. The sync step sets them from the same stats the per-cache syncs
+	// read, so the unified series and the per-cache gauges carry the same numbers. The configured
+	// total budget gauge, gr_cache_budget_bytes, waits on the cache-budget config (doc 14 §11.2).
+	cacheMemory     map[string]*metric.Gauge
+	cacheBudgetUsed *metric.Gauge
 
 	// indexEntryGauges records which index names already have a gr_index_entries computed gauge, so
 	// the sync registers each at most once. The value is unused, only the key (the index name)
@@ -519,6 +564,13 @@ func newQueryMetrics() *queryMetrics {
 		"Frames currently holding a page", "frames", nil)
 	m.bufferpoolBytes = reg.Gauge("gr_bufferpool_memory_bytes",
 		"Memory held by the buffer pool, resident frames times page size", "bytes", nil)
+	m.cacheMemory = make(map[string]*metric.Gauge, len(metricCacheNames))
+	for _, name := range metricCacheNames {
+		m.cacheMemory[name] = reg.Gauge("gr_cache_memory_bytes",
+			"Resident memory per cache, the unified view", "bytes", metric.Labels{"cache": name})
+	}
+	m.cacheBudgetUsed = reg.Gauge("gr_cache_budget_used_bytes",
+		"Sum of all caches' resident memory, against the cache budget", "bytes", nil)
 	for _, r := range metricAuthResults {
 		m.authAttempts[r] = reg.Counter("gr_auth_attempts_total",
 			"Authentication attempts, by result", "attempts", metric.Labels{"result": r})

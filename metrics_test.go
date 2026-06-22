@@ -960,6 +960,38 @@ func TestMetricsBufferPoolAccesses(t *testing.T) {
 	}
 }
 
+func TestMetricsUnifiedCacheMemory(t *testing.T) {
+	db := openMem(t, "mxcachemem.gr")
+	defer db.Close()
+
+	mustExec(t, db, "CREATE (:Person {name: 'a'})", nil)
+	res, err := db.Run(context.Background(), "MATCH (p:Person) RETURN p.name", nil)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	drainResult(t, res)
+
+	snap := db.Metrics()
+	// The buffer pool holds the pages every read and write touched, so its unified series is
+	// live and matches the standalone buffer-pool gauge, the same number by construction.
+	bp := snap.Gauge("gr_cache_memory_bytes", Labels{"cache": "bufferpool"})
+	if bp <= 0 {
+		t.Fatalf("unified bufferpool memory = %d, want > 0", bp)
+	}
+	if standalone := snap.Gauge("gr_bufferpool_memory_bytes", nil); bp != standalone {
+		t.Fatalf("unified bufferpool memory = %d, want %d to match the standalone gauge", bp, standalone)
+	}
+	// The column series matches its standalone gauge too, whatever its current value.
+	col := snap.Gauge("gr_cache_memory_bytes", Labels{"cache": "column"})
+	if standalone := snap.Gauge("gr_colcache_memory_bytes", nil); col != standalone {
+		t.Fatalf("unified column memory = %d, want %d to match the standalone gauge", col, standalone)
+	}
+	// The budget-used sum is exactly the caches that account bytes today.
+	if used := snap.Gauge("gr_cache_budget_used_bytes", nil); used != bp+col {
+		t.Fatalf("budget used = %d, want %d (bufferpool + column)", used, bp+col)
+	}
+}
+
 func TestMetricsConstraintChecks(t *testing.T) {
 	db := openMem(t, "mxcons.gr")
 	defer db.Close()

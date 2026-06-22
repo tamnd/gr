@@ -2,6 +2,7 @@ package pager
 
 import (
 	"hash/crc32"
+	"time"
 
 	"github.com/tamnd/gr/format"
 	"github.com/tamnd/gr/wal"
@@ -42,8 +43,14 @@ func (p *Pager) ReadPage(id format.PageID) (*Frame, error) {
 	// a pread under the hood), so two readers faulting different pages proceed in
 	// parallel.
 	buf := make([]byte, p.pageSize)
+	start := time.Now()
 	if _, err := p.db.ReadAt(buf, int64(id)*int64(p.pageSize)); err != nil {
 		return nil, err
+	}
+	// Time the fault, the device-latency floor under every cache miss (doc 20 §4.2). The observe is a
+	// lock-free atomic add, so it does not serialize the concurrent readers this path is unlocked for.
+	if p.io != nil {
+		p.io.ObservePageRead(time.Since(start).Seconds())
 	}
 	if id != 0 && !verifyPage(buf) {
 		return nil, ErrBadChecksum
@@ -228,11 +235,17 @@ func (p *Pager) Commit() error {
 		return err
 	}
 
-	// Checkpoint: copy the committed images into the database file.
+	// Checkpoint: copy the committed images into the database file, timing each write for the page-write
+	// latency distribution (doc 20 §4.2). The observe is a lock-free atomic add and runs under the engine
+	// write lock the commit already holds, so it adds nothing to the read path.
 	for _, fr := range frames {
 		off := int64(fr.PageID) * int64(p.pageSize)
+		start := time.Now()
 		if _, err := p.db.WriteAt(fr.Image, off); err != nil {
 			return err
+		}
+		if p.io != nil {
+			p.io.ObservePageWrite(time.Since(start).Seconds())
 		}
 	}
 	// Count the images written back, the page write-back volume the checkpoint metrics attribute to a

@@ -1069,6 +1069,35 @@ func TestMetricsWalFsync(t *testing.T) {
 	}
 }
 
+func TestMetricsPageIO(t *testing.T) {
+	fsys := vfs.NewMem()
+	db := openOn(t, fsys, "pageio.gr")
+
+	// Every commit writes its dirty page images back to the file, so a run of creates moves the
+	// page-write latency histogram off zero.
+	for i := 0; i < 50; i++ {
+		mustExec(t, db, "CREATE (:Person {note: 'value'})", nil)
+	}
+	if h := db.Metrics().Histogram("gr_page_write_seconds", nil); h.Count == 0 {
+		t.Fatal("page-write latency has no samples after fifty commits, want the write-back timed")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen on the same media: the observer is live from the first I/O, so the page reads that load the
+	// persisted stores into memory at open are timed. The scan confirms the data survived; the read
+	// samples come from the open-time load, the dominant read I/O this engine does.
+	db2 := openOn(t, fsys, "pageio.gr")
+	defer func() { _ = db2.Close() }()
+	if n := nodeCount(t, db2); n != 50 {
+		t.Fatalf("reopened node count = %d, want 50", n)
+	}
+	if h := db2.Metrics().Histogram("gr_page_read_seconds", nil); h.Count == 0 {
+		t.Fatal("page-read latency has no samples after reopen, want the store-load reads timed")
+	}
+}
+
 func TestMetricsCommits(t *testing.T) {
 	db := openMem(t, "mxcommits.gr")
 	defer db.Close()

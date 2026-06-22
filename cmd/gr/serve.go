@@ -42,6 +42,13 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	readonly := fs.Bool("readonly", false, "open the database read-only")
 	var users userList
 	fs.Var(&users, "user", "name:password[:roles] for HTTP auth (repeatable); roles is a comma list of reader/editor/publisher/admin, default admin; none means auth is off")
+	var jwt jwtOptions
+	fs.StringVar(&jwt.hmacSecret, "jwt-hmac-secret", "", "HS256 shared secret for bearer-token (JWT) auth; selects the JWT provider")
+	fs.StringVar(&jwt.pubKeyPath, "jwt-pubkey", "", "path to a PEM RSA or ECDSA public key for RS256/ES256 bearer-token auth")
+	fs.StringVar(&jwt.issuer, "jwt-issuer", "", "required token issuer (iss claim) for bearer-token auth")
+	fs.StringVar(&jwt.audience, "jwt-audience", "", "required token audience (aud claim) for bearer-token auth")
+	fs.StringVar(&jwt.rolesClaim, "jwt-roles-claim", "", "token claim to read roles from (default roles)")
+	tokenCacheTTL := fs.Duration("auth-token-cache-ttl", 0, "how long a validated bearer token is cached before revalidation (0 uses the default)")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: gr serve [flags] [database]")
 		fmt.Fprintln(stderr)
@@ -62,12 +69,12 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 	}
 	defer func() { _ = db.Close() }()
 
-	auth, err := buildAuth(users)
+	auth, err := buildAuth(users, jwt)
 	if err != nil {
 		fmt.Fprintln(stderr, "gr:", err)
 		return exitUsage
 	}
-	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth})
+	srv := httpd.New(db, httpd.Options{Name: *name, Auth: auth, TokenCacheTTL: *tokenCacheTTL})
 	defer srv.Close()
 	fmt.Fprintf(stderr, "gr serving %s on %s (database %q)\n", describeDB(path), *addr, *name)
 	if auth == nil {
@@ -117,17 +124,43 @@ func openServeDB(path string, readonly bool) (*gr.DB, error) {
 	return gr.Open(path, gr.Options{ReadOnly: readonly})
 }
 
-// buildAuth turns the --user flags into a credential provider, or returns nil when no
-// users were given so authentication is off. The flag is name:password[:roles], where
-// roles is a comma-separated list drawn from reader/editor/publisher/admin (doc 18
-// §10.6); with no roles field a user gets admin, so a single --user keeps full access.
-// A flag with no colon, or an empty name, is a usage error. Because the optional roles
-// field is the third colon-separated part, a password that itself contains a colon must
-// not be combined with an explicit roles field.
-func buildAuth(users userList) (httpd.AuthProvider, error) {
-	if len(users) == 0 {
+// jwtOptions collects the bearer-token (JWT) flags. When any is set, serve runs the JWT
+// provider for the bearer scheme instead of the static basic-credential provider; the two
+// are mutually exclusive, since the server runs one provider at a time (doc 18 §10.7).
+type jwtOptions struct {
+	hmacSecret string
+	pubKeyPath string
+	issuer     string
+	audience   string
+	rolesClaim string
+}
+
+// set reports whether any JWT flag was given.
+func (o jwtOptions) set() bool {
+	return o.hmacSecret != "" || o.pubKeyPath != "" || o.issuer != "" || o.audience != "" || o.rolesClaim != ""
+}
+
+// buildAuth turns the auth flags into a credential provider, or returns nil when none were
+// given so authentication is off. The --user flags select the static basic-credential
+// provider (name:password[:roles], roles a comma list of reader/editor/publisher/admin,
+// default admin so a single --user keeps full access). The --jwt-* flags select the JWT
+// bearer provider instead; the two are mutually exclusive, since the server runs one
+// provider at a time (doc 18 §10.7).
+func buildAuth(users userList, jwt jwtOptions) (httpd.AuthProvider, error) {
+	switch {
+	case jwt.set() && len(users) > 0:
+		return nil, fmt.Errorf("choose one auth provider: --user (basic) or --jwt-* (bearer), not both")
+	case jwt.set():
+		return buildJWT(jwt)
+	case len(users) > 0:
+		return buildStatic(users)
+	default:
 		return nil, nil
 	}
+}
+
+// buildStatic builds the static basic-credential provider from the --user flags.
+func buildStatic(users userList) (httpd.AuthProvider, error) {
 	p := httpd.NewStaticProvider()
 	for _, u := range users {
 		name, pass, roles, err := parseUser(u)
@@ -139,6 +172,33 @@ func buildAuth(users userList) (httpd.AuthProvider, error) {
 		}
 	}
 	return p, nil
+}
+
+// buildJWT builds the bearer-token provider from the --jwt-* flags. A PEM public key path
+// supplies the RS256/ES256 verification key (the kind is detected from the key), and the
+// HMAC secret supplies the HS256 key; at least one must be present.
+func buildJWT(o jwtOptions) (httpd.AuthProvider, error) {
+	cfg := httpd.JWTConfig{
+		Issuer:     o.issuer,
+		Audience:   o.audience,
+		RolesClaim: o.rolesClaim,
+	}
+	if o.hmacSecret != "" {
+		cfg.HMACSecret = []byte(o.hmacSecret)
+	}
+	if o.pubKeyPath != "" {
+		pemBytes, err := os.ReadFile(o.pubKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("read --jwt-pubkey: %w", err)
+		}
+		rsaKey, ecdsaKey, err := httpd.ParsePEMPublicKey(pemBytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse --jwt-pubkey: %w", err)
+		}
+		cfg.RSAPublicKey = rsaKey
+		cfg.ECDSAPublicKey = ecdsaKey
+	}
+	return httpd.NewJWTProvider(cfg)
 }
 
 // parseUser splits a --user flag into its name, password, and roles (doc 18 §10.6). The

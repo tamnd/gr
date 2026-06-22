@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/tamnd/gr/pack"
 	"github.com/tamnd/gr/value"
@@ -333,6 +335,65 @@ func TestSessionGoodbyeCloses(t *testing.T) {
 	// Only HELLO and LOGON replies; GOODBYE ends the loop before the trailing RUN.
 	if !bytes.Equal(tags(reps), []byte{SigSuccess, SigSuccess}) {
 		t.Errorf("reply tags % X, want two successes", tags(reps))
+	}
+}
+
+// recObserver records the protocol events a session reports, for the observer test.
+type recObserver struct {
+	opened   int
+	closed   int
+	lastDur  time.Duration
+	messages []string
+	errors   []string
+	auths    []bool
+}
+
+func (o *recObserver) SessionOpen()                   { o.opened++ }
+func (o *recObserver) SessionClose(dur time.Duration) { o.closed++; o.lastDur = dur }
+func (o *recObserver) Message(t string)               { o.messages = append(o.messages, t) }
+func (o *recObserver) Error(code string)              { o.errors = append(o.errors, code) }
+func (o *recObserver) Auth(ok bool)                   { o.auths = append(o.auths, ok) }
+
+// TestSessionObserver confirms a full session reports its protocol events to the observer
+// (doc 20 §3.3): the session opens and closes once, every dispatched message is named, and the
+// LOGON auth outcome is recorded.
+func TestSessionObserver(t *testing.T) {
+	tx := newFakeTx([]string{"n"}, [][]value.Value{{value.Int(1)}}, Summary{Type: "r"})
+	obs := &recObserver{}
+	srv := &Server{Handler: &fakeHandler{tx: tx}, Observer: obs}
+	conn := clientStream(t, mHello(), mLogon(), mRun("RETURN 1"), mPull(-1))
+	if err := srv.Serve(conn); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	if obs.opened != 1 || obs.closed != 1 {
+		t.Errorf("session open/close = %d/%d, want 1/1", obs.opened, obs.closed)
+	}
+	want := []string{"HELLO", "LOGON", "RUN", "PULL"}
+	if !reflect.DeepEqual(obs.messages, want) {
+		t.Errorf("messages %v, want %v", obs.messages, want)
+	}
+	if len(obs.auths) != 1 || !obs.auths[0] {
+		t.Errorf("auths %v, want one success", obs.auths)
+	}
+	if len(obs.errors) != 0 {
+		t.Errorf("errors %v, want none on a clean session", obs.errors)
+	}
+}
+
+// TestSessionObserverAuthFailure confirms a rejected LOGON reports a failed auth and an
+// unauthorized error to the observer (doc 20 §3.3).
+func TestSessionObserverAuthFailure(t *testing.T) {
+	obs := &recObserver{}
+	srv := &Server{Handler: &fakeHandler{tx: newFakeTx(nil, nil, Summary{}), authErr: errors.New("nope")}, Observer: obs}
+	conn := clientStream(t, mHello(), mLogon())
+	if err := srv.Serve(conn); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	if len(obs.auths) != 1 || obs.auths[0] {
+		t.Errorf("auths %v, want one failure", obs.auths)
+	}
+	if len(obs.errors) == 0 || obs.errors[len(obs.errors)-1] != codeUnauthorized {
+		t.Errorf("errors %v, want a trailing %s", obs.errors, codeUnauthorized)
 	}
 }
 

@@ -170,7 +170,7 @@ func runServe(args []string, stdout, stderr io.Writer, listen func(addr string, 
 		}
 		bh := db.BoltHandler(append(boltAuthOptions(auth), gr.WithBoltAdmission(admission), gr.WithBoltQueryMaxTime(*queryMaxTime), gr.WithBoltRateLimiter(limiter), gr.WithBoltQueryLog(qlog))...)
 		ln := &bolt.Listener{
-			Server:    &bolt.Server{Handler: bh},
+			Server:    &bolt.Server{Handler: bh, Observer: db.BoltObserver()},
 			Addr:      *boltAddr,
 			TLSMode:   mode,
 			TLSConfig: tlsConf,

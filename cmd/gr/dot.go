@@ -73,6 +73,8 @@ func (s *shell) runDot(line string) {
 		s.dotDump(args)
 	case ".load":
 		s.dotLoad(args)
+	case ".import":
+		s.dotImport(args)
 	case ".export":
 		s.dotExport(args)
 	case ".save":
@@ -113,6 +115,8 @@ func (s *shell) dotHelp() {
 .dump [FILE]          Write a Cypher dump of the database (--schema-only,
                       --data-only); no FILE writes to the output sink
 .load FILE            Replay a Cypher dump into the database
+.import FILE OPTS     Import CSV/TSV rows as nodes (--as LABEL, --id-col,
+                      --type COL:TYPE, --merge, --no-header)
 .export OPTS          Export nodes, relationships, or a query to CSV/TSV
                       (--nodes L | --rels T | --query Q) --to FILE
 .backup FILE          Write a consistent physical backup to FILE
@@ -399,7 +403,7 @@ func suggestDot(cmd string) string {
 		".echo", ".nullvalue", ".separator", ".output", ".once", ".read",
 		".begin", ".commit", ".rollback", ".open", ".labels", ".types",
 		".indexes", ".schema", ".databases", ".info", ".dump", ".load",
-		".export", ".backup", ".restore", ".save", ".print",
+		".import", ".export", ".backup", ".restore", ".save", ".print",
 	}
 	for _, k := range known {
 		if near(cmd, k) {

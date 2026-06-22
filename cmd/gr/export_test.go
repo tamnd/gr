@@ -120,6 +120,61 @@ func TestExportImportRelinkRoundTrip(t *testing.T) {
 	}
 }
 
+// TestExportTypedHeader confirms --typed-header annotates property columns with their
+// types (doc 19 §6.1), so the file re-imports with its types without --type.
+func TestExportTypedHeader(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.gr")
+	out := filepath.Join(dir, "people.csv")
+	seedDB(t, src)
+
+	if _, errb, code := runCLI(t, []string{"export", src, "--nodes", "Person", "--typed-header", "--to", out}, ""); code != exitOK {
+		t.Fatalf("export: code=%d stderr=%q", code, errb)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if lines[0] != "_id,age:long,name:string" {
+		t.Errorf("typed header = %q, want _id,age:long,name:string", lines[0])
+	}
+}
+
+// TestTypedHeaderRoundTrip confirms a --typed-header export re-imports with its types and
+// no --type flag (doc 19 §6), for both node and relationship files.
+func TestTypedHeaderRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.gr")
+	dst := filepath.Join(dir, "dst.gr")
+	nodes := filepath.Join(dir, "nodes.csv")
+	rels := filepath.Join(dir, "rels.csv")
+	seedDB(t, src)
+
+	if _, _, code := runCLI(t, []string{"export", src, "--nodes", "Person", "--typed-header", "--to", nodes}, ""); code != exitOK {
+		t.Fatalf("export nodes: code=%d", code)
+	}
+	if _, _, code := runCLI(t, []string{"export", src, "--rels", "KNOWS",
+		"--from-property", "name", "--to-property", "name", "--typed-header", "--to", rels}, ""); code != exitOK {
+		t.Fatalf("export rels: code=%d", code)
+	}
+	if _, _, code := runCLI(t, []string{"import", dst, nodes, "--as", "Person", "--id-col", "name"}, ""); code != exitOK {
+		t.Fatalf("import nodes: code=%d", code)
+	}
+	if _, _, code := runCLI(t, []string{"import", dst, rels, "--as-rel", "KNOWS",
+		"--from", "Person:_start", "--to", "Person:_end", "--id-col", "name"}, ""); code != exitOK {
+		t.Fatalf("import rels: code=%d", code)
+	}
+	age, _, _ := runCLI(t, []string{dst, "--mode", "jsonl", "-c", "MATCH (p:Person {name:'Ada'}) RETURN p.age AS age"}, "")
+	if !strings.Contains(age, `"age":36`) {
+		t.Errorf("age not an integer after typed round trip: %s", age)
+	}
+	since, _, _ := runCLI(t, []string{dst, "--mode", "jsonl", "-c", "MATCH ()-[r:KNOWS]->() RETURN r.since AS since"}, "")
+	if !strings.Contains(since, `"since":2019`) {
+		t.Errorf("since not an integer after typed round trip: %s", since)
+	}
+}
+
 // TestExportQueryCSV confirms gr export --query writes the query result with the query's
 // own column names (doc 17 §6.11).
 func TestExportQueryCSV(t *testing.T) {

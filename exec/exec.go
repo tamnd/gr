@@ -351,7 +351,7 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		return &joinOp{on: x.On, left: left, right: right}, nil, nil
+		return &joinOp{on: x.On, left: left, right: right, rightPlan: x.Right}, nil, nil
 	case *plan.Optional:
 		input, err := compile(x.Input)
 		if err != nil {

@@ -164,6 +164,10 @@ type queryMetrics struct {
 	txOpen     map[string]*metric.Gauge              // gr_transactions_open by [mode]
 	txTotal    map[string]map[string]*metric.Counter // gr_transactions_total by [mode][outcome]
 	txDuration map[string]*metric.Histogram          // gr_transaction_duration_seconds by [mode]
+
+	shortestPath *metric.Counter // gr_shortest_path_total
+	wcoj         *metric.Counter // gr_wcoj_total
+	binaryJoin   *metric.Counter // gr_binary_join_total
 }
 
 // newQueryMetrics builds the registry and pre-resolves every query-metric handle (doc 20
@@ -245,6 +249,12 @@ func newQueryMetrics() *queryMetrics {
 		"Queries that waited in the admission queue before executing", "queries", nil)
 	m.queueWait = reg.Histogram("gr_query_queue_wait_seconds",
 		"Time a query waited in the admission queue before starting", "seconds", queryLatencyBuckets, nil)
+	m.shortestPath = reg.Counter("gr_shortest_path_total",
+		"Shortest-path searches executed", "searches", nil)
+	m.wcoj = reg.Counter("gr_wcoj_total",
+		"Worst-case-optimal joins executed (cyclic-pattern evaluation)", "joins", nil)
+	m.binaryJoin = reg.Counter("gr_binary_join_total",
+		"Binary hash joins executed (tree-pattern evaluation)", "joins", nil)
 	m.returned = reg.Histogram("gr_query_rows_returned",
 		"Rows in the result set, the output cardinality", "rows", rowCountBuckets, nil)
 	m.scanned = reg.Histogram("gr_query_rows_scanned",
@@ -510,6 +520,30 @@ func (db *DB) measureQuery(kind string, start time.Time, res *Result, err error)
 	}
 	db.metrics.finish(kind, "ok", time.Since(start))
 	return res, nil
+}
+
+// graphObserver implements exec.GraphObserver against the query metrics (doc 20 §6): it counts a
+// shortest-path search, a worst-case-optimal join, and a binary hash join as the operators that
+// run them open. One observer value serves every execution against a database, since it holds only
+// the shared metric handles and each method is a single atomic add.
+type graphObserver struct{ m *queryMetrics }
+
+func (g graphObserver) ShortestPath() {
+	if g.m.shortestPath != nil {
+		g.m.shortestPath.Inc()
+	}
+}
+
+func (g graphObserver) WCOJ() {
+	if g.m.wcoj != nil {
+		g.m.wcoj.Inc()
+	}
+}
+
+func (g graphObserver) BinaryJoin() {
+	if g.m.binaryJoin != nil {
+		g.m.binaryJoin.Inc()
+	}
 }
 
 // scanLoad reads a scan counter, treating a nil counter (a result with no execution, such as a

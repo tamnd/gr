@@ -40,6 +40,7 @@ type intersectLeg struct {
 
 func (o *intersectOp) open(ctx *Ctx) error {
 	o.ctx, o.out, o.pos = ctx, nil, 0
+	ctx.countWCOJ()
 	for i := range o.spec.Legs {
 		tok, allow, none := resolveTypes(o.spec.Legs[i].Types)
 		o.leg[i] = intersectLeg{tok: tok, allow: allow, noType: none, dir: toEngineDir(o.spec.Legs[i].Dir)}

@@ -454,6 +454,85 @@ func TestMetricsTxOutcomeMapping(t *testing.T) {
 	}
 }
 
+// TestMetricsGraphOperators confirms the graph-operator counters increment when their operators
+// run: a disconnected pattern is a binary join, and a shortestPath query is a shortest-path
+// search (doc 20 §6).
+func TestMetricsGraphOperators(t *testing.T) {
+	db, err := Open("mg.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Seed a small graph: a KNOWS path a -> b -> c and a node of another label.
+	for _, q := range []string{
+		"CREATE (a:Person {name: 'a'})-[:KNOWS]->(b:Person {name: 'b'})-[:KNOWS]->(c:Person {name: 'c'})",
+		"CREATE (:Movie {title: 'm'})",
+	} {
+		if _, err := db.Run(context.Background(), q, nil); err != nil {
+			t.Fatalf("seed %q: %v", q, err)
+		}
+	}
+
+	// A disconnected pattern joins the two legs with a binary hash join.
+	rj, err := db.Run(context.Background(), "MATCH (p:Person), (m:Movie) RETURN p, m", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainResult(t, rj)
+	if c := db.Metrics().Counter("gr_binary_join_total", nil); c != 1 {
+		t.Errorf("binary joins = %d, want 1", c)
+	}
+
+	// A shortestPath query runs the dedicated shortest-path operator.
+	rs, err := db.Run(context.Background(),
+		"MATCH p = shortestPath((a:Person {name: 'a'})-[:KNOWS*]->(c:Person {name: 'c'})) RETURN length(p) AS len", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainResult(t, rs)
+	if c := db.Metrics().Counter("gr_shortest_path_total", nil); c != 1 {
+		t.Errorf("shortest-path searches = %d, want 1", c)
+	}
+}
+
+// TestMetricsWcoj confirms the worst-case-optimal-join counter increments when the cost model
+// rewrites a triangle's closing expand into an Intersect. The rewrite only engages with a
+// non-trivial average degree, so the graph is seeded dense enough to make the binary plan's
+// intermediate dwarf the closing matches (doc 20 §6).
+func TestMetricsWcoj(t *testing.T) {
+	db, err := Open("mwcoj.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	for i := 0; i < 12; i++ {
+		if _, err := db.Run(ctx, "CREATE (:Person {id: $i})", map[string]any{"i": i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 12; i++ {
+		for k := 1; k <= 5; k++ {
+			if _, err := db.Run(ctx,
+				"MATCH (x:Person {id: $a}), (y:Person {id: $b}) CREATE (x)-[:KNOWS]->(y)",
+				map[string]any{"a": i, "b": (i + k) % 12}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	r, err := db.Run(ctx, "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c)-[:KNOWS]->(a) RETURN a", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainResult(t, r)
+	if c := db.Metrics().Counter("gr_wcoj_total", nil); c != 1 {
+		t.Errorf("worst-case-optimal joins = %d, want 1", c)
+	}
+}
+
 // TestMetricsAlwaysOn confirms the registry exists on a plain Open with no logging configured,
 // so the metrics plane is always on (doc 20 §1.2).
 func TestMetricsAlwaysOn(t *testing.T) {

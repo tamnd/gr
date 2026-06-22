@@ -73,6 +73,24 @@ type Ctx struct {
 	// parallel aggregate, shares the one counter; nil means no caller asked for the count
 	// and the operators skip the add.
 	Scanned *atomic.Int64
+	// Graph receives the graph-operator execution events the graph-specific metrics count (doc
+	// 20 §6): a shortest-path search, a worst-case-optimal join, a binary hash join. The graph
+	// operators report through it as they open; the library wires it to the metric registry. It
+	// is nil for an uninstrumented run, where the report is a nil check and nothing more.
+	Graph GraphObserver
+}
+
+// GraphObserver receives graph-operator execution events for the graph-specific metric catalogue
+// (doc 20 §6). The executor calls these as the operators open, once per operator execution, so
+// the implementation only counts; it does no work on the row hot path. A nil GraphObserver on the
+// Ctx disables the reporting, the embedded default.
+type GraphObserver interface {
+	// ShortestPath reports that a dedicated shortest-path search executed (doc 20 §6.1).
+	ShortestPath()
+	// WCOJ reports that a worst-case-optimal join (cyclic-pattern intersection) executed (§6.3).
+	WCOJ()
+	// BinaryJoin reports that a binary hash join (tree-pattern join) executed (§6.3).
+	BinaryJoin()
 }
 
 // countScan adds n to the scanned-rows counter when one is armed (doc 20 §3.1). It is the
@@ -82,6 +100,27 @@ type Ctx struct {
 func (c *Ctx) countScan(n int64) {
 	if c.Scanned != nil {
 		c.Scanned.Add(n)
+	}
+}
+
+// countShortestPath, countWCOJ, and countBinaryJoin report one graph-operator execution to the
+// observer when one is wired (doc 20 §6). Each is the single place its operator reports, called
+// once as the operator opens; with no observer set they are a nil check and nothing more.
+func (c *Ctx) countShortestPath() {
+	if c.Graph != nil {
+		c.Graph.ShortestPath()
+	}
+}
+
+func (c *Ctx) countWCOJ() {
+	if c.Graph != nil {
+		c.Graph.WCOJ()
+	}
+}
+
+func (c *Ctx) countBinaryJoin() {
+	if c.Graph != nil {
+		c.Graph.BinaryJoin()
 	}
 }
 

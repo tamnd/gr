@@ -40,6 +40,7 @@ type shortestPathOp struct {
 
 func (o *shortestPathOp) open(ctx *Ctx) error {
 	o.ctx, o.out, o.pos = ctx, nil, 0
+	ctx.countShortestPath()
 	o.relTok, o.allow, o.noType = resolveTypes(o.spec.Types)
 	if o.spec.VarLen != nil {
 		o.min, o.max = normVarLen(o.spec.VarLen)

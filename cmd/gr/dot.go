@@ -119,7 +119,8 @@ func (s *shell) dotHelp() {
                       relationships (--as-rel TYPE --from L:COL --to L:COL);
                       --id-col, --type COL:TYPE, --merge, --no-header
 .export OPTS          Export nodes, relationships, or a query to CSV/TSV
-                      (--nodes L | --rels T | --query Q) --to FILE
+                      (--nodes L | --rels T | --query Q) --to FILE;
+                      --from-property/--to-property relink a --rels export
 .backup FILE          Write a consistent physical backup to FILE
 .restore FILE [--force]  Replace the database from a physical backup
 .save FILE            Write the database to FILE as a standalone .gr file

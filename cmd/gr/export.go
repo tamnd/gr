@@ -24,6 +24,8 @@ type exportOptions struct {
 	header    bool
 	separator string
 	idCol     string // the emitted node id column name (default _id)
+	fromProp  string // --from-property: emit this start-node property as _start (relink)
+	toProp    string // --to-property: emit this end-node property as _end (relink)
 }
 
 // parseExportArgs parses the export flags shared by the dot-command and the subcommand
@@ -56,6 +58,10 @@ func parseExportArgs(args []string) (exportOptions, error) {
 			opt.separator, err = next()
 		case "--id-col":
 			opt.idCol, err = next()
+		case "--from-property":
+			opt.fromProp, err = next()
+		case "--to-property":
+			opt.toProp, err = next()
 		case "--header":
 			opt.header = true
 		case "--no-header":
@@ -82,6 +88,9 @@ func parseExportArgs(args []string) (exportOptions, error) {
 	}
 	if opt.to == "" {
 		return opt, fmt.Errorf("--to FILE is required")
+	}
+	if (opt.fromProp != "" || opt.toProp != "") && opt.rels == "" {
+		return opt, fmt.Errorf("--from-property and --to-property apply to --rels only")
 	}
 	opt.format = resolveFormat(opt.format, opt.to)
 	if opt.format != "csv" && opt.format != "tsv" {
@@ -241,10 +250,14 @@ func exportNodes(tx *gr.Tx, opt exportOptions, d *delimited) (int, error) {
 
 // exportRels writes every relationship of a type as a row of its endpoint ids and
 // properties (doc 17 §6.11). The columns are _start, _end, then the union of property
-// keys, the convention an import reads back with --from/--to.
+// keys, the convention an import reads back with --from/--to. By default _start/_end
+// carry the opaque endpoint element ids (good for inspection); with --from-property and
+// --to-property they carry a chosen endpoint property instead, so the file relinks
+// through `gr import --as-rel` (doc 19 §7.3) against nodes a node import established.
 func exportRels(tx *gr.Tx, opt exportOptions, d *delimited) (int, error) {
-	q := "MATCH ()-[r:" + quoteIdent(opt.rels) + "]->() RETURN r"
-	keys, err := collectKeys(tx, q, func(rec *gr.Record) ([]string, error) {
+	relink := opt.fromProp != "" && opt.toProp != ""
+	keyQ := "MATCH ()-[r:" + quoteIdent(opt.rels) + "]->() RETURN r"
+	keys, err := collectKeys(tx, keyQ, func(rec *gr.Record) ([]string, error) {
 		rel, err := rec.GetRelationship("r")
 		if err != nil {
 			return nil, err
@@ -257,6 +270,10 @@ func exportRels(tx *gr.Tx, opt exportOptions, d *delimited) (int, error) {
 	if opt.header {
 		d.writeRow(append([]string{"_start", "_end"}, keys...))
 	}
+	q := keyQ
+	if relink {
+		q = "MATCH (a)-[r:" + quoteIdent(opt.rels) + "]->(b) RETURN a, b, r"
+	}
 	r, err := tx.Run(context.Background(), q, nil)
 	if err != nil {
 		return 0, err
@@ -268,8 +285,14 @@ func exportRels(tx *gr.Tx, opt exportOptions, d *delimited) (int, error) {
 		if err != nil {
 			return n, err
 		}
+		start, end := rel.StartElementId(), rel.EndElementId()
+		if relink {
+			if start, end, err = endpointProps(r.Record(), opt); err != nil {
+				return n, err
+			}
+		}
 		cells := make([]string, 0, len(keys)+2)
-		cells = append(cells, rel.StartElementId(), rel.EndElementId())
+		cells = append(cells, start, end)
 		for _, k := range keys {
 			v, _ := rel.Get(k)
 			cells = append(cells, renderText(v, ""))
@@ -278,6 +301,22 @@ func exportRels(tx *gr.Tx, opt exportOptions, d *delimited) (int, error) {
 		n++
 	}
 	return n, r.Err()
+}
+
+// endpointProps reads the start and end node properties named by --from-property and
+// --to-property from a relink export row, rendered as text for the _start/_end cells.
+func endpointProps(rec *gr.Record, opt exportOptions) (string, string, error) {
+	a, err := rec.GetNode("a")
+	if err != nil {
+		return "", "", err
+	}
+	b, err := rec.GetNode("b")
+	if err != nil {
+		return "", "", err
+	}
+	av, _ := a.Get(opt.fromProp)
+	bv, _ := b.Get(opt.toProp)
+	return renderText(av, ""), renderText(bv, ""), nil
 }
 
 // collectKeys scans a query once and returns the sorted union of the property keys the
@@ -332,7 +371,7 @@ func (s *shell) dotExport(args []string) {
 // read-only and writes the selected nodes, relationships, or query result to a file.
 func runExportCmd(args []string, stdout, stderr io.Writer) int {
 	if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
-		fmt.Fprintln(stderr, "Usage: gr export DATABASE (--nodes LABEL | --rels TYPE | --query CYPHER) --to FILE [--format csv|tsv] [--no-header]")
+		fmt.Fprintln(stderr, "Usage: gr export DATABASE (--nodes LABEL | --rels TYPE | --query CYPHER) --to FILE [--format csv|tsv] [--no-header] [--from-property COL --to-property COL]")
 		return exitUsage
 	}
 	if len(args) < 1 {

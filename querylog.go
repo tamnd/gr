@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -226,4 +227,18 @@ func elementType(xs []any) string {
 func hashParam(v any) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%v", v)))
 	return "sha256:" + hex.EncodeToString(sum[:6])
+}
+
+// queryStatus maps an execution error to a query-log status (doc 20 §10.2): no error is
+// "ok", a context deadline is "timeout" so the cancelled or slow tail is distinguishable,
+// and any other failure is "error".
+func queryStatus(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	default:
+		return "error"
+	}
 }

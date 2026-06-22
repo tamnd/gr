@@ -73,6 +73,10 @@ func (s *shell) runDot(line string) {
 		s.dotDump(args)
 	case ".load":
 		s.dotLoad(args)
+	case ".save":
+		s.dotSave(args)
+	case ".backup":
+		s.dotBackup(args)
 	case ".print":
 		fmt.Fprintln(s.sink(), strings.Join(args, " "))
 	default:
@@ -105,6 +109,8 @@ func (s *shell) dotHelp() {
 .dump [FILE]          Write a Cypher dump of the database (--schema-only,
                       --data-only); no FILE writes to the output sink
 .load FILE            Replay a Cypher dump into the database
+.backup FILE          Write a consistent physical backup to FILE
+.save FILE            Write the database to FILE as a standalone .gr file
 .timer on|off         Show wall-clock timing after each statement
 .echo on|off          Echo each statement before running it
 .print TEXT           Print TEXT to the output
@@ -385,7 +391,8 @@ func suggestDot(cmd string) string {
 		".help", ".quit", ".exit", ".version", ".mode", ".headers", ".timer",
 		".echo", ".nullvalue", ".separator", ".output", ".once", ".read",
 		".begin", ".commit", ".rollback", ".open", ".labels", ".types",
-		".indexes", ".schema", ".databases", ".info", ".dump", ".load", ".print",
+		".indexes", ".schema", ".databases", ".info", ".dump", ".load",
+		".backup", ".save", ".print",
 	}
 	for _, k := range known {
 		if near(cmd, k) {

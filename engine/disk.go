@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"io"
 	"slices"
 	"sync"
 
@@ -472,6 +473,17 @@ func (e *DiskEngine) Checkpoint() error {
 	}
 	e.ov.GC(e.oracle.Watermark())
 	return nil
+}
+
+// Backup writes a consistent physical image of the database to w and returns the
+// number of bytes written (doc 17 §6.13, doc 19 §15). It takes the engine's
+// exclusive lock for the copy, so no write transaction lands mid-image and the
+// page image is the single committed snapshot the lock pins; the result is a
+// standalone .gr file that opens directly.
+func (e *DiskEngine) Backup(w io.Writer) (int64, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.p.CopyImage(w)
 }
 
 // PageSize returns the file's page size in bytes, the value the library surface

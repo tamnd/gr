@@ -89,6 +89,13 @@ type DiskEngine struct {
 	// index gauges use.
 	fileSizeBytes atomic.Uint64
 
+	// freelistPages holds the number of reusable pages on the free list, published the same way as
+	// fileSizeBytes (under the engine lock at open and after a write commit) and read lock-free for
+	// the gr_freelist_pages gauge (doc 20 §4.2). The free list changes only on the write path, so a
+	// commit-time refresh keeps it current, and computing it there walks the trunk chain under the
+	// write lock where no reader runs, which the metrics snapshot path must not do itself.
+	freelistPages atomic.Uint64
+
 	// bc fronts the segmented-base read with decoded segments, so a repeated point
 	// read in a segment does not re-decode it (doc 14 §4). It is an in-memory cache,
 	// never a source of truth: every cached segment carries the checkpoint epoch it
@@ -125,6 +132,7 @@ func Open(fsys vfs.VFS, path string, opt pager.Options) (*DiskEngine, error) {
 	}
 	e.oracle = mvcc.NewOracle(p.Header().ChangeCounter)
 	e.publishFileSize()
+	e.publishFreelistPages()
 	return e, nil
 }
 
@@ -141,6 +149,22 @@ func (e *DiskEngine) publishFileSize() {
 // publishFileSize maintains (doc 20 §4.2). It never takes the engine lock, so the metrics snapshot
 // path calls it freely even while a write transaction holds the lock.
 func (e *DiskEngine) FileSizeBytes() int64 { return int64(e.fileSizeBytes.Load()) }
+
+// publishFreelistPages refreshes the lock-free free-page count the gr_freelist_pages gauge reads
+// (doc 20 §4.2). It walks the free-list trunk chain, which reads pages, so it runs only where the
+// caller holds the engine lock (open before the engine is shared, or a write commit) and no reader
+// is faulting pages. A walk error leaves the previous value rather than failing the commit, since
+// the data is already durable and a stale metric is better than a lost commit.
+func (e *DiskEngine) publishFreelistPages() {
+	if n, err := e.p.FreeCount(); err == nil {
+		e.freelistPages.Store(n)
+	}
+}
+
+// FreelistPages returns the number of reusable pages on the free list, read lock-free from the
+// atomic publishFreelistPages maintains (doc 20 §4.2). It never takes the engine lock, so the
+// metrics snapshot path calls it freely even while a write transaction holds the lock.
+func (e *DiskEngine) FreelistPages() int64 { return int64(e.freelistPages.Load()) }
 
 // load (re)builds the store handles over the current pager state, creating the
 // stores when fresh and opening them otherwise. It is also used to rebuild state
@@ -1254,9 +1278,11 @@ func (t *diskTx) Commit() error {
 	if err != nil {
 		return err
 	}
-	// The pager commit may have grown or truncated the file, so refresh the published size for
-	// the gr_file_size_bytes gauge while the write lock is still held (doc 20 §4.2).
+	// The pager commit may have grown or truncated the file and changed the free list, so refresh
+	// the published size and free-page count for their gauges while the write lock is still held
+	// (doc 20 §4.2).
 	t.e.publishFileSize()
+	t.e.publishFreelistPages()
 	// Publish pre-images at the commit sequence (durable-before-visible: the
 	// pager commit above is the durability point, this publication the visibility
 	// point). Older snapshots now resolve the retained values; newer ones read

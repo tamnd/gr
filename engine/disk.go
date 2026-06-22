@@ -82,6 +82,13 @@ type DiskEngine struct {
 	idxCounts atomic.Pointer[map[string]uint64]
 	idxBytes  atomic.Pointer[map[string]uint64]
 
+	// fileSizeBytes holds the durable size of the main file, published under the engine lock at open
+	// and after every write commit (the only points the size changes) and read lock-free for the
+	// gr_file_size_bytes gauge (doc 20 §4.2). Publishing where the writer already holds the lock and
+	// reading the atomic keeps the metrics snapshot off the engine lock, the same discipline the
+	// index gauges use.
+	fileSizeBytes atomic.Uint64
+
 	// bc fronts the segmented-base read with decoded segments, so a repeated point
 	// read in a segment does not re-decode it (doc 14 §4). It is an in-memory cache,
 	// never a source of truth: every cached segment carries the checkpoint epoch it
@@ -117,8 +124,23 @@ func Open(fsys vfs.VFS, path string, opt pager.Options) (*DiskEngine, error) {
 		}
 	}
 	e.oracle = mvcc.NewOracle(p.Header().ChangeCounter)
+	e.publishFileSize()
 	return e, nil
 }
+
+// publishFileSize stores the durable file size into the lock-free atomic the gr_file_size_bytes
+// gauge reads (doc 20 §4.2). The size is the page count times the page size, the value Commit
+// truncates the file to, and it changes only at open and at a write commit, so publishing at those
+// points keeps the gauge current. It is called while the caller holds the engine lock (or at open,
+// before the engine is shared), so reading the header here does not race a writer.
+func (e *DiskEngine) publishFileSize() {
+	e.fileSizeBytes.Store(uint64(e.p.Header().PageCount) * uint64(e.p.PageSize()))
+}
+
+// FileSizeBytes returns the durable size of the main file in bytes, read lock-free from the atomic
+// publishFileSize maintains (doc 20 §4.2). It never takes the engine lock, so the metrics snapshot
+// path calls it freely even while a write transaction holds the lock.
+func (e *DiskEngine) FileSizeBytes() int64 { return int64(e.fileSizeBytes.Load()) }
 
 // load (re)builds the store handles over the current pager state, creating the
 // stores when fresh and opening them otherwise. It is also used to rebuild state
@@ -1232,6 +1254,9 @@ func (t *diskTx) Commit() error {
 	if err != nil {
 		return err
 	}
+	// The pager commit may have grown or truncated the file, so refresh the published size for
+	// the gr_file_size_bytes gauge while the write lock is still held (doc 20 §4.2).
+	t.e.publishFileSize()
 	// Publish pre-images at the commit sequence (durable-before-visible: the
 	// pager commit above is the durability point, this publication the visibility
 	// point). Older snapshots now resolve the retained values; newer ones read

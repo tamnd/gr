@@ -226,6 +226,11 @@ func Open(path string, opt Options) (*DB, error) {
 	// reopened database with indexes exposes their sizes from the first scrape. New indexes register
 	// lazily on the next snapshot.
 	db.syncIndexGauges()
+	// The on-disk footprint is a single computed gauge reading the size the engine publishes under
+	// its lock at open and each commit (doc 20 §4.2), so the read is lock-free and the value tracks
+	// the file growing without the write path touching the registry.
+	db.metrics.reg.ComputedGauge("gr_file_size_bytes",
+		"Current size of the main .gr file", "bytes", nil, func() int64 { return db.eng.FileSizeBytes() })
 	// The open event reports the file's real geometry and whether this open recovered a
 	// committed WAL prefix after a crash (doc 20 §11.3). StorageInfo reads the header the
 	// engine just mounted, so the format version and page size are the file's own.

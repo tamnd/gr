@@ -51,7 +51,40 @@ const (
 // server renders the same registry as Prometheus text and expvar JSON.
 func (db *DB) Metrics() MetricsSnapshot {
 	db.syncIndexGauges()
+	db.syncColcacheMetrics()
 	return db.metrics.reg.Snapshot()
+}
+
+// syncColcacheMetrics mirrors the property-block cache's cumulative counts into the registry at
+// snapshot time (doc 20 §4.4): it advances gr_colcache_accesses_total by the hits and misses
+// since the last sync and sets the resident-block and memory gauges to the current population. The
+// cache owns the authoritative counts, bumped under its own lock on the read path, so the write
+// path never touches the registry; this bridge runs only on a scrape. The delta add keeps the
+// counter monotonic, and colcacheMu serializes two concurrent scrapes so neither double-counts.
+// Reading the stats takes only the cache's lock, never the engine lock, so a long-held write
+// transaction cannot deadlock a snapshot.
+func (db *DB) syncColcacheMetrics() {
+	if db.eng == nil {
+		return
+	}
+	s := db.eng.BlockCacheStats()
+	m := db.metrics
+	m.colcacheMu.Lock()
+	if c := m.colcacheAccesses["hit"]; c != nil && s.Hits > m.lastColcacheHits {
+		c.Add(s.Hits - m.lastColcacheHits)
+		m.lastColcacheHits = s.Hits
+	}
+	if c := m.colcacheAccesses["miss"]; c != nil && s.Misses > m.lastColcacheMisses {
+		c.Add(s.Misses - m.lastColcacheMisses)
+		m.lastColcacheMisses = s.Misses
+	}
+	m.colcacheMu.Unlock()
+	if m.colcacheBlocks != nil {
+		m.colcacheBlocks.Set(int64(s.Blocks))
+	}
+	if m.colcacheBytes != nil {
+		m.colcacheBytes.Set(int64(s.Bytes))
+	}
 }
 
 // syncIndexGauges ensures the per-index computed gauges exist for every declared index (doc 20 §6.4),
@@ -227,6 +260,13 @@ var metricConstraintKinds = []string{"unique", "exists", "type"}
 // is the data-quality signal, the share of writes the schema turned away.
 var metricConstraintResults = []string{"pass", "violation"}
 
+// metricColcacheResults is the bounded domain of the result label on gr_colcache_accesses_total
+// (doc 20 §4.4): whether a property-block lookup found the decoded vector resident (hit) or had to
+// decode the segment (miss). The hit rate, hit / (hit + miss), is the property-read warmth, the
+// analytical-scan counterpart to the buffer-pool hit rate. Both series are pre-registered so a
+// database that has only ever hit still exposes the miss series at zero.
+var metricColcacheResults = []string{"hit", "miss"}
+
 // metricAuthResults is the bounded domain of the result label on gr_auth_attempts_total (doc 20
 // §3.3): whether an authentication attempt was allowed (ok) or rejected (denied). Both are
 // pre-registered so a server that has only ever seen successes still exposes the denied series at
@@ -276,6 +316,20 @@ type queryMetrics struct {
 	constraintChecks map[constraintCheckKey]*metric.Counter
 
 	indexLookupSeconds map[string]*metric.Histogram // gr_index_lookup_seconds by [kind]
+
+	// colcacheAccesses holds gr_colcache_accesses_total keyed by result (hit, miss), and
+	// colcacheBlocks and colcacheBytes the resident-population gauges. The cache itself owns the
+	// authoritative cumulative counts; the sync step mirrors them into these registry series at
+	// snapshot time, so the read path never touches the registry (doc 20 §4.4). colcacheMu guards
+	// the mirror so two concurrent scrapes do not double-count, and lastColcacheHits and
+	// lastColcacheMisses hold the last mirrored cumulative values, the basis for the delta add that
+	// keeps the registry counter monotonic.
+	colcacheAccesses   map[string]*metric.Counter
+	colcacheBlocks     *metric.Gauge
+	colcacheBytes      *metric.Gauge
+	colcacheMu         sync.Mutex
+	lastColcacheHits   uint64
+	lastColcacheMisses uint64
 
 	// indexEntryGauges records which index names already have a gr_index_entries computed gauge, so
 	// the sync registers each at most once. The value is unused, only the key (the index name)
@@ -390,7 +444,17 @@ func newQueryMetrics() *queryMetrics {
 			len(metricConstraintKinds)*len(metricConstraintResults)),
 
 		indexLookupSeconds: make(map[string]*metric.Histogram, len(metricIndexKinds)),
+
+		colcacheAccesses: make(map[string]*metric.Counter, len(metricColcacheResults)),
 	}
+	for _, r := range metricColcacheResults {
+		m.colcacheAccesses[r] = reg.Counter("gr_colcache_accesses_total",
+			"Property-block cache lookups, by result", "accesses", metric.Labels{"result": r})
+	}
+	m.colcacheBlocks = reg.Gauge("gr_colcache_blocks_resident",
+		"Decoded property blocks currently cached", "blocks", nil)
+	m.colcacheBytes = reg.Gauge("gr_colcache_memory_bytes",
+		"Memory held by decoded property blocks", "bytes", nil)
 	for _, r := range metricAuthResults {
 		m.authAttempts[r] = reg.Counter("gr_auth_attempts_total",
 			"Authentication attempts, by result", "attempts", metric.Labels{"result": r})

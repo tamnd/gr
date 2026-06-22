@@ -123,6 +123,14 @@ func (e *DiskEngine) segGet(base *colsegstore.Store, colID, key uint32, pos uint
 	return cellAt(cells, pos-firstPos)
 }
 
+// BlockCacheStats returns the property-block cache's cumulative lookup outcomes and resident
+// population (doc 20 §4.4), the numbers the column-cache metrics expose. It reads only the
+// cache's own lock, never the engine lock, so the metrics snapshot path calls it freely even
+// while a write transaction holds the engine lock.
+func (e *DiskEngine) BlockCacheStats() blockcache.Stats {
+	return e.bc.Stats()
+}
+
 // cellAt reads the cell at a within-segment offset, resolving an out-of-range or
 // absent cell to (Null, false), the same convention as colsegstore.Get.
 func cellAt(cells []colseg.Cell, i uint64) (value.Value, bool, error) {

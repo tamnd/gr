@@ -91,6 +91,23 @@ type Cache struct {
 	entries  map[Key]*list.Element
 	ring     *list.List    // CLOCK ring of *entry
 	hand     *list.Element // the next element the sweep will examine
+
+	// hits and misses are the cumulative lookup outcomes since the cache was created, the
+	// property-read warmth signal (doc 20 §4.4). They are bumped under mu on the value-lookup
+	// paths (GetDecoded, GetCompressed), so a snapshot reads a consistent pair under the one
+	// lock the cache already holds, and the engine never touches the metric registry from here.
+	hits   uint64
+	misses uint64
+}
+
+// Stats is a point-in-time view of the cache's lookup outcomes and resident population (doc 20
+// §4.4), the numbers the column-cache metrics expose. Hits and Misses are cumulative since the
+// cache was created; Blocks and Bytes are the current resident counts the budget bounds.
+type Stats struct {
+	Hits   uint64
+	Misses uint64
+	Blocks int
+	Bytes  int
 }
 
 // New creates a property-block cache bounded to maxBytes of value memory. A maxBytes
@@ -116,9 +133,11 @@ func (c *Cache) GetDecoded(k Key, version uint64) (any, bool) {
 	defer c.mu.Unlock()
 	e, ok := c.live(k, version)
 	if !ok || e.res != decoded {
+		c.misses++
 		return nil, false
 	}
 	e.ref = true
+	c.hits++
 	return e.vec, true
 }
 
@@ -130,9 +149,11 @@ func (c *Cache) GetCompressed(k Key, version uint64) ([]byte, bool) {
 	defer c.mu.Unlock()
 	e, ok := c.live(k, version)
 	if !ok || e.comp == nil {
+		c.misses++
 		return nil, false
 	}
 	e.ref = true
+	c.hits++
 	return e.comp, true
 }
 
@@ -344,4 +365,15 @@ func (c *Cache) Bytes() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.curBytes
+}
+
+// Stats returns the cumulative hit and miss counts and the current resident population in one
+// lock acquisition (doc 20 §4.4), the snapshot the column-cache metrics read. Taking the four
+// numbers together under mu keeps the hit rate and the size consistent, and the lock is the
+// cache's own, never the engine's, so the metrics path reads it without risk of the write-path
+// deadlock that an engine-lock read would invite.
+func (c *Cache) Stats() Stats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return Stats{Hits: c.hits, Misses: c.misses, Blocks: c.ring.Len(), Bytes: c.curBytes}
 }

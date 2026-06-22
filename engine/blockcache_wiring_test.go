@@ -95,6 +95,61 @@ func TestCrossSegmentReadsCacheSeparately(t *testing.T) {
 	}
 }
 
+// TestBlockCacheStatsCountsHitsAndMisses proves the stats snapshot tracks the lookup
+// outcomes the column-cache metrics expose: the first read of a folded segment is a
+// miss that decodes and caches it, a second read in the same segment is a hit on that
+// one entry, and the resident counts reflect the single cached block. The fold against
+// an empty base on the first checkpoint caches nothing and serves no reads, so the
+// counts start clean.
+func TestBlockCacheStatsCountsHitsAndMisses(t *testing.T) {
+	fsys := vfs.NewMem()
+	e := openDisk(t, fsys, "stats.gr")
+	defer e.Close()
+
+	name, _ := e.Intern(catalog.KindPropKey, "name")
+	tx, _ := e.Begin(true)
+	a, _ := tx.CreateNode(nil)
+	b, _ := tx.CreateNode(nil)
+	tx.SetNodeProperty(a, name, value.String("alice"))
+	tx.SetNodeProperty(b, name, value.String("bob"))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	if s := e.BlockCacheStats(); s.Hits != 0 || s.Misses != 0 {
+		t.Fatalf("stats after checkpoint = %+v, want zero hits and misses", s)
+	}
+
+	rx, _ := e.Begin(false)
+	defer rx.Abort()
+
+	// The first read decodes and caches its segment: a miss.
+	if v, _ := rx.NodeProperty(a, name); mustStr(t, v) != "alice" {
+		t.Fatalf("a.name = %v, want alice", v)
+	}
+	if s := e.BlockCacheStats(); s.Hits != 0 || s.Misses != 1 {
+		t.Fatalf("stats after first read = %+v, want 0 hits and 1 miss", s)
+	}
+
+	// b shares a's segment, so its read is served from the cached entry: a hit.
+	if v, _ := rx.NodeProperty(b, name); mustStr(t, v) != "bob" {
+		t.Fatalf("b.name = %v, want bob", v)
+	}
+	s := e.BlockCacheStats()
+	if s.Hits != 1 || s.Misses != 1 {
+		t.Fatalf("stats after same-segment read = %+v, want 1 hit and 1 miss", s)
+	}
+	if s.Blocks != 1 {
+		t.Fatalf("stats blocks = %d, want 1 resident block", s.Blocks)
+	}
+	if s.Bytes <= 0 {
+		t.Fatalf("stats bytes = %d, want a positive resident size", s.Bytes)
+	}
+}
+
 // TestCheckpointInvalidatesCachedSegment proves a checkpoint that rebuilds the base
 // invalidates the cache by epoch: a value cached before the second checkpoint is not
 // served afterward, so the read returns the freshly folded value, not the stale one.

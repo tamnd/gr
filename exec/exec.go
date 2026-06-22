@@ -274,7 +274,7 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		return &aggregateOp{spec: x, input: input}, nil, nil
+		return &aggregateOp{spec: x, input: input, inputPlan: x.Input}, nil, nil
 	case *plan.ExpandCount:
 		// The count stands in for an Aggregate over an Expand, so its input is
 		// compiled in a fresh pattern scope (peers nil), exactly as the aggregate

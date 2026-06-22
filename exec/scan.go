@@ -62,10 +62,18 @@ type nodeScanOp struct {
 	pos  int
 	rest []engine.Token // additional labels the node must also carry
 	none bool           // an unknown label: the scan is empty
+
+	// src, when set, makes this scan a morsel consumer for parallel aggregation:
+	// instead of buffering its own label scan, it pulls [lo,hi) windows of an
+	// already-scanned shared node slice and applies the residual labels per row.
+	// mhi is the exclusive end of the morsel currently being walked (pos is the
+	// cursor into src.ids). The serial path leaves src nil and uses buf.
+	src *morselSource
+	mhi int
 }
 
 func (o *nodeScanOp) open(ctx *Ctx) error {
-	o.ctx, o.buf, o.pos, o.rest, o.none = ctx, nil, 0, nil, false
+	o.ctx, o.buf, o.pos, o.rest, o.none, o.mhi = ctx, nil, 0, nil, false, 0
 	scanTok := engine.Token(0)
 	for i, l := range o.spec.Labels {
 		if !l.Known {
@@ -78,6 +86,11 @@ func (o *nodeScanOp) open(ctx *Ctx) error {
 			o.rest = append(o.rest, l.Token)
 		}
 	}
+	if o.src != nil {
+		// The shared morsel source already holds the primary-label scan; this copy
+		// only needs its residual labels (set above) to filter each morsel row.
+		return nil
+	}
 	return ctx.Tx.ScanLabel(scanTok, func(id engine.NodeID) error {
 		o.buf = append(o.buf, id)
 		return nil
@@ -87,6 +100,9 @@ func (o *nodeScanOp) open(ctx *Ctx) error {
 func (o *nodeScanOp) next() (eval.Row, bool, error) {
 	if o.none {
 		return nil, false, nil
+	}
+	if o.src != nil {
+		return o.nextMorsel()
 	}
 	for o.pos < len(o.buf) {
 		id := o.buf[o.pos]
@@ -100,6 +116,30 @@ func (o *nodeScanOp) next() (eval.Row, bool, error) {
 		}
 	}
 	return nil, false, nil
+}
+
+// nextMorsel produces the scan's rows from the shared morsel source: it walks the
+// current morsel window, and when that window is spent it atomically takes the
+// next one, stopping when the source is drained.
+func (o *nodeScanOp) nextMorsel() (eval.Row, bool, error) {
+	for {
+		for o.pos < o.mhi {
+			id := o.src.ids[o.pos]
+			o.pos++
+			ok, err := o.hasAll(id)
+			if err != nil {
+				return nil, false, err
+			}
+			if ok {
+				return eval.Row{o.spec.Var: value.Node(uint64(id))}, true, nil
+			}
+		}
+		lo, hi, ok := o.src.take()
+		if !ok {
+			return nil, false, nil
+		}
+		o.pos, o.mhi = lo, hi
+	}
 }
 
 func (o *nodeScanOp) hasAll(id engine.NodeID) (bool, error) {

@@ -2,6 +2,7 @@ package exec
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 
 	"github.com/tamnd/gr/ast"
@@ -18,9 +19,10 @@ import (
 // surrounding expression is evaluated against a representative row of the group
 // extended with those bindings.
 type aggregateOp struct {
-	spec  *plan.Aggregate
-	input operator
-	ctx   *Ctx
+	spec      *plan.Aggregate
+	input     operator
+	inputPlan plan.Op // the logical input, recompiled per worker on the parallel path
+	ctx       *Ctx
 
 	calls   []*ast.FunctionCall // the maximal aggregate calls, in discovery order
 	aggExpr []ast.Expr          // each Aggs col rewritten with synthetic bindings
@@ -78,7 +80,38 @@ func (o *aggregateOp) next() (eval.Row, bool, error) {
 	return row, true, nil
 }
 
+// run drains the input and builds the output rows. A grouping-free aggregation
+// over a scan-rooted read pipeline of order-independent aggregates runs in
+// parallel across morsels; everything else runs the serial path. The two produce
+// identical rows (the parallel aggregates are exactly associative).
 func (o *aggregateOp) run() error {
+	if ns := o.parallelScan(); ns != nil {
+		return o.runParallel(ns)
+	}
+	return o.runSerial()
+}
+
+// parallelScan returns the NodeScan to parallelize over when this aggregation is
+// eligible for the morsel-driven path, or nil to run serially. Eligibility:
+// read-only, no grouping keys, at least one aggregate and every one of them
+// order-independent and not DISTINCT, more than one core available, and an input
+// pipeline that is a row-independent chain rooted at a node scan.
+func (o *aggregateOp) parallelScan() *plan.NodeScan {
+	if o.ctx.Effects != nil || len(o.spec.GroupKeys) != 0 || o.inputPlan == nil {
+		return nil
+	}
+	if len(o.calls) == 0 || runtime.GOMAXPROCS(0) < 2 {
+		return nil
+	}
+	for _, c := range o.calls {
+		if c.Distinct || !parallelSafeAgg(c.Name) {
+			return nil
+		}
+	}
+	return parallelLeaf(o.inputPlan)
+}
+
+func (o *aggregateOp) runSerial() error {
 	groups := map[string]*group{}
 	var order []string
 	keyExprs := make([]ast.Expr, len(o.spec.GroupKeys))

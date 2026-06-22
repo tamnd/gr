@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -8,6 +9,21 @@ import (
 	"github.com/tamnd/gr/eval"
 	"github.com/tamnd/gr/value"
 )
+
+// errNoScanLeaf guards the parallel aggregation path: a worker's compiled
+// pipeline copy must bottom out in a nodeScanOp to be pointed at the morsel
+// source. parallelLeaf already proved the plan has that shape, so this is a
+// belt-and-braces error, never expected to fire.
+var errNoScanLeaf = errors.New("exec: parallel aggregate input has no scan leaf")
+
+// mergeable is an accumulator that folds another partial of the same kind into
+// itself, so a morsel-parallel aggregation can combine each worker's partial into
+// one result (doc 12 §10). Only the order-independent accumulators implement it
+// (count, min, max); the parallel path runs over exactly those, so the type
+// assertion in the merge step is always satisfied.
+type mergeable interface {
+	merge(other accumulator)
+}
 
 // accumulator is one aggregate's running state over a group's rows. add folds in
 // one value (nulls are dropped, the Cypher aggregate convention); result returns
@@ -54,6 +70,7 @@ func (a *countAcc) add(v value.Value) error {
 	return nil
 }
 func (a *countAcc) result() value.Value { return value.Int(a.n) }
+func (a *countAcc) merge(other accumulator) { a.n += other.(*countAcc).n }
 
 // sumAcc sums numeric values, staying integer until a float appears (doc 02 §5.2).
 // The sum of no values is integer zero.
@@ -141,6 +158,16 @@ func (a *minMaxAcc) result() value.Value {
 		return value.Null
 	}
 	return a.best
+}
+
+// merge folds another partial's best into this one through the same comparison
+// add uses, so the combined result is the global min or max. A partial that saw
+// no value contributes nothing.
+func (a *minMaxAcc) merge(other accumulator) {
+	o := other.(*minMaxAcc)
+	if o.has {
+		_ = a.add(o.best)
+	}
 }
 
 // collectAcc gathers the non-null values into a list (doc 09 §8.1).

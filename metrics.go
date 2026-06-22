@@ -225,6 +225,8 @@ func (db *DB) syncCheckpointMetrics() {
 // counter monotonic, and walMu serializes two concurrent scrapes so neither double-counts. Reading the
 // stats is a lock-free atomic load, never the engine lock, so a long-held write transaction cannot
 // deadlock a snapshot. The current WAL size is a computed gauge registered at open, not mirrored here.
+// The fsync counts are mirrored the same delta way; the fsync durations cannot be, so the WAL buffers
+// each sample and this step drains the buffer into gr_wal_fsync_seconds, one observe per fsync.
 func (db *DB) syncWalMetrics() {
 	if db.eng == nil {
 		return
@@ -244,6 +246,19 @@ func (db *DB) syncWalMetrics() {
 	if c := m.walFrames["commit"]; c != nil && st.FramesCommit > m.lastWalCommit {
 		c.Add(st.FramesCommit - m.lastWalCommit)
 		m.lastWalCommit = st.FramesCommit
+	}
+	if c := m.walFsyncTotal; c != nil && st.FsyncTotal > m.lastWalFsync {
+		c.Add(st.FsyncTotal - m.lastWalFsync)
+		m.lastWalFsync = st.FsyncTotal
+	}
+	if c := m.walFsyncErrors; c != nil && st.FsyncErrors > m.lastWalFsyncErr {
+		c.Add(st.FsyncErrors - m.lastWalFsyncErr)
+		m.lastWalFsyncErr = st.FsyncErrors
+	}
+	if m.walFsyncDuration != nil {
+		for _, d := range db.eng.DrainWALFsyncDurations() {
+			m.walFsyncDuration.Observe(d)
+		}
 	}
 }
 
@@ -609,6 +624,19 @@ type queryMetrics struct {
 	lastWalPage     uint64
 	lastWalCommit   uint64
 
+	// walFsyncTotal holds gr_wal_fsync_total, walFsyncErrors gr_wal_fsync_errors_total, and
+	// walFsyncDuration gr_wal_fsync_seconds (doc 20 §5.2): the durable-barrier count a commit
+	// amortizes against, the fatal fsync-failure count, and the per-fsync latency distribution that is
+	// the WAL's true commit cost. The WAL owns the authoritative atomics for the two counts, bumped
+	// under the engine write lock as it fsyncs; the sync step mirrors them delta-style under walMu and
+	// drains the WAL's buffered durations into the histogram, the same drain-queue the GC duration uses.
+	// lastWalFsync and lastWalFsyncErr hold the last mirrored cumulative counts.
+	walFsyncTotal    *metric.Counter
+	walFsyncErrors   *metric.Counter
+	walFsyncDuration *metric.Histogram
+	lastWalFsync     uint64
+	lastWalFsyncErr  uint64
+
 	// gcRuns holds gr_mvcc_gc_runs_total and gcReclaimed gr_mvcc_gc_reclaimed_total keyed by element
 	// (doc 20 §5.1). The engine owns the authoritative cumulative totals, bumped under its lock when
 	// GC runs at checkpoint; the sync step mirrors them here delta-style, the same bridge the
@@ -792,6 +820,12 @@ func newQueryMetrics() *queryMetrics {
 		m.walFrames[kind] = reg.Counter("gr_wal_frames_written_total",
 			"WAL frames appended, by kind", "frames", metric.Labels{"kind": kind})
 	}
+	m.walFsyncTotal = reg.Counter("gr_wal_fsync_total",
+		"WAL fsyncs issued, the durable barriers a commit amortizes against", "fsyncs", nil)
+	m.walFsyncErrors = reg.Counter("gr_wal_fsync_errors_total",
+		"WAL fsyncs that returned an error, any nonzero value a durability alarm", "fsyncs", nil)
+	m.walFsyncDuration = reg.Histogram("gr_wal_fsync_seconds",
+		"Wall-clock duration of a WAL fsync, the true commit cost", "seconds", queryLatencyBuckets, nil)
 	m.gcRuns = reg.Counter("gr_mvcc_gc_runs_total",
 		"Version-GC passes executed", "runs", nil)
 	m.gcReclaimed = make(map[string]*metric.Counter, len(metricMvccElements))

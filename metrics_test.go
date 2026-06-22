@@ -1034,6 +1034,41 @@ func TestMetricsWalWrites(t *testing.T) {
 	}
 }
 
+func TestMetricsWalFsync(t *testing.T) {
+	db := openMem(t, "mxwalfsync.gr")
+	defer db.Close()
+
+	// Opening commits the catalog, which fsyncs the WAL, so the count starts non-zero; measure deltas.
+	base := db.Metrics()
+	baseFsync := base.Counter("gr_wal_fsync_total", nil)
+	baseHist := base.Histogram("gr_wal_fsync_seconds", nil).Count
+
+	for i := 0; i < 50; i++ {
+		mustExec(t, db, "CREATE (:Person {note: 'value'})", nil)
+	}
+
+	snap := db.Metrics()
+	// Each committed transaction fsyncs the WAL at its commit point, so the count climbs past the
+	// baseline and the latency histogram observed each barrier.
+	fsync := snap.Counter("gr_wal_fsync_total", nil)
+	if fsync <= baseFsync {
+		t.Fatalf("wal fsyncs after fifty commits = %d, want > %d", fsync, baseFsync)
+	}
+	if h := snap.Histogram("gr_wal_fsync_seconds", nil); h.Count <= baseHist {
+		t.Fatalf("fsync-seconds samples after fifty commits = %d, want > %d", h.Count, baseHist)
+	}
+	// No fsync failed, so the durability-alarm counter stays at zero.
+	if e := snap.Counter("gr_wal_fsync_errors_total", nil); e != 0 {
+		t.Fatalf("wal fsync errors = %d, want 0 on a healthy run", e)
+	}
+
+	// A checkpoint resets the WAL, which fsyncs again, so the count keeps climbing.
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+	if more := db.Metrics().Counter("gr_wal_fsync_total", nil); more <= fsync {
+		t.Fatalf("wal fsyncs after a checkpoint = %d, want > %d", more, fsync)
+	}
+}
+
 func TestMetricsCheckpoint(t *testing.T) {
 	db := openMem(t, "mxcheckpoint.gr")
 	defer db.Close()

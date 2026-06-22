@@ -314,5 +314,16 @@ func (p *Pager) WALStats() wal.Stats {
 	return p.wal.Stats()
 }
 
+// DrainWALFsyncDurations returns the WAL's fsync durations in seconds buffered since the last drain and
+// clears the buffer (doc 20 §5.2), or nil on a read-only pager with no writable WAL. It forwards to the
+// WAL's own drain, which takes only its small buffer lock, never the pool lock or the engine lock, so it
+// is safe off the metrics snapshot path.
+func (p *Pager) DrainWALFsyncDurations() []float64 {
+	if p.wal == nil {
+		return nil
+	}
+	return p.wal.DrainFsyncDurations()
+}
+
 // PayloadSize returns usable payload bytes per page.
 func (p *Pager) PayloadSize() int { return format.PayloadSize(p.pageSize) }

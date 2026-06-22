@@ -77,6 +77,53 @@ func TestWALStats(t *testing.T) {
 	}
 }
 
+func TestWALFsyncMetrics(t *testing.T) {
+	fsys := vfs.NewMem()
+	w, _ := openWAL(t, fsys)
+
+	// Init does not fsync, so a fresh WAL has issued no barriers and buffered no samples.
+	if st := w.Stats(); st.FsyncTotal != 0 || st.FsyncErrors != 0 {
+		t.Fatalf("fresh fsync counts = total %d errors %d, want 0 and 0", st.FsyncTotal, st.FsyncErrors)
+	}
+	if d := w.DrainFsyncDurations(); d != nil {
+		t.Fatalf("fresh drain = %v, want nil", d)
+	}
+
+	// A commit fsyncs once (the WAL opened at SyncFull), so the count rises and one sample buffers.
+	if _, err := w.Append([]Frame{{PageID: 1, Image: page(0x11)}}, true, 2); err != nil {
+		t.Fatal(err)
+	}
+	if st := w.Stats(); st.FsyncTotal != 1 || st.FsyncErrors != 0 {
+		t.Fatalf("after one commit, fsync counts = total %d errors %d, want 1 and 0", st.FsyncTotal, st.FsyncErrors)
+	}
+
+	// Reset fsyncs again, so by the drain two barriers have run and two samples wait.
+	if err := w.Reset(7); err != nil {
+		t.Fatal(err)
+	}
+	if st := w.Stats(); st.FsyncTotal != 2 {
+		t.Fatalf("after commit then reset, fsync total = %d, want 2", st.FsyncTotal)
+	}
+	d := w.DrainFsyncDurations()
+	if len(d) != 2 {
+		t.Fatalf("drained %d samples, want 2", len(d))
+	}
+	for _, s := range d {
+		if s < 0 {
+			t.Fatalf("negative fsync duration %v", s)
+		}
+	}
+
+	// The drain clears the buffer, so a second drain with no fsync in between returns nothing, but the
+	// cumulative count holds: the counter is monotonic, only the sample buffer empties.
+	if d := w.DrainFsyncDurations(); d != nil {
+		t.Fatalf("second drain = %v, want nil after the buffer cleared", d)
+	}
+	if st := w.Stats(); st.FsyncTotal != 2 {
+		t.Fatalf("fsync total after drain = %d, want it to hold at 2", st.FsyncTotal)
+	}
+}
+
 func TestWALAppendAndRecover(t *testing.T) {
 	fsys := vfs.NewMem()
 	w, f := openWAL(t, fsys)

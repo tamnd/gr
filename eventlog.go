@@ -146,6 +146,21 @@ func (l *EventLog) ConfigChange(setting, oldValue, newValue, who string) {
 	)
 }
 
+// ConstraintViolation records that a write violated a declared constraint (doc 20 §11.3): the
+// constraint kind (unique, exists, or type), the constraint name, the label and property it
+// guards, and the offending value for a uniqueness violation (empty for an existence violation,
+// where the problem is the absence of a value). It is a warn since a violation is a rejected
+// write an operator may want to watch, not an engine fault.
+func (l *EventLog) ConstraintViolation(kind, constraint, label, property, value string) {
+	l.Event(slog.LevelWarn, EventConstraintViolation, "constraint violated",
+		slog.String("kind", kind),
+		slog.String("constraint", constraint),
+		slog.String("label", label),
+		slog.String("property", property),
+		slog.String("value", value),
+	)
+}
+
 // QuerySlow records that a query crossed the slow threshold (doc 20 §11.3): the query id
 // that correlates it to the full query-log entry, the statement kind, how long it ran, and
 // the threshold it crossed. It is a warn so a log-based alert can watch the slow tail. The

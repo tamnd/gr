@@ -531,6 +531,16 @@ var varlenDepthBuckets = []float64{
 	0, 1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 30, 50, 100,
 }
 
+// versionChainLengthBuckets is the bucket layout for gr_mvcc_version_chain_length (doc 20 §5.1), the
+// number of retained versions on one element's chain. The boundaries are tight at the low end, where
+// a healthy chain sits (one or two versions a recent write left behind that GC will soon reclaim),
+// and reach into the hundreds so a hot element a long reader pinned into deep history lands in a
+// distinct high bucket: the gap between a shallow p50 and a deep tail is the GC-not-keeping-up signal
+// the histogram exists to show (§16.4).
+var versionChainLengthBuckets = []float64{
+	1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377,
+}
+
 // metricQueryKinds is the bounded domain of the kind label on the query metrics (doc 20 §3.1,
 // §7.2): the statement classes a query falls into. The handles for every kind are pre-resolved
 // at open so recording one is a map read and an atomic add, never a registry lock.

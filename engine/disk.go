@@ -264,6 +264,12 @@ func (e *DiskEngine) CheckpointPagesWrittenTotal() uint64 { return e.ckptPagesWr
 // lock, so there is no inversion.
 func (e *DiskEngine) VersionsResident() int64 { return int64(e.ov.Len()) }
 
+// VersionChainLengths returns the length of every retained version chain split by element (doc 20
+// §5.1), for the gr_mvcc_version_chain_length histogram. Like VersionsResident it reads the overlay's
+// own lock, never the engine lock, so the metrics path computes the point-in-time distribution
+// without waiting on a write transaction.
+func (e *DiskEngine) VersionChainLengths() (node, rel []float64) { return e.ov.ChainLengths() }
+
 // GCStats returns the cumulative version-GC totals (doc 20 §5.1): the GC passes run and the
 // pre-images reclaimed split by element, read lock-free from the atomics each checkpoint's GC bumps.
 // The metrics path mirrors these into gr_mvcc_gc_runs_total and gr_mvcc_gc_reclaimed_total{element}

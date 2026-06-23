@@ -1472,6 +1472,48 @@ func TestMetricsVersionsResident(t *testing.T) {
 	}
 }
 
+func TestMetricsVersionChainLength(t *testing.T) {
+	db := openMem(t, "mxchain.gr")
+	defer db.Close()
+
+	// A fresh database carries no version history, so the distribution is empty.
+	if h := db.Metrics().Histogram("gr_mvcc_version_chain_length", Labels{"element": "node"}); h.Count != 0 {
+		t.Fatalf("node chain observations on fresh db = %d, want 0", h.Count)
+	}
+
+	mustExec(t, db, "CREATE (:Counter {n: 0})", nil)
+	// Twenty overwrites of one property record twenty pre-images on one element's chain, which the
+	// overlay holds until GC reclaims it.
+	for i := 0; i < 20; i++ {
+		mustExec(t, db, "MATCH (c:Counter) SET c.n = c.n + 1", nil)
+	}
+	nodeHist := db.Metrics().Histogram("gr_mvcc_version_chain_length", Labels{"element": "node"})
+	if nodeHist.Count == 0 {
+		t.Fatalf("node chains after updates = %d, want at least one", nodeHist.Count)
+	}
+	// The element's property chain alone is at least twenty versions deep, so the depths sum past it.
+	if nodeHist.Sum < 20 {
+		t.Fatalf("node chain depth sum = %v, want >= 20", nodeHist.Sum)
+	}
+	// That deep chain lands well into the tail, the GC-not-keeping-up signal the histogram exists to
+	// show: the 99th percentile sits past the shallow buckets.
+	if q := nodeHist.Quantile(0.99); q <= 13 {
+		t.Fatalf("node chain p99 = %v, want a deep tail past 13", q)
+	}
+	// No relationship was versioned, so the rel element's distribution is empty.
+	if h := db.Metrics().Histogram("gr_mvcc_version_chain_length", Labels{"element": "rel"}); h.Count != 0 {
+		t.Fatalf("rel chains = %d, want 0", h.Count)
+	}
+
+	// A checkpoint with no open reader advances the watermark to the latest commit, so GC reclaims
+	// the whole chain and the point-in-time distribution empties on the next scrape, confirming it
+	// reflects the live state rather than accumulating past observations.
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+	if h := db.Metrics().Histogram("gr_mvcc_version_chain_length", Labels{"element": "node"}); h.Count != 0 {
+		t.Fatalf("node chains after GC = %d, want 0", h.Count)
+	}
+}
+
 func TestMetricsCheckpointDeltaFolded(t *testing.T) {
 	db := openMem(t, "mxckptfold.gr")
 	defer db.Close()

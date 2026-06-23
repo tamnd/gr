@@ -274,7 +274,7 @@ func (tx *Tx) runDispatch(ctx context.Context, q *ast.Query, cypher string, vals
 		if !tx.write {
 			return nil, ErrReadOnly
 		}
-		return tx.runWrite(q, vals, cfg.lazy)
+		return tx.runWrite(ctx, q, vals, cfg.lazy)
 	}
 	return tx.runRead(ctx, cypher, q, vals, cfg.lazy)
 }
@@ -296,13 +296,21 @@ func (tx *Tx) runRead(ctx context.Context, cypher string, q *ast.Query, params m
 	if tx.write {
 		// A read inside a write transaction binds against the transaction's own catalog, so it
 		// never uses the plan cache: time the bind and plan as a plan-cache miss (doc 20 §3.1).
+		// The gr.plan span wraps the structural bind as a child of the root, always a miss here
+		// (doc 20 §12.2).
+		_, pspan := tx.db.startPhaseSpan(ctx, "gr.plan")
 		pstart := time.Now()
 		bound, err := bind.Bind(q, bind.NewEngineCatalog(tx.etx), false)
 		if err != nil {
+			endPhaseSpan(pspan, err)
 			return nil, err
 		}
 		b, op = bound, plan.Plan(bound)
 		tx.db.metrics.recordPlan("miss", time.Since(pstart))
+		if pspan != nil {
+			pspan.SetString("gr.plan.cache", "miss")
+		}
+		endPhaseSpan(pspan, nil)
 	} else {
 		entry, err := tx.db.compile(ctx, cypher)
 		if err != nil {
@@ -312,13 +320,17 @@ func (tx *Tx) runRead(ctx context.Context, cypher string, q *ast.Query, params m
 		st = engineStats{tx.db.eng}
 	}
 	// The executor span starts once the plan is ready; Close records the time since it as
-	// gr_query_execute_duration_seconds (doc 20 §3.1).
+	// gr_query_execute_duration_seconds (doc 20 §3.1). The gr.execute trace span covers the same
+	// boundary as a child of the root, ended at Close with the scanned and returned rows (doc 20
+	// §12.2).
+	_, espan := tx.db.startPhaseSpan(ctx, "gr.execute")
 	execStart := time.Now()
 	cur, err := exec.Open(op, tx.readCtx(b, params))
 	if err != nil {
+		endExecuteSpan(espan, 0, 0, err)
 		return nil, err
 	}
-	return &Result{cols: cur.Cols(), cursor: cur, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy), mscan: cur.ScanCount(), mexec: execStart, planOp: op, planStats: st}, nil
+	return &Result{cols: cur.Cols(), cursor: cur, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy), mscan: cur.ScanCount(), mexec: execStart, planOp: op, planStats: st, execSpan: espan}, nil
 }
 
 // runWrite executes a write statement eagerly and returns a result over its
@@ -328,8 +340,8 @@ func (tx *Tx) runRead(ctx context.Context, cypher string, q *ast.Query, params m
 // Names are interned inside the transaction and the bind resolves against its
 // catalog view (doc 13 §9), so the write takes no lock it does not already hold and
 // leaves no orphan token on rollback (doc 13 §16).
-func (tx *Tx) runWrite(q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
-	cols, buf, summary, scanned, op, err := tx.db.execWriteBuffered(tx.etx, q, params)
+func (tx *Tx) runWrite(ctx context.Context, q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
+	cols, buf, summary, scanned, op, err := tx.db.execWriteBuffered(ctx, tx.etx, q, params)
 	if err != nil {
 		return nil, err
 	}

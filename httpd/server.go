@@ -137,6 +137,7 @@ func New(db *gr.DB, opts Options) *Server {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/healthz/detail", s.handleHealthDetail)
 	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/debug/vars", s.handleVars)
@@ -317,6 +318,22 @@ func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
+}
+
+// handleHealthDetail serves GET /healthz/detail (doc 20 §13.3): the structured health
+// report, the operator's at-a-glance view distinct from the orchestrator's liveness and
+// readiness booleans. It carries the engine state, the liveness gauges, the checkpoint and
+// commit progress, and any active warnings, rendered as JSON. The status code follows the
+// report's readiness so a probe that watches this endpoint still gets a pass or fail: 200
+// when ready, 503 when stopped or not ready. Like the other health probes it is unauthenticated,
+// so an operator reaches it without a credential.
+func (s *server) handleHealthDetail(w http.ResponseWriter, r *http.Request) {
+	rep := s.db.Health()
+	w.Header().Set("Content-Type", "application/json")
+	if !rep.Ready {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	_ = json.NewEncoder(w).Encode(rep)
 }
 
 // handleReadyz serves GET /readyz (doc 18 §9.7): 200 when the engine is open and

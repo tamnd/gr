@@ -8,7 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tamnd/gr/value"
 	"github.com/tamnd/gr/vfs"
+	"github.com/tamnd/gr/wal"
 )
 
 // captureDBEvents builds an event log writing JSON into a buffer plus a reader that
@@ -119,6 +121,115 @@ func TestDBCheckpointEvent(t *testing.T) {
 	}
 	if _, ok := ckpt["delta_folded"]; !ok {
 		t.Errorf("checkpoint event has no delta_folded: %v", ckpt)
+	}
+}
+
+// TestDBRecoveryEvent confirms reopening a database with a committed-but-uncheckpointed
+// WAL prefix emits a recovery_complete event carrying the transactions it replayed, the
+// durable commit sequence as the last_lsn, and a duration, the operator's confirmation
+// of a clean recovery (doc 20 §11.3). The clean commit protocol folds and resets the WAL
+// on every commit, so the only state that recovers is a crash between a commit's fsync
+// and its checkpoint; we stage exactly that by appending a committed frame to the WAL
+// directly, the same way the pager's recovery test does.
+func TestDBRecoveryEvent(t *testing.T) {
+	fsys := vfs.NewMem()
+	db, err := Open("rec.gr", Options{VFS: fsys, SaltSeed: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"A", "B", "C"} {
+		if _, err := db.Exec("CREATE (:Person {name: $n})", map[string]value.Value{"n": value.String(name)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ps := db.PageSize()
+	info, err := db.Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageCount := info.PageCount
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read the header page's real image so the staged redo rewrites it with its own
+	// content: the recovery is then a real, valid replay that leaves the database intact.
+	page0 := make([]byte, ps)
+	dbf, err := fsys.Open("rec.gr", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dbf.ReadAt(page0, 0); err != nil {
+		t.Fatal(err)
+	}
+	_ = dbf.Close()
+
+	// Stage the torn commit: append a committed frame for page 0 to the WAL without
+	// folding it, the state a crash between fsync and checkpoint leaves behind.
+	wf, err := fsys.Open("rec.gr-wal", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := wal.Open(wf, ps, wal.SyncFull, 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Append([]wal.Frame{{PageID: 0, Image: page0}}, true, pageCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen with an event log: recovery redoes the committed frame and records it.
+	el, read := captureDBEvents()
+	db2, err := Open("rec.gr", Options{VFS: fsys, SaltSeed: 1, EventLog: el})
+	if err != nil {
+		t.Fatalf("reopen after a torn commit: %v", err)
+	}
+	defer func() { _ = db2.Close() }()
+
+	var rec map[string]any
+	for _, e := range read() {
+		if e["event"] == EventRecoveryComplete {
+			rec = e
+		}
+	}
+	if rec == nil {
+		t.Fatalf("no recovery_complete event after a torn-commit reopen; entries = %v", read())
+	}
+	if tx, ok := rec["transactions_replayed"].(float64); !ok || tx < 1 {
+		t.Errorf("transactions_replayed = %v, want the staged commit", rec["transactions_replayed"])
+	}
+	if lsn, ok := rec["last_lsn"].(float64); !ok || lsn == 0 {
+		t.Errorf("last_lsn = %v, want the durable commit sequence", rec["last_lsn"])
+	}
+	if _, ok := rec["duration_ms"]; !ok {
+		t.Errorf("recovery event has no duration_ms: %v", rec)
+	}
+	// The database survived the recovery intact: the three writes are still there.
+	if n := nodeCount(t, db2); n != 3 {
+		t.Errorf("recovered node count = %d, want 3", n)
+	}
+}
+
+// TestDBNoRecoveryEventOnCleanOpen confirms a fresh open that recovered nothing emits
+// no recovery_complete event, only the open event.
+func TestDBNoRecoveryEventOnCleanOpen(t *testing.T) {
+	el, read := captureDBEvents()
+	fsys := vfs.NewMem()
+	db, err := Open("clean.gr", Options{VFS: fsys, SaltSeed: 1, EventLog: el})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	for _, e := range read() {
+		if e["event"] == EventRecoveryComplete {
+			t.Errorf("a clean open emitted a recovery event: %v", e)
+		}
 	}
 }
 

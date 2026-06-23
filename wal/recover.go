@@ -24,6 +24,10 @@ type RecoverResult struct {
 	DBPages uint64
 	// Committed reports whether any committed transaction was found.
 	Committed bool
+	// Commits is the number of committed transactions in the redone prefix, one per
+	// commit frame, the transactions_replayed count the recovery_complete event
+	// carries (doc 20 §11.3).
+	Commits int
 }
 
 // Recover scans the WAL file and returns the committed prefix to redo. It walks
@@ -65,6 +69,7 @@ func Recover(f vfs.File, pageSize uint32) (RecoverResult, error) {
 
 	s1, s2 := salt1, salt2
 	off := int64(walHeaderSize)
+	commits := 0
 	for off+frameSz <= size {
 		fh := make([]byte, frameHeaderLen)
 		if _, err := f.ReadAt(fh, off); err != nil {
@@ -87,6 +92,7 @@ func Recover(f vfs.File, pageSize uint32) (RecoverResult, error) {
 		if trunc != 0 {
 			lastCommit = len(all) - 1
 			lastCommitPages = trunc
+			commits++
 		}
 		off += frameSz
 	}
@@ -98,5 +104,6 @@ func Recover(f vfs.File, pageSize uint32) (RecoverResult, error) {
 		Frames:    all[:lastCommit+1],
 		DBPages:   lastCommitPages,
 		Committed: true,
+		Commits:   commits,
 	}, nil
 }

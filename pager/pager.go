@@ -16,6 +16,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/tamnd/gr/format"
 	"github.com/tamnd/gr/vfs"
@@ -187,7 +188,9 @@ type Pager struct {
 
 	headerDirty bool
 	closed      bool
-	recovered   bool // true if open redid committed WAL frames after a crash
+	recovered   bool          // true if open redid committed WAL frames after a crash
+	recoveredTx int           // committed transactions the recovery redid (doc 20 §11.3)
+	recoverDur  time.Duration // wall-clock the recovery took, for the recovery_complete event
 }
 
 func (o Options) withDefaults() Options {
@@ -302,6 +305,7 @@ func (p *Pager) loadHeader() error {
 // recover opens the WAL, redoes any committed frames into the database file,
 // resets the WAL, and reloads the header.
 func (p *Pager) recover(saltSeed uint64) error {
+	start := time.Now()
 	wf, err := p.vfs.Open(p.walPath, true)
 	if err != nil {
 		return err
@@ -317,6 +321,7 @@ func (p *Pager) recover(saltSeed uint64) error {
 		// event's recovered flag).
 		if len(res.Frames) > 0 {
 			p.recovered = true
+			p.recoveredTx = res.Commits
 		}
 		// Redo committed frames into the database file (idempotent: full images).
 		for _, fr := range res.Frames {
@@ -342,7 +347,11 @@ func (p *Pager) recover(saltSeed uint64) error {
 		return err
 	}
 	// Reload the header now that the database reflects the committed prefix.
-	return p.loadHeader()
+	if err := p.loadHeader(); err != nil {
+		return err
+	}
+	p.recoverDur = time.Since(start)
+	return nil
 }
 
 func (p *Pager) nextSalt() uint64 {
@@ -382,6 +391,14 @@ func (p *Pager) PageSize() uint32 { return p.pageSize }
 // means the previous process crashed between a commit's fsync and its checkpoint.
 // It feeds the open event's recovered flag (doc 20 §11.3).
 func (p *Pager) Recovered() bool { return p.recovered }
+
+// RecoveryStats returns what the crash recovery on open redid: the number of committed
+// transactions replayed, the durable commit sequence the header now records (the change
+// counter, bumped once per commit, the last_lsn the recovery_complete event carries), and
+// how long the recovery took (doc 20 §11.3). They are zero when the open did not recover.
+func (p *Pager) RecoveryStats() (txReplayed int, lastSeq uint64, dur time.Duration) {
+	return p.recoveredTx, p.header.ChangeCounter, p.recoverDur
+}
 
 // PagesWritten returns the cumulative count of page images Commit has copied into the database file
 // since open (doc 20 §5.4). The engine reads it around a checkpoint to attribute the fold's write-back

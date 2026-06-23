@@ -312,6 +312,24 @@ func (ov *Overlay) GC(watermark Seq) GCStats {
 	return st
 }
 
+// ChainLengths reports the length of every retained version chain, split by element (doc 20 §5.1):
+// node-element chains (existence, labels, properties) and rel-element chains (existence, properties).
+// It is a point-in-time read for the version-chain-length histogram, taken under the overlay's own
+// read lock, never the engine lock, so a metrics scrape never waits on a write transaction. A deep
+// chain here is a hot element carrying history GC has not reclaimed, the long-reader signature.
+func (ov *Overlay) ChainLengths() (node, rel []float64) {
+	ov.mu.RLock()
+	defer ov.mu.RUnlock()
+	for k, ch := range ov.chains {
+		if k.Kind.isRel() {
+			rel = append(rel, float64(len(ch)))
+		} else {
+			node = append(node, float64(len(ch)))
+		}
+	}
+	return node, rel
+}
+
 // Len reports the number of retained pre-images, for tests and observability.
 func (ov *Overlay) Len() int {
 	ov.mu.RLock()

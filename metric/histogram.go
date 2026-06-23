@@ -22,6 +22,12 @@ type Histogram struct {
 	counts []atomic.Uint64 // one counter per bound, the count of observations at or below that bound
 	sum    atomic.Uint64   // total of observed values, a float64 bit-cast, updated by CAS (doc 20 §22.4)
 	count  atomic.Uint64   // total number of observations
+	// compute, when set, makes this a point-in-time histogram: snapshot buckets the values the
+	// function returns against the bounds at read time, rather than reading accumulated counts (doc
+	// 20 §5.1). It serves a distribution over a current population (version-chain lengths over live
+	// elements) rather than a stream of events, so re-reading every scrape must not accumulate.
+	// Observe is a no-op on a computed histogram, the same shape a computed gauge ignores Set.
+	compute func() []float64
 }
 
 // newHistogram builds a histogram over the given upper bounds (doc 20 §2.5). The bounds are
@@ -45,12 +51,25 @@ func newHistogram(bounds []float64) *Histogram {
 	return &Histogram{bounds: b, counts: make([]atomic.Uint64, len(b))}
 }
 
+// newComputedHistogram builds a point-in-time histogram whose distribution fn produces at read
+// time (doc 20 §5.1): fn returns the current population of values and snapshot buckets them against
+// the bounds, so the metric reflects the live state rather than an accumulation of past scrapes.
+func newComputedHistogram(bounds []float64, fn func() []float64) *Histogram {
+	h := newHistogram(bounds)
+	h.compute = fn
+	return h
+}
+
 // Observe records one value (doc 20 §2.5, §22.4): it finds the lowest bucket whose bound is
 // at or above the value and increments that bucket, adds the value to sum through a CAS loop
 // (atomic has no native float add), and increments count. The bucket counts are kept
 // non-cumulative in storage and made cumulative at read (Snapshot), so an observation touches
-// exactly one bucket cell rather than every bucket at or above the value.
+// exactly one bucket cell rather than every bucket at or above the value. A computed histogram
+// ignores it, because its distribution comes from its function, not from stored cells.
 func (h *Histogram) Observe(v float64) {
+	if h.compute != nil {
+		return
+	}
 	i := h.bucket(v)
 	h.counts[i].Add(1)
 	h.count.Add(1)
@@ -83,6 +102,9 @@ func (h *Histogram) addSum(v float64) {
 // the value is coherent (doc 20 §22.6). The stored per-bucket counts are folded into the
 // cumulative form Prometheus and the quantile math expect here, on the read side.
 func (h *Histogram) snapshot() HistogramValue {
+	if h.compute != nil {
+		return bucketize(h.bounds, h.compute())
+	}
 	bounds := append([]float64(nil), h.bounds...)
 	cumulative := make([]uint64, len(h.counts))
 	var running uint64
@@ -95,6 +117,32 @@ func (h *Histogram) snapshot() HistogramValue {
 		Counts: cumulative,
 		Sum:    math.Float64frombits(h.sum.Load()),
 		Count:  h.count.Load(),
+	}
+}
+
+// bucketize folds a current population of values into the cumulative-bucket HistogramValue a
+// computed histogram exposes (doc 20 §5.1): it counts each value into the lowest bucket whose
+// bound is at or above it, accumulates the sum, and makes the counts cumulative, the same read-side
+// shape Observe-backed histograms produce. Bounds carry the +Inf top bucket already.
+func bucketize(bounds []float64, values []float64) HistogramValue {
+	counts := make([]uint64, len(bounds))
+	var sum float64
+	for _, v := range values {
+		i := sort.Search(len(bounds), func(i int) bool { return v <= bounds[i] })
+		counts[i]++
+		sum += v
+	}
+	cumulative := make([]uint64, len(counts))
+	var running uint64
+	for i := range counts {
+		running += counts[i]
+		cumulative[i] = running
+	}
+	return HistogramValue{
+		Bounds: append([]float64(nil), bounds...),
+		Counts: cumulative,
+		Sum:    sum,
+		Count:  running,
 	}
 }
 

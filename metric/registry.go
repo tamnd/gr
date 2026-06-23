@@ -105,6 +105,19 @@ func (r *Registry) Histogram(name, help, unit string, bounds []float64, labels L
 	return e.histogram
 }
 
+// ComputedHistogram registers a histogram whose distribution fn produces at read time (doc 20
+// §5.1): fn returns the current population of values and the snapshot buckets them against the
+// family's bounds, for a point-in-time distribution over a live population (the version-chain
+// lengths over current elements) rather than a stream of past events. Re-reading every scrape
+// reflects the current state instead of accumulating, which an Observe-backed histogram cannot do.
+func (r *Registry) ComputedHistogram(name, help, unit string, bounds []float64, labels Labels, fn func() []float64) *Histogram {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.resolve(name, TypeHistogram, help, unit, bounds, labels)
+	e.histogram = newComputedHistogram(e.familyBounds, fn)
+	return e.histogram
+}
+
 // resolve finds or creates the family for name and the series for labels, checking the type
 // and label-schema consistency the catalogue depends on (doc 20 §2.6). It runs under the
 // registry lock. It returns the series entry, carrying the family's histogram bounds so the

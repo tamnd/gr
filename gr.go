@@ -252,6 +252,19 @@ func Open(path string, opt Options) (*DB, error) {
 	db.metrics.reg.ComputedGauge("gr_mvcc_versions_resident",
 		"Element versions held beyond the current committed version, the version-store size", "versions", nil,
 		func() int64 { return db.eng.VersionsResident() })
+	// The version-chain-length distribution is a point-in-time histogram over live elements, split by
+	// element (doc 20 §5.1): each retained chain's depth, bucketed fresh every scrape rather than
+	// accumulated, so it reflects the current history the overlay holds. A long-tailed distribution is
+	// hot elements carrying deep history GC has not reclaimed, the long-reader pathology (§16.4). It
+	// reads the overlay's own lock, never the engine lock, so the snapshot stays off the write lock.
+	db.metrics.reg.ComputedHistogram("gr_mvcc_version_chain_length",
+		"Distribution of version-chain lengths over node elements", "versions",
+		versionChainLengthBuckets, Labels{"element": "node"},
+		func() []float64 { node, _ := db.eng.VersionChainLengths(); return node })
+	db.metrics.reg.ComputedHistogram("gr_mvcc_version_chain_length",
+		"Distribution of version-chain lengths over rel elements", "versions",
+		versionChainLengthBuckets, Labels{"element": "rel"},
+		func() []float64 { _, rel := db.eng.VersionChainLengths(); return rel })
 	// The watermark lag is the reclaimable backlog: the commit versions GC could drop the moment the
 	// oldest live snapshot releases (doc 20 §5.1). It reads the oracle's lock, never the engine lock,
 	// so a lag that stays high while a reader holds a snapshot is the long-reader signal (§16.4).

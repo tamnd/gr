@@ -37,6 +37,14 @@ type Loader struct {
 	// that streaming-API sources (whose readers are exhausted) don't need to
 	// re-parse the header in pass 2.
 	hdrBuf []*NodeHeader
+
+	// relRowBuf buffers accepted relationship rows from streaming sources for the
+	// scatter pass. All relationship sources share one ordered list; the scatter
+	// pass replays them in the same order the count pass visited them.
+	relRowBuf []rowRecord
+	// relHdrBuf holds the parsed RelHeader for each relationship source, cached
+	// during the count sub-step for scatter-pass replay.
+	relHdrBuf []*RelHeader
 }
 
 // rowRecord is one buffered data row from the streaming API.
@@ -70,12 +78,13 @@ func New(opts Options) *Loader {
 		}
 	}
 	return &Loader{
-		opts:    opts,
-		catalog: newCatalogBuilder(),
-		idmap:   newIDMapBuilder(),
-		bad:     newBadLineSink(badWriter),
-		rowBuf:  make([][]rowRecord, len(opts.Nodes)),
-		hdrBuf:  make([]*NodeHeader, len(opts.Nodes)),
+		opts:      opts,
+		catalog:   newCatalogBuilder(),
+		idmap:     newIDMapBuilder(),
+		bad:       newBadLineSink(badWriter),
+		rowBuf:    make([][]rowRecord, len(opts.Nodes)),
+		hdrBuf:    make([]*NodeHeader, len(opts.Nodes)),
+		relHdrBuf: make([]*RelHeader, len(opts.Relationships)),
 	}
 }
 

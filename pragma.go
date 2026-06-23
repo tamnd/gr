@@ -299,9 +299,17 @@ func (db *DB) execPragma(cmd *ast.PragmaCommand) (*Result, error) {
 			}
 			return nil, fmt.Errorf("%w: %s", ErrNotSettable, cmd.Name)
 		}
+		// Capture the value before the change so the config_change event carries the old and
+		// new values (doc 20 §11.3), the audit trail for a runtime reconfiguration. The read is
+		// the same lock-free getter the query form uses, so it adds no lock to the set path.
+		old := p.get(db)
 		if err := p.set(db, cmd.Value); err != nil {
 			return nil, err
 		}
+		// A setting changed, so record it: the setting, its old and new rendered values, and
+		// the principal. A library call is "embedded"; the served path threads its user once the
+		// pragma surface carries a principal.
+		db.events.ConfigChange(cmd.Name, old.String(), p.get(db).String(), "embedded")
 		return emptyResult(), nil
 	}
 	return &Result{cols: []string{cmd.Name}, buf: []eval.Row{{cmd.Name: p.get(db)}}}, nil

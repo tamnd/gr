@@ -216,6 +216,68 @@ func TestDBRecoveryEvent(t *testing.T) {
 	}
 }
 
+// TestDBConfigChangeEvent confirms setting a value pragma emits a config_change event
+// carrying the setting, its old and new values, and the principal, the audit trail for a
+// runtime reconfiguration (doc 20 §11.3).
+func TestDBConfigChangeEvent(t *testing.T) {
+	el, read := captureDBEvents()
+	fsys := vfs.NewMem()
+	db, err := Open("cfg.gr", Options{VFS: fsys, SaltSeed: 1, EventLog: el})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Run(context.Background(), "PRAGMA max_retries = 7", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var cfg map[string]any
+	for _, e := range read() {
+		if e["event"] == EventConfigChange {
+			cfg = e
+		}
+	}
+	if cfg == nil {
+		t.Fatalf("no config_change event after a pragma set; entries = %v", read())
+	}
+	if cfg["setting"] != "max_retries" {
+		t.Errorf("setting = %v, want max_retries", cfg["setting"])
+	}
+	if cfg["new"] != "7" {
+		t.Errorf("new = %v, want 7", cfg["new"])
+	}
+	if _, ok := cfg["old"]; !ok {
+		t.Errorf("config_change event has no old value: %v", cfg)
+	}
+	if cfg["who"] != "embedded" {
+		t.Errorf("who = %v, want embedded", cfg["who"])
+	}
+}
+
+// TestDBNoConfigChangeEventOnRead confirms reading a pragma value emits no config_change
+// event, since nothing changed.
+func TestDBNoConfigChangeEventOnRead(t *testing.T) {
+	el, read := captureDBEvents()
+	fsys := vfs.NewMem()
+	db, err := Open("cfgr.gr", Options{VFS: fsys, SaltSeed: 1, EventLog: el})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	res, err := db.Run(context.Background(), "PRAGMA max_retries", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = res.Close()
+	for _, e := range read() {
+		if e["event"] == EventConfigChange {
+			t.Errorf("reading a pragma emitted a config_change event: %v", e)
+		}
+	}
+}
+
 // TestDBNoRecoveryEventOnCleanOpen confirms a fresh open that recovered nothing emits
 // no recovery_complete event, only the open event.
 func TestDBNoRecoveryEventOnCleanOpen(t *testing.T) {

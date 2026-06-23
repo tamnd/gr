@@ -592,6 +592,52 @@ func TestMetricsVarLenExpand(t *testing.T) {
 	}
 }
 
+// TestMetricsDegreeDistribution confirms the supernode and skew gauges report the degree
+// distribution of a deliberately skewed graph after a checkpoint folds it into the base (doc 20
+// §6.2). A hub with ten outgoing KNOWS edges sits beside four ordinary nodes with one each, so the
+// outgoing degree distribution is [1, 1, 1, 1, 10]: median one, 99th-percentile and max ten, and a
+// max-over-mean skew of three (10 over the mean of 2.8).
+func TestMetricsDegreeDistribution(t *testing.T) {
+	db, err := Open("mdegree.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	mustExec(t, db, "CREATE (:Person {n: 'hub'})", nil)
+	for i := 0; i < 10; i++ {
+		mustExec(t, db, "MATCH (h:Person {n: 'hub'}) CREATE (h)-[:KNOWS]->(:Person {n: 'leaf'})", nil)
+	}
+	for i := 0; i < 4; i++ {
+		mustExec(t, db, "CREATE (:Person {n: 'src'})-[:KNOWS]->(:Person {n: 'dst'})", nil)
+	}
+	// The distribution is published at open and checkpoint, so fold the writes into the base first.
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+
+	out := Labels{"type": "KNOWS", "dir": "out"}
+	if p50 := db.Metrics().Gauge("gr_degree_p50", out); p50 != 1 {
+		t.Errorf("outgoing degree p50 = %d, want 1", p50)
+	}
+	if p99 := db.Metrics().Gauge("gr_degree_p99", out); p99 != 10 {
+		t.Errorf("outgoing degree p99 = %d, want 10", p99)
+	}
+	if skew := db.Metrics().Gauge("gr_degree_skew_ratio", out); skew != 3 {
+		t.Errorf("outgoing skew ratio = %d, want 3 (10 over mean 2.8)", skew)
+	}
+	if mx := db.Metrics().Gauge("gr_supernode_max_degree", Labels{"type": "KNOWS"}); mx != 10 {
+		t.Errorf("supernode max degree = %d, want 10", mx)
+	}
+	// The incoming side points every edge at a distinct node, so its degree is one everywhere: a
+	// uniform direction next to the skewed one, confirming the per-direction split.
+	in := Labels{"type": "KNOWS", "dir": "in"}
+	if p99 := db.Metrics().Gauge("gr_degree_p99", in); p99 != 1 {
+		t.Errorf("incoming degree p99 = %d, want 1", p99)
+	}
+	if skew := db.Metrics().Gauge("gr_degree_skew_ratio", in); skew != 1 {
+		t.Errorf("incoming skew ratio = %d, want 1 (uniform)", skew)
+	}
+}
+
 // TestMetricsExpandWildcard confirms an expand with no named type is attributed to the all-types
 // bucket: the type label is "*" rather than a relationship-type name (doc 20 §6.1).
 func TestMetricsExpandWildcard(t *testing.T) {

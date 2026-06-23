@@ -159,6 +159,23 @@ type DiskEngine struct {
 	// timing is skipped when it is nil. The observe is a lock-free atomic bucket add, so timing a
 	// decode does not serialize the read path.
 	decodeObs SegmentDecodeObserver
+
+	// degreeStats is the per-(type, direction) degree distribution published at
+	// open and after each checkpoint, the substrate for the supernode and skew
+	// metrics (doc 20 §6.2). It is computed under the engine lock, where the adj
+	// degree summaries are consistent, and stored here so db.Metrics() can read it
+	// lock-free without taking the engine lock (which a live writer holds for its
+	// whole transaction, so the metrics path must never wait on it).
+	degreeStats atomic.Pointer[[]DegreeStat]
+}
+
+// DegreeStat is one (relationship type, direction) slot's degree distribution, the
+// engine-facing shape of an adj.DegreeSummary with the slot already split into a
+// typed, directed pair (doc 20 §6.2).
+type DegreeStat struct {
+	Type                        Token
+	Dir                         Direction
+	Nodes, Edges, Max, P50, P99 uint64
 }
 
 // Open opens or creates a graph database at path. A fresh file gets empty stores,
@@ -331,6 +348,7 @@ func (e *DiskEngine) load(create bool) error {
 		if e.st, err = stats.Create(e.p, e.secs); err != nil {
 			return err
 		}
+		e.publishDegreeStats()
 		return e.rebuildIndexes()
 	}
 	if e.secs, err = store.OpenSections(e.p); err != nil {
@@ -366,6 +384,7 @@ func (e *DiskEngine) load(create bool) error {
 	if e.st, err = stats.Open(e.p, e.secs); err != nil {
 		return err
 	}
+	e.publishDegreeStats()
 	return e.rebuildIndexes()
 }
 
@@ -708,7 +727,49 @@ func (e *DiskEngine) Checkpoint() error {
 	e.gcDurMu.Lock()
 	e.gcDurations = append(e.gcDurations, gcDur)
 	e.gcDurMu.Unlock()
+	// The fold rebuilt the adjacency base, so its degree distribution changed;
+	// republish it for the metrics path while we still hold the engine lock.
+	e.publishDegreeStats()
 	return nil
+}
+
+// publishDegreeStats converts the adjacency's per-slot degree summaries into the
+// engine's typed, directed DegreeStat list and stores it for the lock-free
+// metrics path (doc 20 §6.2). The caller holds the engine lock, where adj's
+// degStats is consistent; the published slice is the metrics path's only view, so
+// it never reaches into adj. A slot maps to a type token (slot/2, shifted to the
+// 1-based SPI space) and a direction (slot%2).
+func (e *DiskEngine) publishDegreeStats() {
+	summaries := e.adj.DegreeStats()
+	out := make([]DegreeStat, 0, len(summaries))
+	for s, d := range summaries {
+		dir := Outgoing
+		if adj.SlotDir(s) == adj.In {
+			dir = Incoming
+		}
+		out = append(out, DegreeStat{
+			Type:  toTok(adj.SlotType(s)),
+			Dir:   dir,
+			Nodes: d.Nodes,
+			Edges: d.Edges,
+			Max:   d.Max,
+			P50:   d.P50,
+			P99:   d.P99,
+		})
+	}
+	e.degreeStats.Store(&out)
+}
+
+// DegreeStats returns the per-(type, direction) degree distribution published at
+// the last open or checkpoint, read lock-free so the metrics path never waits on
+// the engine lock a live writer holds (doc 20 §6.2). It returns nil before the
+// first publish.
+func (e *DiskEngine) DegreeStats() []DegreeStat {
+	p := e.degreeStats.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
 }
 
 // Backup writes a consistent physical image of the database to w and returns the

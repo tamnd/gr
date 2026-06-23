@@ -113,6 +113,25 @@ type Adj struct {
 	// the base offset delta plus this. It is reset at checkpoint, when the base
 	// offsets again reflect every live edge.
 	degTail map[uint32]map[uint64]int64
+	// degStats is the per-slot degree distribution computed from the base offset
+	// array at the last open or checkpoint: it feeds the supernode and skew
+	// metrics (doc 20 §6.2). It is rebuilt whenever the base does, so it reflects
+	// only the folded edges, which is exactly the durable state a planner reasons
+	// about. It is written on the write/checkpoint path and read by DegreeStats,
+	// both under the engine's exclusive lock, so it needs no lock of its own.
+	degStats map[uint32]DegreeSummary
+}
+
+// DegreeSummary is one slot's degree distribution, computed by a single pass over
+// the base CSR offset array with no edge reads (doc 20 §6.2). It counts only
+// participating sources, those with at least one edge in the slot, so a slot the
+// schema knows but a node never uses does not drag the percentiles to zero.
+type DegreeSummary struct {
+	Nodes uint64 // sources with degree >= 1 in this slot
+	Edges uint64 // sum of those sources' degrees
+	Max   uint64 // largest single degree, the supernode tip
+	P50   uint64 // median degree over participating sources
+	P99   uint64 // 99th-percentile degree over participating sources
 }
 
 // Create initializes a fresh adjacency: an empty base directory and a zero
@@ -130,9 +149,10 @@ func Create(p *pager.Pager, secs *store.Sections, rels *rel.Store) (*Adj, error)
 	}
 	return &Adj{
 		p: p, secs: secs, rels: rels, dir: dir,
-		delta:   map[uint32]map[uint64][]Neighbor{},
-		cache:   map[uint32]*base{},
-		degTail: map[uint32]map[uint64]int64{},
+		delta:    map[uint32]map[uint64][]Neighbor{},
+		cache:    map[uint32]*base{},
+		degTail:  map[uint32]map[uint64]int64{},
+		degStats: map[uint32]DegreeSummary{},
 	}, nil
 }
 
@@ -153,11 +173,15 @@ func Open(p *pager.Pager, secs *store.Sections, rels *rel.Store) (*Adj, error) {
 	}
 	a := &Adj{
 		p: p, secs: secs, rels: rels, dir: dir, folded: folded,
-		delta:   map[uint32]map[uint64][]Neighbor{},
-		cache:   map[uint32]*base{},
-		degTail: map[uint32]map[uint64]int64{},
+		delta:    map[uint32]map[uint64][]Neighbor{},
+		cache:    map[uint32]*base{},
+		degTail:  map[uint32]map[uint64]int64{},
+		degStats: map[uint32]DegreeSummary{},
 	}
 	if err := a.rebuildDelta(); err != nil {
+		return nil, err
+	}
+	if err := a.recomputeDegStats(); err != nil {
 		return nil, err
 	}
 	return a, nil
@@ -433,9 +457,9 @@ func (a *Adj) freeOldBase(s uint32) error {
 // order), and the logical offset count (nodeCount+1). An empty slot has logHead
 // zero and offLen zero.
 type dirCell struct {
-	logHead                    format.PageID
+	logHead                      format.PageID
 	offBytes, nbrBytes, edgBytes uint64
-	offLen                     uint64
+	offLen                       uint64
 }
 
 func (a *Adj) readDir(s uint32) (dirCell, error) {
@@ -564,8 +588,115 @@ func (a *Adj) Checkpoint(nodeCount uint64) error {
 	// The rebuilt base offsets now reflect every live edge, so the tail
 	// adjustment starts fresh.
 	a.degTail = map[uint32]map[uint64]int64{}
+	// The base just changed, so the degree distribution did too: recompute it from
+	// the fresh offset arrays while we are already on the write path.
+	return a.recomputeDegStats()
+}
+
+// recomputeDegStats rebuilds the per-slot degree distribution from the base
+// offset arrays. It runs at open and after each checkpoint, the two points the
+// base is freshly consistent, and reads only each slot's offset blob, never its
+// neighbor or edge arrays, so it stays cheap even for a graph full of supernodes.
+func (a *Adj) recomputeDegStats() error {
+	stats := make(map[uint32]DegreeSummary, a.dir.Count())
+	for s := 0; s < a.dir.Count(); s++ {
+		off, err := a.slotOffsets(uint32(s))
+		if err != nil {
+			return err
+		}
+		if len(off) < 2 {
+			continue
+		}
+		degs := make([]uint64, 0, len(off)-1)
+		var sum, mx uint64
+		for i := 1; i < len(off); i++ {
+			d := off[i] - off[i-1]
+			if d == 0 {
+				continue // a node with no edge in this slot does not participate
+			}
+			degs = append(degs, d)
+			sum += d
+			if d > mx {
+				mx = d
+			}
+		}
+		if len(degs) == 0 {
+			continue
+		}
+		slices.Sort(degs)
+		stats[uint32(s)] = DegreeSummary{
+			Nodes: uint64(len(degs)),
+			Edges: sum,
+			Max:   mx,
+			P50:   percentile(degs, 50),
+			P99:   percentile(degs, 99),
+		}
+	}
+	a.degStats = stats
 	return nil
 }
+
+// slotOffsets decodes just a slot's offset array, the first of its three packed
+// blobs, leaving the neighbor and edge blobs on disk. An empty slot has no base
+// and returns nil.
+func (a *Adj) slotOffsets(s uint32) ([]uint64, error) {
+	c, err := a.readDir(s)
+	if err != nil {
+		return nil, err
+	}
+	if c.offLen == 0 {
+		return nil, nil
+	}
+	log, err := store.OpenLog(a.p, c.logHead, int(c.offBytes))
+	if err != nil {
+		return nil, err
+	}
+	blob := make([]byte, c.offBytes)
+	if err := log.Read(0, int(c.offBytes), blob); err != nil {
+		return nil, err
+	}
+	return decodeArray(blob)
+}
+
+// percentile returns the nearest-rank pth percentile of a sorted, non-empty
+// degree slice: the value at rank ceil(p*n/100), one-based and clamped into the
+// slice. Nearest-rank needs no interpolation, so it returns an actual observed
+// degree, which reads naturally as a metric ("the 99th-percentile node has this
+// many edges").
+func percentile(sorted []uint64, p int) uint64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	rank := (p*len(sorted) + 99) / 100 // ceil(p*n/100)
+	if rank < 1 {
+		rank = 1
+	}
+	if rank > len(sorted) {
+		rank = len(sorted)
+	}
+	return sorted[rank-1]
+}
+
+// DegreeStats returns a copy of the per-slot degree summaries computed at the
+// last open or checkpoint, keyed by slot (relType*2 + direction). It is read on
+// the write/checkpoint path under the engine's exclusive lock, so degStats itself
+// needs no lock; the copy lets the caller publish the snapshot without aliasing
+// the live map.
+func (a *Adj) DegreeStats() map[uint32]DegreeSummary {
+	out := make(map[uint32]DegreeSummary, len(a.degStats))
+	for k, v := range a.degStats {
+		out[k] = v
+	}
+	return out
+}
+
+// SlotType and SlotDir split a slot key back into its relationship type token and
+// direction, the inverse of the packing slot() does, so a caller mapping per-slot
+// stats onto typed, directed metric labels need not know the encoding.
+func SlotType(s uint32) uint32 { return s / 2 }
+
+// SlotDir returns the direction half of a slot key.
+func SlotDir(s uint32) Dir { return Dir(s % 2) }
 
 // DeltaLen reports how many (source, slot) neighbor entries are pending in the
 // delta. It is zero immediately after a checkpoint.

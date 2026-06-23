@@ -58,6 +58,7 @@ func (db *DB) Metrics() MetricsSnapshot {
 	db.syncPageStoreMetrics()
 	db.syncWalMetrics()
 	db.syncMvccGCMetrics()
+	db.syncDegreeMetrics()
 	return db.metrics.reg.Snapshot()
 }
 
@@ -193,6 +194,102 @@ func (db *DB) syncCacheMemoryMetrics() {
 		columnBudget := int64(db.eng.BlockCacheStats().Budget)
 		m.cacheBudget.Set(poolBudget + columnBudget)
 	}
+}
+
+// syncDegreeMetrics sets the supernode and skew gauges from the engine's published degree
+// distribution at snapshot time (doc 20 §6.2): gr_degree_p50{type,dir} and gr_degree_p99{type,dir}
+// are the median and 99th-percentile degree, gr_degree_skew_ratio{type,dir} is the max-over-mean
+// ratio that is the at-a-glance skew signal, and gr_supernode_max_degree{type} is the densest node of
+// a type, the max over both directions. The engine recomputes the distribution at open and after each
+// checkpoint under its own lock and publishes it to an atomic pointer, so reading it here is a
+// lock-free load that never waits on the engine lock a write transaction holds. The handles register
+// lazily the first time a (type,dir) appears, so a database with no relationships never creates them.
+// Every cached gauge is zeroed before the present slots are applied, so a type whose edges were all
+// deleted (and so dropped from the published distribution) reads zero rather than its stale last value.
+func (db *DB) syncDegreeMetrics() {
+	if db.eng == nil {
+		return
+	}
+	m := db.metrics
+	m.degreeHandles.Range(func(_, v any) bool {
+		h := v.(*degreeHandles)
+		h.p50.Set(0)
+		h.p99.Set(0)
+		h.skew.Set(0)
+		return true
+	})
+	m.degreeMaxHandles.Range(func(_, v any) bool {
+		v.(*metric.Gauge).Set(0)
+		return true
+	})
+	maxByType := map[engine.Token]uint64{}
+	for _, d := range db.eng.DegreeStats() {
+		h := m.degreeHandlesFor(d.Type, d.Dir)
+		h.p50.Set(int64(d.P50))
+		h.p99.Set(int64(d.P99))
+		// skew = max_degree / mean_degree = Max * Nodes / Edges, in integers to avoid a float gauge.
+		// The interesting range spans orders of magnitude (one for a uniform graph, thousands for a
+		// power-law graph), so the dropped fraction does not matter to the signal.
+		if d.Edges > 0 {
+			h.skew.Set(int64(d.Max * d.Nodes / d.Edges))
+		}
+		if d.Max > maxByType[d.Type] {
+			maxByType[d.Type] = d.Max
+		}
+	}
+	for tok, mx := range maxByType {
+		m.degreeMaxHandleFor(tok).Set(int64(mx))
+	}
+}
+
+// degreeHandlesFor returns the cached p50/p99/skew gauges for a (type,dir), registering them on the
+// first scrape that sees the slot. The type label is the relationship-type name, or "*" when the
+// token does not resolve, the same convention the expand metrics use; the dir label is out or in.
+func (m *queryMetrics) degreeHandlesFor(relType engine.Token, dir engine.Direction) *degreeHandles {
+	key := degreeKey{tok: relType, dir: dir}
+	if v, ok := m.degreeHandles.Load(key); ok {
+		return v.(*degreeHandles)
+	}
+	typeLabel := degreeTypeLabel(m, relType)
+	dirLabel := metricExpandDir(dir)
+	h := &degreeHandles{
+		p50: m.reg.Gauge("gr_degree_p50",
+			"Median degree by type and direction, the typical fan-out", "edges",
+			metric.Labels{"type": typeLabel, "dir": dirLabel}),
+		p99: m.reg.Gauge("gr_degree_p99",
+			"99th-percentile degree by type and direction; its gap over p50 quantifies skew", "edges",
+			metric.Labels{"type": typeLabel, "dir": dirLabel}),
+		skew: m.reg.Gauge("gr_degree_skew_ratio",
+			"Max-over-mean degree by type and direction, the at-a-glance skew signal", "ratio",
+			metric.Labels{"type": typeLabel, "dir": dirLabel}),
+	}
+	actual, _ := m.degreeHandles.LoadOrStore(key, h)
+	return actual.(*degreeHandles)
+}
+
+// degreeMaxHandleFor returns the cached supernode max-degree gauge for a type, registering it on the
+// first scrape that sees the type. It is labelled by type only, since it is the max over both
+// directions.
+func (m *queryMetrics) degreeMaxHandleFor(relType engine.Token) *metric.Gauge {
+	if v, ok := m.degreeMaxHandles.Load(relType); ok {
+		return v.(*metric.Gauge)
+	}
+	g := m.reg.Gauge("gr_supernode_max_degree",
+		"Maximum degree of any node of a type, the worst-case fan-out the planner must respect", "edges",
+		metric.Labels{"type": degreeTypeLabel(m, relType)})
+	actual, _ := m.degreeMaxHandles.LoadOrStore(relType, g)
+	return actual.(*metric.Gauge)
+}
+
+// degreeTypeLabel resolves a relationship-type token to its name for a degree metric's type label,
+// falling back to "*" when the token does not resolve, the same convention the expand metrics use.
+func degreeTypeLabel(m *queryMetrics, relType engine.Token) string {
+	if relType != 0 && m.relTypeName != nil {
+		if name, ok := m.relTypeName(relType); ok {
+			return name
+		}
+	}
+	return "*"
 }
 
 // syncCheckpointMetrics mirrors the engine's cumulative per-checkpoint work counts into the registry at
@@ -844,6 +941,13 @@ type queryMetrics struct {
 	// per-source and per-path reports stay off the registry lock. The key space is the schema's
 	// relationship types plus the all-types token, so the cache stays small (§7.2).
 	varlenHandles sync.Map // engine.Token -> *varlenHandles
+	// degreeHandles caches the per-(type,dir) degree-distribution gauges (p50, p99, skew ratio), keyed
+	// by degreeKey, and degreeMaxHandles caches the per-type supernode max-degree gauge. They are set
+	// on the snapshot path from the engine's published degree statistics, so they register lazily the
+	// first time a (type,dir) appears and are reused every later scrape (§6.2). The key space is the
+	// schema's relationship types times two directions, so the caches stay small.
+	degreeHandles    sync.Map // degreeKey -> *degreeHandles
+	degreeMaxHandles sync.Map // engine.Token -> *metric.Gauge
 }
 
 // constraintCheckKey identifies one gr_constraint_checks_total series: the constraint kind (unique,
@@ -887,6 +991,22 @@ type expandHandles struct {
 type varlenHandles struct {
 	total *metric.Counter
 	depth *metric.Histogram
+}
+
+// degreeKey identifies the degree-distribution gauges for one (type, direction): a relationship-type
+// token and a direction. Both are small integers, so the key is a cheap comparable sync.Map key.
+type degreeKey struct {
+	tok engine.Token
+	dir engine.Direction
+}
+
+// degreeHandles holds the three per-(type,dir) degree gauges: the median and 99th-percentile degree
+// and the skew ratio (max over mean). They are resolved together because the engine publishes all
+// three for a slot at once, so a slot that appears sets all three on the same scrape.
+type degreeHandles struct {
+	p50  *metric.Gauge
+	p99  *metric.Gauge
+	skew *metric.Gauge
 }
 
 // sessionHandles holds the three session metric series for one protocol: the open-connection gauge,

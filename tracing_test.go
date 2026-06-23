@@ -80,6 +80,32 @@ func (tr *recordingTracer) last() *recordingSpan {
 	return tr.spans[len(tr.spans)-1]
 }
 
+// named returns the first span started under name, or nil if none, so a test asserts a phase
+// span was emitted.
+func (tr *recordingTracer) named(name string) *recordingSpan {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	for _, s := range tr.spans {
+		if s.name == name {
+			return s
+		}
+	}
+	return nil
+}
+
+// lastNamed returns the most recent span started under name, for a test that runs several
+// statements and wants the last one's span.
+func (tr *recordingTracer) lastNamed(name string) *recordingSpan {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	for i := len(tr.spans) - 1; i >= 0; i-- {
+		if tr.spans[i].name == name {
+			return tr.spans[i]
+		}
+	}
+	return nil
+}
+
 // TestDBTracerRootSpanOnWrite confirms a write through Run starts and ends a root gr.query span
 // carrying the correlation id, the kind, the ok status, and the rows it returned (doc 20 §12.2,
 // §12.3).
@@ -92,7 +118,7 @@ func TestDBTracerRootSpanOnWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	span := tr.last()
+	span := tr.named("gr.query")
 	if span == nil {
 		t.Fatal("no span started for a write")
 	}
@@ -129,7 +155,7 @@ func TestDBTracerRootSpanOnRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	readSpan := tr.last()
+	readSpan := tr.lastNamed("gr.query")
 	if readSpan == nil || readSpan.name != "gr.query" {
 		t.Fatal("no root span for the read")
 	}
@@ -173,7 +199,7 @@ func TestDBTracerRootSpanOnError(t *testing.T) {
 	if _, err := db.Run(context.Background(), "THIS IS NOT CYPHER", nil); err == nil {
 		t.Fatal("a parse failure was accepted")
 	}
-	span := tr.last()
+	span := tr.named("gr.query")
 	if span == nil {
 		t.Fatal("no span started for a parse failure")
 	}
@@ -204,7 +230,7 @@ func TestDBTracerShareIDWithQueryLog(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	span := tr.last()
+	span := tr.named("gr.query")
 	if span == nil {
 		t.Fatal("no span")
 	}
@@ -223,6 +249,55 @@ func TestDBTracerShareIDWithQueryLog(t *testing.T) {
 	}
 	if logged["query_id"] != spanID {
 		t.Errorf("query-log id = %v, span id = %v, want equal", logged["query_id"], spanID)
+	}
+}
+
+// TestDBTracerParseSpan confirms a statement emits a gr.parse child span tagged with the
+// statement length and ended (doc 20 §12.2, §12.3).
+func TestDBTracerParseSpan(t *testing.T) {
+	tr := &recordingTracer{}
+	db := openMemTraced(t, "trace_parse.gr", tr)
+	defer func() { _ = db.Close() }()
+
+	const stmt = "CREATE (:Person {name: 'a'})"
+	if _, err := db.Run(context.Background(), stmt, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	parse := tr.named("gr.parse")
+	if parse == nil {
+		t.Fatal("no gr.parse span emitted")
+	}
+	if !parse.ended {
+		t.Error("gr.parse span was not ended")
+	}
+	if !parse.ok {
+		t.Error("gr.parse span was marked failed for a valid statement")
+	}
+	if parse.ints["gr.parse.query_len"] != int64(len(stmt)) {
+		t.Errorf("gr.parse.query_len = %d, want %d", parse.ints["gr.parse.query_len"], len(stmt))
+	}
+}
+
+// TestDBTracerParseSpanFailed confirms a parse failure ends the gr.parse span marked failed, so
+// the phase that failed is visible in the trace (doc 20 §12.2).
+func TestDBTracerParseSpanFailed(t *testing.T) {
+	tr := &recordingTracer{}
+	db := openMemTraced(t, "trace_parsefail.gr", tr)
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Run(context.Background(), "NOT CYPHER AT ALL", nil); err == nil {
+		t.Fatal("a parse failure was accepted")
+	}
+	parse := tr.named("gr.parse")
+	if parse == nil {
+		t.Fatal("no gr.parse span emitted for a parse failure")
+	}
+	if !parse.ended {
+		t.Error("gr.parse span was not ended")
+	}
+	if parse.ok {
+		t.Error("gr.parse span was marked ok for a parse failure")
 	}
 }
 

@@ -208,7 +208,10 @@ func (tx *Tx) Run(ctx context.Context, cypher string, params Params, opts ...Run
 	if err != nil {
 		return nil, err
 	}
+	// The gr.parse phase span decomposes the parse cost out of the root span (doc 20 §12.2).
+	pspan := tx.db.parseSpan(ctx, cypher)
 	q, err := parse.Parse(cypher)
+	endPhaseSpan(pspan, err)
 	if err != nil {
 		// As in the database-level Run, a parse failure counts in gr_query_errors_total even
 		// though it never reaches gr_queries_total (doc 20 §3.1), and the query log records the

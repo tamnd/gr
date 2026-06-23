@@ -60,6 +60,47 @@ func (db *DB) startQuerySpan(ctx context.Context, id, kind string) (context.Cont
 	return ctx, span
 }
 
+// startPhaseSpan begins a child span named name under the root span carried in ctx when a tracer
+// is configured (doc 20 §12.2), for the per-phase decomposition of a query (gr.parse, gr.plan,
+// gr.execute, gr.stream). A nil tracer returns the context unchanged and a nil span, so a phase
+// boundary calls this unconditionally and an untraced database pays only the nil check. It
+// returns the child context too so a phase that has children of its own (gr.execute and its
+// operator spans) parents them correctly.
+func (db *DB) startPhaseSpan(ctx context.Context, name string) (context.Context, Span) {
+	if db.tracer == nil {
+		return ctx, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return db.tracer.StartSpan(ctx, name)
+}
+
+// parseSpan begins the gr.parse phase span for a statement of the given text (doc 20 §12.2),
+// tagging it with the statement length (doc 20 §12.3). Parse has no child spans, so it returns
+// only the span, which the caller ends with endPhaseSpan once the parse returns.
+func (db *DB) parseSpan(ctx context.Context, cypher string) Span {
+	_, span := db.startPhaseSpan(ctx, "gr.parse")
+	if span != nil {
+		span.SetInt("gr.parse.query_len", int64(len(cypher)))
+	}
+	return span
+}
+
+// endPhaseSpan closes a phase span, marking it failed when the phase errored (doc 20 §12.2). It
+// is nil-safe so a phase boundary ends the span whether or not tracing is on.
+func endPhaseSpan(span Span, err error) {
+	if span == nil {
+		return
+	}
+	if err != nil {
+		span.SetStatus(false, queryStatus(err))
+	} else {
+		span.SetStatus(true, "ok")
+	}
+	span.End()
+}
+
 // endQuerySpan closes the root span at a query's completion boundary (doc 20 §12.2), recording
 // the outcome and the output cardinality as attributes (doc 20 §12.3) so a trace shows the
 // status and the rows the same way the query-log entry does. It is nil-safe so the eager, error,

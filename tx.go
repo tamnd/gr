@@ -275,6 +275,11 @@ func (tx *Tx) runDispatch(q *ast.Query, cypher string, vals map[string]value.Val
 func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
 	var b *bind.Bound
 	var op plan.Op
+	// st is the statistics the captured plan is rendered against for the slow-query log (doc 20
+	// §10.6): a read inside a write transaction binds structurally with no cost model, so it has
+	// none and PlanText shows the bare tree; a plain read's plan was cost-chosen, so the listing
+	// carries the per-operator estimates the engine statistics supply.
+	var st plan.Statistics
 	if tx.write {
 		// A read inside a write transaction binds against the transaction's own catalog, so it
 		// never uses the plan cache: time the bind and plan as a plan-cache miss (doc 20 §3.1).
@@ -291,6 +296,7 @@ func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value
 			return nil, err
 		}
 		b, op = entry.Bound, entry.Op
+		st = engineStats{tx.db.eng}
 	}
 	// The executor span starts once the plan is ready; Close records the time since it as
 	// gr_query_execute_duration_seconds (doc 20 §3.1).
@@ -299,7 +305,7 @@ func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value
 	if err != nil {
 		return nil, err
 	}
-	return &Result{cols: cur.Cols(), cursor: cur, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy), mscan: cur.ScanCount(), mexec: execStart}, nil
+	return &Result{cols: cur.Cols(), cursor: cur, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy), mscan: cur.ScanCount(), mexec: execStart, planOp: op, planStats: st}, nil
 }
 
 // runWrite executes a write statement eagerly and returns a result over its
@@ -310,11 +316,11 @@ func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value
 // catalog view (doc 13 §9), so the write takes no lock it does not already hold and
 // leaves no orphan token on rollback (doc 13 §16).
 func (tx *Tx) runWrite(q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
-	cols, buf, summary, scanned, err := tx.db.execWriteBuffered(tx.etx, q, params)
+	cols, buf, summary, scanned, op, err := tx.db.execWriteBuffered(tx.etx, q, params)
 	if err != nil {
 		return nil, err
 	}
-	return &Result{cols: cols, buf: buf, summary: summary, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy), mscan: scanned}, nil
+	return &Result{cols: cols, buf: buf, summary: summary, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy), mscan: scanned, planOp: op}, nil
 }
 
 // Exec runs a Cypher write statement against the transaction and returns a summary

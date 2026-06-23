@@ -47,6 +47,30 @@ const (
 // 24): a query slower than this is logged in full regardless of the query-log level.
 const defaultSlowQuery = time.Second
 
+// PlanCapture sets how much of a slow query's plan the slow-query log keeps (doc 20 §10.6,
+// §28.2). A slow-query entry carries the plan the query ran, so an operator diagnoses an
+// incident from the captured plan without reproducing it, the difference between "a query
+// was slow last night" and "here is the plan it ran". Capture costs the plan serialization,
+// so the depth is a configured choice.
+type PlanCapture int
+
+const (
+	// PlanCaptureOff keeps no plan with a slow-query entry, the lightest setting for a
+	// deployment that wants the slow tail without the plan-serialization cost.
+	PlanCaptureOff PlanCapture = iota
+	// PlanCaptureExplain keeps the EXPLAIN-grade plan tree (section 8), the production
+	// default: it serializes the already-computed plan, so it is cheap and adds nothing to
+	// the fast path of a query that turns out fast.
+	PlanCaptureExplain
+	// PlanCaptureProfile keeps the PROFILE-grade plan with actual rows and times (section 9).
+	// It is opt-in because it instruments every query in case it turns out slow, paying the
+	// per-call profiling overhead on all of them, a trade for diagnosing a recurring slow
+	// query that cannot be caught live. The profiling shim is not yet wired into the served
+	// query path, so this currently captures the EXPLAIN-grade plan and is documented as the
+	// ceiling the capture will reach.
+	PlanCaptureProfile
+)
+
 // QueryRecord is one query execution's facts, assembled by a server surface and handed to
 // the query log (doc 20 §10.2). A surface fills what it knows; the engine-internal fields
 // the spec also lists (peak memory, plan time, rows scanned, spill) wait on the executor
@@ -65,6 +89,12 @@ type QueryRecord struct {
 	Duration     time.Duration  // end-to-end query duration
 	RowsReturned int            // result row count
 	TxID         string         // the transaction the query ran in
+	// Plan, when set, renders the EXPLAIN-grade plan tree the query ran (doc 20 §10.6). It
+	// is a thunk, not the rendered text, so the cost of serializing the plan is paid only
+	// when the log decides a query is slow and plan capture is on, never on the fast path of
+	// a query that turns out quick. A surface sets it to the result's PlanText; nil leaves a
+	// slow-query entry without a captured plan, the same as plan capture being off.
+	Plan func() string
 }
 
 // QueryLog writes structured query-log entries through an slog.Logger (doc 20 §10, §11.2),
@@ -75,10 +105,11 @@ type QueryRecord struct {
 // A nil *QueryLog is disabled and records nothing, the embedded-friendly default when no
 // logger is configured.
 type QueryLog struct {
-	logger *slog.Logger
-	level  QueryLogLevel
-	redact RedactPolicy
-	slow   time.Duration
+	logger  *slog.Logger
+	level   QueryLogLevel
+	redact  RedactPolicy
+	slow    time.Duration
+	capture PlanCapture
 	// events, when set, receives a query_slow event for a slow query and a query_error
 	// event for a failed one (doc 20 §11.3), the lighter signals an operator alerts on
 	// alongside the full query-log record. nil leaves the event stream untouched, so the
@@ -98,7 +129,21 @@ func NewQueryLog(logger *slog.Logger, level QueryLogLevel, redact RedactPolicy, 
 	if slow <= 0 {
 		slow = defaultSlowQuery
 	}
-	return &QueryLog{logger: logger, level: level, redact: redact, slow: slow}
+	// EXPLAIN-grade capture is the production default (doc 20 §28.2): it serializes the
+	// already-computed plan, so a slow-query entry carries the plan it ran at no cost to the
+	// fast path. WithPlanCapture changes the depth.
+	return &QueryLog{logger: logger, level: level, redact: redact, slow: slow, capture: PlanCaptureExplain}
+}
+
+// WithPlanCapture sets how much of a slow query's plan the slow-query log keeps (doc 20
+// §10.6, §28.2) and returns the log for chaining. A nil query log is left nil. The default
+// from NewQueryLog is PlanCaptureExplain, the cheap, default-on capture; PlanCaptureOff
+// drops the plan, PlanCaptureProfile is the opt-in profiled capture.
+func (l *QueryLog) WithPlanCapture(c PlanCapture) *QueryLog {
+	if l != nil {
+		l.capture = c
+	}
+	return l
 }
 
 // WithEvents links the query log to an event log so a slow query raises a query_slow event
@@ -173,6 +218,16 @@ func (l *QueryLog) Record(r QueryRecord) {
 	}
 	if slow {
 		attrs = append(attrs, slog.Bool("slow", true), slog.Float64("threshold_ms", float64(l.slow)/float64(time.Millisecond)))
+		// A slow-query entry carries the captured plan (doc 20 §10.6): the plan the query ran,
+		// so an operator diagnoses the incident from the entry without reproducing it. The plan
+		// thunk runs only here, on the slow path, so the serialization cost lands only on the
+		// queries worth keeping the plan for. Capture off, or a surface that supplied no plan,
+		// leaves the entry without one.
+		if l.capture != PlanCaptureOff && r.Plan != nil {
+			if text := r.Plan(); text != "" {
+				attrs = append(attrs, slog.String("plan", text))
+			}
+		}
 	}
 	if failed && r.Err != nil {
 		attrs = append(attrs, slog.String("error", r.Err.Error()))

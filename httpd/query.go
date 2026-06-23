@@ -74,7 +74,7 @@ func (s *server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		status, ae := mapError(err)
 		s.writeError(w, status, ae)
-		s.recordQuery(r, req, started, queryStatus(err), err, 0, "")
+		s.recordQuery(r, req, started, queryStatus(err), err, 0, "", nil)
 		return
 	}
 	defer release()
@@ -87,7 +87,9 @@ func (s *server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	} else {
 		rows, rerr = s.bufferedResponse(w, res, req.IncludeCounters, intAsString)
 	}
-	s.recordQuery(r, req, started, queryStatus(rerr), rerr, rows, "")
+	// The result is fully drained but not yet released here, so its captured plan is still
+	// readable: pass res.PlanText so a slow query carries its plan in the log (doc 20 §10.6).
+	s.recordQuery(r, req, started, queryStatus(rerr), rerr, rows, "", res.PlanText)
 }
 
 // run executes the request's statement under the requested access mode (doc 18 §9.2).

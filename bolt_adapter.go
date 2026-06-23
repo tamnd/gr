@@ -543,6 +543,10 @@ func (c *boltCursor) Close() error {
 			Err:          c.rawErr,
 			Duration:     c.rec.clock().Sub(c.rec.started),
 			RowsReturned: c.rows,
+			// The result is drained but not yet released at this point, so its captured plan is
+			// readable: hand the log res.PlanText for the slow-query log's captured plan (doc 20
+			// §10.6). The log runs it only for a slow query, so a fast one pays nothing.
+			Plan: c.res.PlanText,
 		})
 		c.rec = nil
 	}

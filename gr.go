@@ -587,7 +587,7 @@ func (db *DB) query(cypher string, params map[string]value.Value, lazy bool) (*R
 		_ = tx.Abort()
 		return nil, err
 	}
-	return &Result{cols: cur.Cols(), cursor: cur, tx: tx, ownTx: true, mat: db.materializer(tx, lazy), mscan: cur.ScanCount(), mexec: execStart}, nil
+	return &Result{cols: cur.Cols(), cursor: cur, tx: tx, ownTx: true, mat: db.materializer(tx, lazy), mscan: cur.ScanCount(), mexec: execStart, planOp: entry.Op, planStats: engineStats{db.eng}}, nil
 }
 
 // execCtx builds the execution context shared by every run of a statement: the
@@ -629,16 +629,16 @@ func (db *DB) execCtx(etx engine.Tx, b *bind.Bound, params map[string]value.Valu
 // lands before the caller sees a row, so a half-consumed result cannot leave the
 // statement partly applied at commit. It does not begin, commit, or abort the
 // transaction; the caller owns that.
-func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]value.Value) ([]string, []eval.Row, Summary, *atomic.Int64, error) {
+func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]value.Value) ([]string, []eval.Row, Summary, *atomic.Int64, plan.Op, error) {
 	// A write is never served from the plan cache, so the bind and plan below are a full
 	// compile: time them as a plan-cache miss for gr_query_plan_duration_seconds (doc 20 §3.1).
 	pstart := time.Now()
 	if err := internWriteNames(etx, q); err != nil {
-		return nil, nil, Summary{}, nil, err
+		return nil, nil, Summary{}, nil, nil, err
 	}
 	b, err := bind.Bind(q, bind.NewEngineCatalog(etx), false)
 	if err != nil {
-		return nil, nil, Summary{}, nil, err
+		return nil, nil, Summary{}, nil, nil, err
 	}
 	op := plan.Plan(b)
 	db.metrics.recordPlan("miss", time.Since(pstart))
@@ -652,7 +652,7 @@ func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]v
 	cur, err := exec.Open(op, ctx)
 	if err != nil {
 		db.metrics.recordExecute("write", time.Since(estart))
-		return nil, nil, Summary{}, nil, err
+		return nil, nil, Summary{}, nil, nil, err
 	}
 	cols := cur.Cols()
 	var buf []eval.Row
@@ -661,7 +661,7 @@ func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]v
 		if err != nil {
 			_ = cur.Close()
 			db.metrics.recordExecute("write", time.Since(estart))
-			return nil, nil, Summary{}, nil, err
+			return nil, nil, Summary{}, nil, nil, err
 		}
 		if !ok {
 			break
@@ -670,12 +670,15 @@ func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]v
 	}
 	if err := cur.Close(); err != nil {
 		db.metrics.recordExecute("write", time.Since(estart))
-		return nil, nil, Summary{}, nil, err
+		return nil, nil, Summary{}, nil, nil, err
 	}
 	db.metrics.recordExecute("write", time.Since(estart))
 	// The scan counter is final now the cursor is drained and closed, so the caller stores it
 	// on the eager result and measureQuery reads it for gr_query_rows_scanned (doc 20 §3.1).
-	return cols, buf, summaryOf(eff), ctx.Scanned, nil
+	// The plan op rides back too, so the caller can render it for the slow-query log's captured
+	// plan (doc 20 §10.6); the write plan carries no cost estimates, so PlanText shows the bare
+	// tree.
+	return cols, buf, summaryOf(eff), ctx.Scanned, op, nil
 }
 
 // cloneRow copies a row map so a buffered write result does not alias a row the
@@ -773,7 +776,7 @@ func (db *DB) runAutoWrite(q *ast.Query, params map[string]value.Value, lazy boo
 	if err != nil {
 		return nil, err
 	}
-	cols, buf, summary, scanned, err := db.execWriteBuffered(tx, q, params)
+	cols, buf, summary, scanned, op, err := db.execWriteBuffered(tx, q, params)
 	if err != nil {
 		_ = tx.Abort()
 		return nil, err
@@ -781,7 +784,7 @@ func (db *DB) runAutoWrite(q *ast.Query, params map[string]value.Value, lazy boo
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	res := &Result{cols: cols, buf: buf, summary: summary, mscan: scanned}
+	res := &Result{cols: cols, buf: buf, summary: summary, mscan: scanned, planOp: op}
 	// A write commits before returning, so its buffered rows have no live snapshot to
 	// materialize their graph objects against. When the result carries rows, open a
 	// fresh read transaction over the just-committed state and let the result own it,
@@ -1650,6 +1653,34 @@ type Result struct {
 	// eager result reads its returned count from the buffer length instead.
 	mscan        *atomic.Int64
 	rowsReturned int64
+
+	// planOp and planStats carry the plan this result ran so PlanText can render the
+	// EXPLAIN-grade tree the slow-query log captures (doc 20 §10.6). planStats is the
+	// statistics the read plan was cost-chosen against, so the listing shows the per-operator
+	// row estimates; it is nil for a write, whose plan carries no estimates. Both are nil for
+	// a result with no executed plan (a schema, EXPLAIN, or PROFILE result), where PlanText
+	// returns the empty string.
+	planOp    plan.Op
+	planStats plan.Statistics
+}
+
+// PlanText renders the EXPLAIN-grade plan tree this result ran (doc 20 §10.6). It is the
+// same listing EXPLAIN prints: the operator tree annotated with the per-operator row
+// estimates when the plan was cost-chosen against statistics, the bare tree for a write
+// plan that carries none. The slow-query log calls it to capture the plan a slow query
+// used at the time it was slow, so an operator diagnoses the incident from the captured
+// plan without reproducing it. A result with no executed plan returns the empty string.
+func (r *Result) PlanText() string {
+	if r == nil || r.planOp == nil {
+		return ""
+	}
+	var text string
+	if r.planStats != nil {
+		text = plan.StringWithRows(r.planOp, r.planStats)
+	} else {
+		text = plan.String(r.planOp)
+	}
+	return strings.TrimRight(text, "\n")
 }
 
 // Columns returns the result's output column names in order. It is the same column

@@ -15,7 +15,7 @@ import (
 // its placeholders, the timing, the outcome) and hands them to the shared query log, which
 // decides whether to emit by its level and slow threshold and redacts the parameters. A
 // nil log makes this a no-op, so the call site never guards it.
-func (s *server) recordQuery(r *http.Request, req queryRequest, started time.Time, status string, qerr error, rows int, txID string) {
+func (s *server) recordQuery(r *http.Request, req queryRequest, started time.Time, status string, qerr error, rows int, txID string, plan func() string) {
 	if s.qlog == nil {
 		return
 	}
@@ -40,6 +40,11 @@ func (s *server) recordQuery(r *http.Request, req queryRequest, started time.Tim
 		Duration:     s.now().Sub(started),
 		RowsReturned: rows,
 		TxID:         txID,
+		// The plan thunk renders the EXPLAIN-grade plan for the slow-query log's captured plan
+		// (doc 20 §10.6); the query log runs it only if it decides the query was slow, so a fast
+		// query pays nothing. A query that failed before it ran has no plan, so the caller passes
+		// nil on the error paths.
+		Plan: plan,
 	})
 }
 

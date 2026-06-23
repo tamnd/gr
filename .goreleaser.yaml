@@ -1,0 +1,205 @@
+# GoReleaser turns one tag push into everything a user might install from: raw
+# archives, Linux packages (deb, rpm, apk), a multi-arch container image, and
+# entries for the package managers (Homebrew, Scoop). `git tag vX.Y.Z && git
+# push --tags` fans out to all of them through .github/workflows/release.yml.
+#
+# gr is pure Go (CGO_ENABLED=0), so every target cross-compiles from the
+# Linux amd64 CI runner without a native toolchain (ADR-18, doc 21 §1).
+#
+# The full test suite, the config-freeze guard, the API stability guard, the
+# conformance gate, and the race detector all run as release gates in the
+# workflow; GoReleaser only runs if those gates are green.
+version: 2
+
+project_name: gr
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: gr
+    binary: gr
+    main: ./cmd/gr
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - linux_arm_7
+      - linux_386
+      - darwin_amd64
+      - darwin_arm64
+      - windows_amd64
+      - windows_arm64
+      - freebsd_amd64
+      - freebsd_arm64
+
+archives:
+  - id: default
+    ids:
+      - gr
+    name_template: "gr_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - STABILITY.md
+      - CONFORMANCE.md
+
+nfpms:
+  - id: linux-packages
+    package_name: gr
+    ids:
+      - gr
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: tamnd
+    homepage: https://github.com/tamnd/gr
+    maintainer: Duc-Tam Nguyen <tamnd87@gmail.com>
+    description: An embedded, single-file, labeled-property-graph database for Go that speaks Cypher.
+    license: Apache-2.0
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
+    section: utils
+    contents:
+      - src: ./LICENSE
+        dst: /usr/share/doc/gr/LICENSE
+      - src: ./README.md
+        dst: /usr/share/doc/gr/README.md
+      - src: ./STABILITY.md
+        dst: /usr/share/doc/gr/STABILITY.md
+      - src: ./CONFORMANCE.md
+        dst: /usr/share/doc/gr/CONFORMANCE.md
+
+dockers:
+  - id: gr-amd64
+    ids:
+      - gr
+    image_templates:
+      - "ghcr.io/tamnd/gr:{{ .Version }}-amd64"
+      - "ghcr.io/tamnd/gr:latest-amd64"
+    goarch: amd64
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=gr"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.source=https://github.com/tamnd/gr"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+
+  - id: gr-arm64
+    ids:
+      - gr
+    image_templates:
+      - "ghcr.io/tamnd/gr:{{ .Version }}-arm64"
+      - "ghcr.io/tamnd/gr:latest-arm64"
+    goarch: arm64
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=gr"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.source=https://github.com/tamnd/gr"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+
+docker_manifests:
+  - name_template: "ghcr.io/tamnd/gr:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/tamnd/gr:{{ .Version }}-amd64"
+      - "ghcr.io/tamnd/gr:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/tamnd/gr:latest"
+    image_templates:
+      - "ghcr.io/tamnd/gr:latest-amd64"
+      - "ghcr.io/tamnd/gr:latest-arm64"
+
+signs:
+  - cmd: cosign
+    certificate: "${artifact}.pem"
+    output: true
+    artifacts: checksum
+    args:
+      - sign-blob
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+      - "--yes"
+
+sboms:
+  - artifacts: archive
+    args:
+      - "$artifact"
+      - "--file"
+      - "$sbom"
+      - "--output"
+      - "cyclonedx-json"
+
+brews:
+  - name: gr
+    ids:
+      - default
+    repository:
+      owner: tamnd
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/tamnd/gr
+    description: An embedded, single-file, labeled-property-graph database for Go that speaks Cypher.
+    license: Apache-2.0
+    skip_upload: "{{ if .Env.HOMEBREW_TAP_GITHUB_TOKEN }}false{{ else }}true{{ end }}"
+
+scoops:
+  - name: gr
+    ids:
+      - default
+    repository:
+      owner: tamnd
+      name: scoop-bucket
+      token: "{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}"
+    homepage: https://github.com/tamnd/gr
+    description: An embedded, single-file, labeled-property-graph database for Go that speaks Cypher.
+    license: Apache-2.0
+    skip_upload: "{{ if .Env.SCOOP_BUCKET_GITHUB_TOKEN }}false{{ else }}true{{ end }}"
+
+release:
+  github:
+    owner: tamnd
+    name: gr
+  name_template: "gr {{ .Tag }}"
+  header: |
+    See [CHANGELOG](https://github.com/tamnd/gr/releases) for details.
+    The [STABILITY.md](https://github.com/tamnd/gr/blob/main/STABILITY.md) document records what this release commits not to break.
+    The [CONFORMANCE.md](https://github.com/tamnd/gr/blob/main/CONFORMANCE.md) document records the TCK pass rate and non-goals.
+  extra_files:
+    - glob: ./STABILITY.md
+    - glob: ./CONFORMANCE.md
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  use: github
+  sort: asc
+  groups:
+    - title: Features
+      regexp: "^feat"
+      order: 0
+    - title: Fixes
+      regexp: "^fix"
+      order: 1
+    - title: Other
+      order: 999

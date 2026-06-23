@@ -1,6 +1,7 @@
 package gr
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -25,7 +26,7 @@ func TestCompileReplansOnDataDrift(t *testing.T) {
 	}
 
 	const q = "MATCH (a:A)-[:R]->(b:B) RETURN a"
-	first, err := db.compile(q)
+	first, err := db.compile(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +40,7 @@ func TestCompileReplansOnDataDrift(t *testing.T) {
 		mustExec(t, db, "CREATE (:A)", nil)
 	}
 
-	second, err := db.compile(q)
+	second, err := db.compile(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +66,7 @@ func TestCompileReusesPlanWithinDrift(t *testing.T) {
 	}
 
 	const q = "MATCH (a:A)-[:R]->(b:B) RETURN a"
-	first, err := db.compile(q)
+	first, err := db.compile(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +76,7 @@ func TestCompileReusesPlanWithinDrift(t *testing.T) {
 		mustExec(t, db, "CREATE (:B)", nil)
 	}
 
-	second, err := db.compile(q)
+	second, err := db.compile(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +101,7 @@ func TestCompileDriftDisabled(t *testing.T) {
 	}
 
 	const q = "MATCH (a:A)-[:R]->(b:B) RETURN a"
-	first, err := db.compile(q)
+	first, err := db.compile(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +110,7 @@ func TestCompileDriftDisabled(t *testing.T) {
 		mustExec(t, db, "CREATE (:A)", nil)
 	}
 
-	second, err := db.compile(q)
+	second, err := db.compile(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
 	}

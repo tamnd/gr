@@ -229,14 +229,14 @@ func (tx *Tx) Run(ctx context.Context, cypher string, params Params, opts ...Run
 		span.SetString("gr.query.kind", kind)
 	}
 	tx.db.metrics.begin(kind)
-	res, err := tx.runDispatch(q, cypher, vals, cfg)
+	res, err := tx.runDispatch(ctx, q, cypher, vals, cfg)
 	return tx.db.measureQuery(kind, cypher, vals, start, id, span, res, err)
 }
 
 // runDispatch routes a parsed statement inside a managed transaction, the body of Run with
 // the metric instrumentation lifted out so the query metrics record once around the dispatch
 // (doc 20 §3.1).
-func (tx *Tx) runDispatch(q *ast.Query, cypher string, vals map[string]value.Value, cfg runConfig) (*Result, error) {
+func (tx *Tx) runDispatch(ctx context.Context, q *ast.Query, cypher string, vals map[string]value.Value, cfg runConfig) (*Result, error) {
 	if q.Explain {
 		// A write transaction holds the engine lock, so it must plan against its own
 		// catalog view and skip the seek rewrite (a nil index oracle) and the cost
@@ -276,7 +276,7 @@ func (tx *Tx) runDispatch(q *ast.Query, cypher string, vals map[string]value.Val
 		}
 		return tx.runWrite(q, vals, cfg.lazy)
 	}
-	return tx.runRead(cypher, q, vals, cfg.lazy)
+	return tx.runRead(ctx, cypher, q, vals, cfg.lazy)
 }
 
 // runRead opens a read statement over the transaction's snapshot and returns a
@@ -285,7 +285,7 @@ func (tx *Tx) runDispatch(q *ast.Query, cypher string, vals map[string]value.Val
 // transaction holds no write lock); a write transaction binds against its own
 // catalog view, since it holds the engine lock (an engine lookup would deadlock)
 // and must see its own uncommitted interned names.
-func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
+func (tx *Tx) runRead(ctx context.Context, cypher string, q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
 	var b *bind.Bound
 	var op plan.Op
 	// st is the statistics the captured plan is rendered against for the slow-query log (doc 20
@@ -304,7 +304,7 @@ func (tx *Tx) runRead(cypher string, q *ast.Query, params map[string]value.Value
 		b, op = bound, plan.Plan(bound)
 		tx.db.metrics.recordPlan("miss", time.Since(pstart))
 	} else {
-		entry, err := tx.db.compile(cypher)
+		entry, err := tx.db.compile(ctx, cypher)
 		if err != nil {
 			return nil, err
 		}

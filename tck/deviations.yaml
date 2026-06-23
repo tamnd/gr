@@ -1,0 +1,15 @@
+# tck/deviations.yaml — every intentional divergence from a TCK expectation.
+# Each entry documents a gr behavior that differs from what the openCypher TCK
+# expects, per the discipline in doc 23 §2.5.
+#
+# Fields:
+#   id:            unique deviation identifier (DEV-NNNN)
+#   scenario:      the exact scenario name from the .feature file
+#   feature:       the feature file (partial match, for reference)
+#   gr_behavior:   what gr actually does
+#   tck_expectation: what the TCK expects
+#   rationale:     why gr differs (GQL alignment, documented divergence, etc.)
+#   introduced:    the gr version where this was first documented
+#   tracking:      spec section or issue tracking the deviation
+#
+# Empty registry as of v0.4.0: all passing scenarios pass exactly.

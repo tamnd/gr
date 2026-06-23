@@ -112,12 +112,13 @@ type Cache struct {
 // Stats is a point-in-time view of the cache's lookup outcomes, resident population, and eviction
 // counts (doc 20 §4.4), the numbers the column-cache metrics expose. Hits and Misses are cumulative
 // since the cache was created, as are EvictCapacity and EvictInvalidation; Blocks and Bytes are the
-// current resident counts the budget bounds.
+// current resident counts the budget bounds, and Budget is that configured ceiling (doc 20 §4.5).
 type Stats struct {
 	Hits              uint64
 	Misses            uint64
 	Blocks            int
 	Bytes             int
+	Budget            int
 	EvictCapacity     uint64
 	EvictInvalidation uint64
 }
@@ -401,6 +402,7 @@ func (c *Cache) Stats() Stats {
 		Misses:            c.misses,
 		Blocks:            c.ring.Len(),
 		Bytes:             c.curBytes,
+		Budget:            c.maxBytes,
 		EvictCapacity:     c.evictCapacity,
 		EvictInvalidation: c.evictInvalidation,
 	}

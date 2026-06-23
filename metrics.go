@@ -188,6 +188,11 @@ func (db *DB) syncCacheMemoryMetrics() {
 	if m.cacheBudgetUsed != nil {
 		m.cacheBudgetUsed.Set(bufferpool + column)
 	}
+	if m.cacheBudget != nil {
+		poolBudget := int64(db.eng.BufferPoolStats().Budget)
+		columnBudget := int64(db.eng.BlockCacheStats().Budget)
+		m.cacheBudget.Set(poolBudget + columnBudget)
+	}
 }
 
 // syncCheckpointMetrics mirrors the engine's cumulative per-checkpoint work counts into the registry at
@@ -677,10 +682,13 @@ type queryMetrics struct {
 	// cacheMemory holds gr_cache_memory_bytes keyed by cache name, the unified per-cache
 	// resident-memory view (doc 20 §4.5), and cacheBudgetUsed gr_cache_budget_used_bytes, the sum of
 	// those caches' resident bytes. The sync step sets them from the same stats the per-cache syncs
-	// read, so the unified series and the per-cache gauges carry the same numbers. The configured
-	// total budget gauge, gr_cache_budget_bytes, waits on the cache-budget config (doc 14 §11.2).
+	// read, so the unified series and the per-cache gauges carry the same numbers. cacheBudget holds
+	// gr_cache_budget_bytes, the configured ceiling those resident bytes stay under (invariant 9): the
+	// sum of the per-cache budgets the buffer pool and the column cache are sized to, until a unified
+	// cache-budget config (doc 14 §11.2) replaces the per-cache caps with one knob.
 	cacheMemory     map[string]*metric.Gauge
 	cacheBudgetUsed *metric.Gauge
+	cacheBudget     *metric.Gauge
 
 	// checkpointTotal holds gr_checkpoint_total keyed by trigger, checkpointDuration the
 	// gr_checkpoint_duration_seconds histogram, and checkpointLast the
@@ -940,6 +948,8 @@ func newQueryMetrics() *queryMetrics {
 	}
 	m.cacheBudgetUsed = reg.Gauge("gr_cache_budget_used_bytes",
 		"Sum of all caches' resident memory, against the cache budget", "bytes", nil)
+	m.cacheBudget = reg.Gauge("gr_cache_budget_bytes",
+		"Configured total cache budget, the ceiling resident memory stays under", "bytes", nil)
 	m.checkpointTotal = make(map[string]*metric.Counter, len(metricCheckpointTriggers))
 	for _, trigger := range metricCheckpointTriggers {
 		m.checkpointTotal[trigger] = reg.Counter("gr_checkpoint_total",

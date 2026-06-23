@@ -113,6 +113,14 @@ type DB struct {
 	// site calls it without a guard. It is set at Open and read for the close event.
 	events *EventLog
 
+	// querylog is the per-query structured log (doc 20 §10), nil when none is configured,
+	// the embedded default. It records at each statement's completion boundary on the Run
+	// and Query seams: measureQuery for an eager result or an error, and the streaming
+	// read's Close, where the parse-through-last-row latency actually ends. When an event
+	// log is also configured it is linked at Open so a slow or failed query also raises the
+	// query_slow and query_error events (doc 20 §11.3).
+	querylog *QueryLog
+
 	// metrics is the database's metric registry and the pre-resolved query-metric handles
 	// (doc 20 §3.1). It is always built at Open, so db.Metrics never returns nil and the
 	// always-on collection runs whether or not a query log or event log is configured.
@@ -176,6 +184,13 @@ type Options struct {
 	// nothing until the embedder points it at an slog handler. Build one with
 	// [NewEventLog].
 	EventLog *EventLog
+	// QueryLog receives the per-query structured log (doc 20 §10): one entry per executed
+	// statement on the Run and Query seams, filtered by the log's level and the always-on
+	// slow-query rule, with parameters redacted by its policy. nil, the default, disables
+	// it, so an embedded database records no query log until the embedder builds one with
+	// [NewQueryLog]. When an EventLog is configured too, gr links them at Open so a slow or
+	// failed query also raises the lighter query_slow and query_error events (doc 20 §11.3).
+	QueryLog *QueryLog
 }
 
 // Open opens the database at path, creating it with a fresh graph structure if it
@@ -219,8 +234,13 @@ func Open(path string, opt Options) (*DB, error) {
 		lazyProps:   opt.LazyProperties,
 		readOnly:    opt.ReadOnly,
 		events:      opt.EventLog,
+		querylog:    opt.QueryLog,
 		metrics:     metrics,
 	}
+	// Link the query log to the event log so a slow or failed query also raises the lighter
+	// query_slow and query_error events (doc 20 §11.3). WithEvents is a no-op on a nil query
+	// log and clears nothing when the event log is nil, so this is safe in every combination.
+	db.querylog.WithEvents(db.events)
 	// Wire the plan-cache metrics to the cache now both exist (doc 20 §3.2): the eviction hook
 	// counts LRU drops, and a computed gauge reads the resident plan count at snapshot time.
 	db.cache.OnEvict = func(reason string) { db.metrics.recordCacheEviction(reason) }
@@ -567,7 +587,7 @@ func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, erro
 	start := time.Now()
 	db.metrics.begin("read")
 	res, err := db.query(cypher, params, db.lazyDefault())
-	return db.measureQuery("read", start, res, err)
+	return db.measureQuery("read", cypher, params, start, res, err)
 }
 
 // query is the body of Query with the resolved property-materialization mode threaded
@@ -723,6 +743,7 @@ func (db *DB) Run(ctx context.Context, cypher string, params Params, opts ...Run
 		return nil, err
 	}
 	cfg := db.resolveRun(opts)
+	start := time.Now()
 	vals, err := toValues(params)
 	if err != nil {
 		return nil, err
@@ -730,18 +751,20 @@ func (db *DB) Run(ctx context.Context, cypher string, params Params, opts ...Run
 	q, err := parse.Parse(cypher)
 	if err != nil {
 		// A parse failure never classifies into a kind, so it is not in gr_queries_total, but
-		// it is still a query error and counts in gr_query_errors_total{class="syntax"}.
+		// it is still a query error and counts in gr_query_errors_total{class="syntax"}. It is
+		// a failed query, so the query log records it too, with an empty kind the way the server
+		// surface does (doc 20 §10.2): the failure is carried by the status and error.
 		db.metrics.recordError(err)
+		db.logQuery("", cypher, vals, start, queryStatus(err), err, 0, nil)
 		return nil, err
 	}
 	// The query metrics (doc 20 §3.1) wrap the dispatch: begin raises the in-flight gauge,
 	// runDispatch executes, and measureQuery records the outcome and latency, recording an
 	// eager result now and deferring a streaming read to its Close.
 	kind := metricQueryKind(q)
-	start := time.Now()
 	db.metrics.begin(kind)
 	res, err := db.runDispatch(q, cypher, vals, cfg)
-	return db.measureQuery(kind, start, res, err)
+	return db.measureQuery(kind, cypher, vals, start, res, err)
 }
 
 // runDispatch routes a parsed statement to its execution path, the body of Run with the
@@ -1663,6 +1686,14 @@ type Result struct {
 	mscan        *atomic.Int64
 	rowsReturned int64
 
+	// qlcypher and qlparams carry what a streaming read's deferred query-log entry needs
+	// that the result does not already hold (doc 20 §10): the statement text and its
+	// parameters. measureQuery stashes them when a query log is configured, and Close builds
+	// the entry from them once the stream has drained and its latency is known. They are
+	// empty for an eager result, which logs at dispatch, and for a database with no query log.
+	qlcypher string
+	qlparams map[string]value.Value
+
 	// planOp and planStats carry the plan this result ran so PlanText can render the
 	// EXPLAIN-grade tree the slow-query log captures (doc 20 §10.6). planStats is the
 	// statistics the read plan was cost-chosen against, so the listing shows the per-operator
@@ -1809,6 +1840,11 @@ func (r *Result) Close() error {
 			r.mdb.metrics.recordExecute(r.mkind, time.Since(r.mexec))
 		}
 		r.mdb.metrics.finish(r.mkind, metricStatusOf(r.err), time.Since(r.mstart))
+		// The streaming read's query-log entry completes here too, where its
+		// parse-through-last-row latency ends (doc 20 §10): the status follows whether the
+		// stream errored, the row count is what it yielded, and the plan is the one it ran for
+		// the slow-query log's captured plan (doc 20 §10.6). A clean stream logs no error.
+		r.mdb.logQuery(r.mkind, r.qlcypher, r.qlparams, r.mstart, queryStatus(r.err), r.err, int(r.rowsReturned), r.PlanText)
 	}
 	if cerr != nil {
 		return cerr

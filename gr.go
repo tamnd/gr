@@ -628,14 +628,18 @@ func (db *DB) query(ctx context.Context, cypher string, params map[string]value.
 		return nil, err
 	}
 	// The executor span for the streaming read starts here, once the plan is ready and the
-	// snapshot is open; Close records the time since it (doc 20 §3.1).
+	// snapshot is open; Close records the time since it (doc 20 §3.1). The gr.execute trace span
+	// covers the same boundary as a child of the root, ended at Close with the scanned and
+	// returned rows (doc 20 §12.2).
+	_, espan := db.startPhaseSpan(ctx, "gr.execute")
 	execStart := time.Now()
 	cur, err := exec.Open(entry.Op, db.execCtx(tx, entry.Bound, params))
 	if err != nil {
+		endExecuteSpan(espan, 0, 0, err)
 		_ = tx.Abort()
 		return nil, err
 	}
-	return &Result{cols: cur.Cols(), cursor: cur, tx: tx, ownTx: true, mat: db.materializer(tx, lazy), mscan: cur.ScanCount(), mexec: execStart, planOp: entry.Op, planStats: engineStats{db.eng}}, nil
+	return &Result{cols: cur.Cols(), cursor: cur, tx: tx, ownTx: true, mat: db.materializer(tx, lazy), mscan: cur.ScanCount(), mexec: execStart, planOp: entry.Op, planStats: engineStats{db.eng}, execSpan: espan}, nil
 }
 
 // execCtx builds the execution context shared by every run of a statement: the
@@ -1742,6 +1746,10 @@ type Result struct {
 	// which finalizes at dispatch, and for a database with neither a query log nor a tracer.
 	qlid string
 	span Span
+	// execSpan is the gr.execute phase span query started once the plan was ready and the cursor
+	// open, ended at Close with the scanned and returned rows where the streaming executor's work
+	// ends (doc 20 §12.2). It is nil for an eager result and for a database with no tracer.
+	execSpan Span
 
 	// planOp and planStats carry the plan this result ran so PlanText can render the
 	// EXPLAIN-grade tree the slow-query log captures (doc 20 §10.6). planStats is the
@@ -1884,10 +1892,14 @@ func (r *Result) Close() error {
 		if r.err != nil {
 			r.mdb.metrics.recordError(r.err)
 		}
-		r.mdb.metrics.recordRows(r.rowsReturned, scanLoad(r.mscan))
+		scanned := scanLoad(r.mscan)
+		r.mdb.metrics.recordRows(r.rowsReturned, scanned)
 		if !r.mexec.IsZero() {
 			r.mdb.metrics.recordExecute(r.mkind, time.Since(r.mexec))
 		}
+		// The gr.execute child span ends where the executor work ends (doc 20 §12.2), carrying the
+		// scanned and returned rows the metrics just recorded.
+		endExecuteSpan(r.execSpan, int(scanned), int(r.rowsReturned), r.err)
 		r.mdb.metrics.finish(r.mkind, metricStatusOf(r.err), time.Since(r.mstart))
 		// The streaming read's query-log entry completes here too, where its
 		// parse-through-last-row latency ends (doc 20 §10): the status follows whether the

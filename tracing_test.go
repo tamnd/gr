@@ -404,6 +404,93 @@ func TestDBTracerExecuteSpan(t *testing.T) {
 	}
 }
 
+// TestDBTracerWritePhaseSpans confirms an eager write emits gr.plan and gr.execute child spans,
+// both ended, with the plan marked a cache miss and the execute carrying the rows it wrote (doc
+// 20 §12.2): a write never uses the plan cache, so its plan is always a miss.
+func TestDBTracerWritePhaseSpans(t *testing.T) {
+	tr := &recordingTracer{}
+	db := openMemTraced(t, "trace_write_phases.gr", tr)
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Run(context.Background(), "CREATE (:Person {name: 'a'}) RETURN 1 AS one", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	plan := tr.named("gr.plan")
+	if plan == nil {
+		t.Fatal("no gr.plan span emitted for a write")
+	}
+	if !plan.ended {
+		t.Error("write gr.plan span was not ended")
+	}
+	if plan.strs["gr.plan.cache"] != "miss" {
+		t.Errorf("write gr.plan.cache = %q, want miss", plan.strs["gr.plan.cache"])
+	}
+
+	exec := tr.named("gr.execute")
+	if exec == nil {
+		t.Fatal("no gr.execute span emitted for a write")
+	}
+	if !exec.ended {
+		t.Error("write gr.execute span was not ended")
+	}
+	if !exec.ok {
+		t.Error("write gr.execute span was marked failed for a clean write")
+	}
+	if exec.ints["gr.execute.rows_returned"] != 1 {
+		t.Errorf("write gr.execute.rows_returned = %d, want 1", exec.ints["gr.execute.rows_returned"])
+	}
+}
+
+// TestDBTracerTxPhaseSpans confirms a read inside a managed write transaction emits gr.plan and
+// gr.execute child spans (doc 20 §12.2): the structural bind inside the transaction is a plan-cache
+// miss, and the execute span ends at Close with the rows it yielded.
+func TestDBTracerTxPhaseSpans(t *testing.T) {
+	tr := &recordingTracer{}
+	db := openMemTraced(t, "trace_tx_phases.gr", tr)
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Run(context.Background(), "CREATE (:Person {name: 'a'}), (:Person {name: 'b'})", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := db.Begin(context.Background(), Write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.Run(context.Background(), "MATCH (p:Person) RETURN p.name AS name", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := 0
+	for res.Next() {
+		rows++
+	}
+	if err := res.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("read %d rows, want 2", rows)
+	}
+
+	plan := tr.lastNamed("gr.plan")
+	if plan == nil || plan.strs["gr.plan.cache"] != "miss" {
+		t.Fatalf("tx gr.plan span missing or not a miss: %+v", plan)
+	}
+	exec := tr.lastNamed("gr.execute")
+	if exec == nil {
+		t.Fatal("no gr.execute span for a tx read")
+	}
+	if !exec.ended {
+		t.Error("tx gr.execute span was not ended at Close")
+	}
+	if exec.ints["gr.execute.rows_returned"] != 2 {
+		t.Errorf("tx gr.execute.rows_returned = %d, want 2", exec.ints["gr.execute.rows_returned"])
+	}
+}
+
 // TestDBNoTracerDisabled confirms a database opened without a tracer neither panics nor starts
 // spans, the embedded default.
 func TestDBNoTracerDisabled(t *testing.T) {

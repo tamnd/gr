@@ -681,29 +681,41 @@ func (db *DB) execCtx(etx engine.Tx, b *bind.Bound, params map[string]value.Valu
 // lands before the caller sees a row, so a half-consumed result cannot leave the
 // statement partly applied at commit. It does not begin, commit, or abort the
 // transaction; the caller owns that.
-func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]value.Value) ([]string, []eval.Row, Summary, *atomic.Int64, plan.Op, error) {
+func (db *DB) execWriteBuffered(ctx context.Context, etx engine.Tx, q *ast.Query, params map[string]value.Value) ([]string, []eval.Row, Summary, *atomic.Int64, plan.Op, error) {
 	// A write is never served from the plan cache, so the bind and plan below are a full
 	// compile: time them as a plan-cache miss for gr_query_plan_duration_seconds (doc 20 §3.1).
+	// The gr.plan span wraps the same work as a child of the root, always a miss for a write
+	// (doc 20 §12.2).
+	_, pspan := db.startPhaseSpan(ctx, "gr.plan")
 	pstart := time.Now()
 	if err := internWriteNames(etx, q); err != nil {
+		endPhaseSpan(pspan, err)
 		return nil, nil, Summary{}, nil, nil, err
 	}
 	b, err := bind.Bind(q, bind.NewEngineCatalog(etx), false)
 	if err != nil {
+		endPhaseSpan(pspan, err)
 		return nil, nil, Summary{}, nil, nil, err
 	}
 	op := plan.Plan(b)
 	db.metrics.recordPlan("miss", time.Since(pstart))
+	if pspan != nil {
+		pspan.SetString("gr.plan.cache", "miss")
+	}
+	endPhaseSpan(pspan, nil)
 	eff := &exec.SideEffects{}
-	ctx := db.execCtx(etx, b, params)
-	ctx.Effects = eff
+	ec := db.execCtx(etx, b, params)
+	ec.Effects = eff
 	// The executor span starts here, once the plan is ready, and ends when the cursor drains and
 	// closes: it is gr_query_execute_duration_seconds for the write, the executor work alone with
-	// parse and plan excluded (doc 20 §3.1).
+	// parse and plan excluded (doc 20 §3.1). The gr.execute span covers the same boundary as a
+	// child of the root, ended with the scanned and returned rows (doc 20 §12.2).
+	_, espan := db.startPhaseSpan(ctx, "gr.execute")
 	estart := time.Now()
-	cur, err := exec.Open(op, ctx)
+	cur, err := exec.Open(op, ec)
 	if err != nil {
 		db.metrics.recordExecute("write", time.Since(estart))
+		endExecuteSpan(espan, 0, 0, err)
 		return nil, nil, Summary{}, nil, nil, err
 	}
 	cols := cur.Cols()
@@ -713,6 +725,7 @@ func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]v
 		if err != nil {
 			_ = cur.Close()
 			db.metrics.recordExecute("write", time.Since(estart))
+			endExecuteSpan(espan, int(scanLoad(ec.Scanned)), len(buf), err)
 			return nil, nil, Summary{}, nil, nil, err
 		}
 		if !ok {
@@ -722,15 +735,17 @@ func (db *DB) execWriteBuffered(etx engine.Tx, q *ast.Query, params map[string]v
 	}
 	if err := cur.Close(); err != nil {
 		db.metrics.recordExecute("write", time.Since(estart))
+		endExecuteSpan(espan, int(scanLoad(ec.Scanned)), len(buf), err)
 		return nil, nil, Summary{}, nil, nil, err
 	}
 	db.metrics.recordExecute("write", time.Since(estart))
+	endExecuteSpan(espan, int(scanLoad(ec.Scanned)), len(buf), nil)
 	// The scan counter is final now the cursor is drained and closed, so the caller stores it
 	// on the eager result and measureQuery reads it for gr_query_rows_scanned (doc 20 §3.1).
 	// The plan op rides back too, so the caller can render it for the slow-query log's captured
 	// plan (doc 20 §10.6); the write plan carries no cost estimates, so PlanText shows the bare
 	// tree.
-	return cols, buf, summaryOf(eff), ctx.Scanned, op, nil
+	return cols, buf, summaryOf(eff), ec.Scanned, op, nil
 }
 
 // cloneRow copies a row map so a buffered write result does not alias a row the
@@ -827,7 +842,7 @@ func (db *DB) runDispatch(ctx context.Context, q *ast.Query, cypher string, vals
 		return &Result{summary: s}, nil
 	}
 	if queryHasWrites(q) {
-		return db.runAutoWrite(q, vals, cfg.lazy)
+		return db.runAutoWrite(ctx, q, vals, cfg.lazy)
 	}
 	return db.query(ctx, cypher, vals, cfg.lazy)
 }
@@ -839,12 +854,12 @@ func (db *DB) runDispatch(ctx context.Context, q *ast.Query, cypher string, vals
 // before the commit; any error aborts the transaction and leaves the database
 // unchanged. The returned result iterates the buffered rows and reports the mutations
 // through Summary; it owns no open transaction, so Close has nothing to release.
-func (db *DB) runAutoWrite(q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
+func (db *DB) runAutoWrite(ctx context.Context, q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
 	tx, err := db.eng.Begin(true)
 	if err != nil {
 		return nil, err
 	}
-	cols, buf, summary, scanned, op, err := db.execWriteBuffered(tx, q, params)
+	cols, buf, summary, scanned, op, err := db.execWriteBuffered(ctx, tx, q, params)
 	if err != nil {
 		_ = tx.Abort()
 		return nil, err

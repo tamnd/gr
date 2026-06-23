@@ -199,6 +199,7 @@ func (tx *Tx) Run(ctx context.Context, cypher string, params Params, opts ...Run
 		return nil, err
 	}
 	cfg := tx.db.resolveRun(opts)
+	start := time.Now()
 	vals, err := toValues(params)
 	if err != nil {
 		return nil, err
@@ -206,18 +207,19 @@ func (tx *Tx) Run(ctx context.Context, cypher string, params Params, opts ...Run
 	q, err := parse.Parse(cypher)
 	if err != nil {
 		// As in the database-level Run, a parse failure counts in gr_query_errors_total even
-		// though it never reaches gr_queries_total (doc 20 §3.1).
+		// though it never reaches gr_queries_total (doc 20 §3.1), and the query log records the
+		// failed statement with an empty kind (doc 20 §10.2).
 		tx.db.metrics.recordError(err)
+		tx.db.logQuery("", cypher, vals, start, queryStatus(err), err, 0, nil)
 		return nil, err
 	}
 	// The query metrics (doc 20 §3.1) wrap the dispatch the same way the database-level Run
 	// does, recording against the database's one registry, so a query run inside a managed
 	// transaction counts the same as an auto-commit one.
 	kind := metricQueryKind(q)
-	start := time.Now()
 	tx.db.metrics.begin(kind)
 	res, err := tx.runDispatch(q, cypher, vals, cfg)
-	return tx.db.measureQuery(kind, start, res, err)
+	return tx.db.measureQuery(kind, cypher, vals, start, res, err)
 }
 
 // runDispatch routes a parsed statement inside a managed transaction, the body of Run with

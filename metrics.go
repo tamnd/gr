@@ -14,6 +14,7 @@ import (
 	"github.com/tamnd/gr/engine"
 	"github.com/tamnd/gr/metric"
 	"github.com/tamnd/gr/parse"
+	"github.com/tamnd/gr/value"
 )
 
 // Labels is a metric's bounded label set (doc 20 §7.2), re-exported from the metric package
@@ -1505,30 +1506,45 @@ func metricErrorClass(err error) string {
 // so it records immediately; a streaming read is not finished until the caller drains and
 // closes it, so it carries the recording on the result and fires it once at Close, which is
 // where the parse-through-last-row latency actually ends.
-func (db *DB) measureQuery(kind string, start time.Time, res *Result, err error) (*Result, error) {
+func (db *DB) measureQuery(kind, cypher string, params map[string]value.Value, start time.Time, res *Result, err error) (*Result, error) {
 	if err != nil {
 		db.metrics.recordError(err)
 		db.metrics.finish(kind, metricStatusOf(err), time.Since(start))
+		// A failure has no plan to capture, so the query-log entry carries none (doc 20 §10.6).
+		db.logQuery(kind, cypher, params, start, queryStatus(err), err, 0, nil)
 		return res, err
 	}
 	if res != nil && res.cursor != nil {
 		res.mdb = db
 		res.mkind = kind
 		res.mstart = start
+		// The streaming read's query-log entry is deferred to Close with the latency, so stash
+		// what the entry needs that the result does not already carry (doc 20 §10).
+		res.qlcypher = cypher
+		res.qlparams = params
 		return res, nil
 	}
 	// An eager result is complete now: its returned count is the buffered row count and its
 	// scan work is final on the counter, so record the amplification pair alongside the
 	// latency (doc 20 §3.1). A write with no RETURN has no output columns and buffers a single
 	// effect row the caller never reads, so its output cardinality is zero, not that row.
+	returned := int64(0)
 	if res != nil {
-		returned := int64(len(res.buf))
+		returned = int64(len(res.buf))
 		if len(res.cols) == 0 {
 			returned = 0
 		}
 		db.metrics.recordRows(returned, scanLoad(res.mscan))
 	}
 	db.metrics.finish(kind, "ok", time.Since(start))
+	// An eager result is finished, so its query-log entry is complete here, with the plan it
+	// ran for the slow-query log's captured plan (doc 20 §10.6). A nil result (an effect-only
+	// path) has no plan to render.
+	var planText func() string
+	if res != nil {
+		planText = res.PlanText
+	}
+	db.logQuery(kind, cypher, params, start, "ok", nil, int(returned), planText)
 	return res, nil
 }
 

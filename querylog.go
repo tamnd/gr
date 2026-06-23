@@ -2,12 +2,15 @@ package gr
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/tamnd/gr/value"
 )
 
 // QueryLogLevel sets how much of the query stream the query log records (doc 20 §10.4),
@@ -319,6 +322,63 @@ func elementType(xs []any) string {
 func hashParam(v any) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%v", v)))
 	return "sha256:" + hex.EncodeToString(sum[:6])
+}
+
+// mintQueryID returns the correlation id one execution carries through its query-log entry
+// and its query_slow or query_error event (doc 20 §10.2, §11.3), a random 128-bit token
+// hex-encoded so entries from different opens never collide in a shared log sink. It is
+// minted only when a query log is configured, so the random draw never lands on the fast
+// path of a database that logs nothing.
+func mintQueryID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// logQuery records one completed statement to the query log when one is configured (doc 20
+// §10), the embedded counterpart of the server's recordQuery. It mints the correlation id
+// the entry and its events share, converts the internal parameter values to the plain Go
+// values the redaction policy inspects, stamps the duration from start, and hands the record
+// to the log, which decides by its level and slow threshold whether to write it and raises
+// the query_slow or query_error event. A nil query log makes this a no-op, so the call sites
+// never guard it, and the parameter conversion runs only when a log is present. plan renders
+// the captured plan for a slow entry and is nil when the statement failed before a plan
+// existed. The user is "embedded", the library-call principal the spec names (doc 20 §10.2).
+func (db *DB) logQuery(kind, cypher string, params map[string]value.Value, start time.Time, status string, qerr error, rows int, plan func() string) {
+	if db.querylog == nil {
+		return
+	}
+	id, _ := mintQueryID()
+	db.querylog.Record(QueryRecord{
+		StartedAt:    start,
+		QueryID:      id,
+		User:         "embedded",
+		Cypher:       cypher,
+		Params:       paramsToAny(params),
+		Kind:         kind,
+		Status:       status,
+		Err:          qerr,
+		Duration:     time.Since(start),
+		RowsReturned: rows,
+		Plan:         plan,
+	})
+}
+
+// paramsToAny converts a statement's internal parameter values to the plain Go values the
+// query log's redaction policy inspects (doc 20 §10.3): RedactAll reads each value's type,
+// RedactNone its content, and both want the Go shape, not the internal value wrapper. An
+// empty map returns nil so the entry omits the params field.
+func paramsToAny(params map[string]value.Value) map[string]any {
+	if len(params) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(params))
+	for k, v := range params {
+		out[k] = fromValue(v)
+	}
+	return out
 }
 
 // queryStatus maps an execution error to a query-log status (doc 20 §10.2): no error is

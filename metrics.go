@@ -62,8 +62,9 @@ func (db *DB) Metrics() MetricsSnapshot {
 }
 
 // syncColcacheMetrics mirrors the property-block cache's cumulative counts into the registry at
-// snapshot time (doc 20 §4.4): it advances gr_colcache_accesses_total by the hits and misses
-// since the last sync and sets the resident-block and memory gauges to the current population. The
+// snapshot time (doc 20 §4.4): it advances gr_colcache_accesses_total by the hits and misses since the
+// last sync, advances gr_colcache_evictions_total{reason} by the capacity and invalidation evictions,
+// and sets the resident-block and memory gauges to the current population. The
 // cache owns the authoritative counts, bumped under its own lock on the read path, so the write
 // path never touches the registry; this bridge runs only on a scrape. The delta add keeps the
 // counter monotonic, and colcacheMu serializes two concurrent scrapes so neither double-counts.
@@ -83,6 +84,14 @@ func (db *DB) syncColcacheMetrics() {
 	if c := m.colcacheAccesses["miss"]; c != nil && s.Misses > m.lastColcacheMisses {
 		c.Add(s.Misses - m.lastColcacheMisses)
 		m.lastColcacheMisses = s.Misses
+	}
+	if c := m.colcacheEvictions["capacity"]; c != nil && s.EvictCapacity > m.lastColcacheEvictCapacity {
+		c.Add(s.EvictCapacity - m.lastColcacheEvictCapacity)
+		m.lastColcacheEvictCapacity = s.EvictCapacity
+	}
+	if c := m.colcacheEvictions["invalidation"]; c != nil && s.EvictInvalidation > m.lastColcacheEvictInval {
+		c.Add(s.EvictInvalidation - m.lastColcacheEvictInval)
+		m.lastColcacheEvictInval = s.EvictInvalidation
 	}
 	m.colcacheMu.Unlock()
 	if m.colcacheBlocks != nil {
@@ -509,6 +518,14 @@ var metricBufferpoolResults = []string{"hit", "miss"}
 // database that has only ever hit still exposes the miss series at zero.
 var metricColcacheResults = []string{"hit", "miss"}
 
+// metricColcacheEvictReasons is the bounded domain of the reason label on gr_colcache_evictions_total
+// (doc 20 §4.4): why a decoded property block left the cache. capacity is the budget sweep dropping a
+// cold block under size pressure, the scan-resistance question (§16.3); invalidation is a block dropped
+// because a checkpoint produced a new base, so the cached one is stale. A high invalidation rate against
+// the capacity rate is the write-heavy-churn signal. Both are pre-registered so a fresh cache exposes
+// each series at zero.
+var metricColcacheEvictReasons = []string{"capacity", "invalidation"}
+
 // metricCheckpointTriggers is the bounded domain of the trigger label on gr_checkpoint_total (doc
 // 20 §5.4): what drove a checkpoint. manual is the PRAGMA wal_checkpoint a caller runs by hand, the
 // only trigger wired today; wal_threshold (the WAL grew past its limit), timer (the periodic
@@ -611,6 +628,15 @@ type queryMetrics struct {
 	colcacheMu         sync.Mutex
 	lastColcacheHits   uint64
 	lastColcacheMisses uint64
+
+	// colcacheEvictions holds gr_colcache_evictions_total keyed by reason (capacity, invalidation), the
+	// blocks that left the cache split by why (doc 20 §4.4). The cache owns the authoritative cumulative
+	// counts, bumped under its lock at the remove sites; the sync step mirrors them delta-style under
+	// colcacheMu beside the access counters, and lastColcacheEvictCapacity and lastColcacheEvictInval
+	// hold the last mirrored cumulative values, the basis for the monotonic delta add.
+	colcacheEvictions         map[string]*metric.Counter
+	lastColcacheEvictCapacity uint64
+	lastColcacheEvictInval    uint64
 
 	// bufferpoolAccesses holds gr_bufferpool_accesses_total keyed by result (hit, miss), and
 	// bufferpoolResident and bufferpoolBytes the fill-level gauges. The pager owns the
@@ -866,6 +892,11 @@ func newQueryMetrics() *queryMetrics {
 		"Decoded property blocks currently cached", "blocks", nil)
 	m.colcacheBytes = reg.Gauge("gr_colcache_memory_bytes",
 		"Memory held by decoded property blocks", "bytes", nil)
+	m.colcacheEvictions = make(map[string]*metric.Counter, len(metricColcacheEvictReasons))
+	for _, reason := range metricColcacheEvictReasons {
+		m.colcacheEvictions[reason] = reg.Counter("gr_colcache_evictions_total",
+			"Property blocks evicted from the cache, by reason", "evictions", metric.Labels{"reason": reason})
+	}
 	m.bufferpoolAccesses = make(map[string]*metric.Counter, len(metricBufferpoolResults))
 	for _, r := range metricBufferpoolResults {
 		m.bufferpoolAccesses[r] = reg.Counter("gr_bufferpool_accesses_total",

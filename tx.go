@@ -217,7 +217,7 @@ func (tx *Tx) Run(ctx context.Context, cypher string, params Params, opts ...Run
 		// though it never reaches gr_queries_total (doc 20 §3.1), and the query log records the
 		// failed statement with an empty kind (doc 20 §10.2).
 		tx.db.metrics.recordError(err)
-		tx.db.logQuery(id, "", cypher, vals, start, queryStatus(err), err, 0, nil)
+		tx.db.logQuery(id, "", cypher, vals, start, queryStatus(err), err, 0, 0, nil)
 		endQuerySpan(span, queryStatus(err), 0)
 		return nil, err
 	}

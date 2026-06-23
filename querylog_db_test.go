@@ -82,6 +82,52 @@ func TestDBQueryLogRecordsStatements(t *testing.T) {
 	}
 }
 
+// TestDBQueryLogRowsScanned confirms a read entry carries rows_scanned, the work the query
+// touched, alongside rows_returned, so the slow-query log surfaces the scanned/returned
+// amplification (doc 20 §10.2, §16.2). The query scans every Person and returns the one that
+// matches the filter, so scanned exceeds returned.
+func TestDBQueryLogRowsScanned(t *testing.T) {
+	ql, read := captureQueryLog(QueryLogAll, RedactAll, time.Hour)
+	fsys := vfs.NewMem()
+	db, err := Open("scan.gr", Options{VFS: fsys, SaltSeed: 1, QueryLog: ql})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	for _, name := range []string{"Ada", "Bob", "Cleo", "Dan"} {
+		if _, err := db.Run(context.Background(), "CREATE (:Person {name: $n})", map[string]any{"n": name}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := db.Query("MATCH (n:Person) WHERE n.name = 'Ada' RETURN n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainResult(t, res)
+
+	var rd map[string]any
+	for _, e := range read() {
+		if e["kind"] == "read" {
+			rd = e
+		}
+	}
+	if rd == nil {
+		t.Fatalf("no read entry in the query log")
+	}
+	returned, _ := rd["rows_returned"].(float64)
+	scanned, ok := rd["rows_scanned"].(float64)
+	if !ok {
+		t.Fatalf("read entry has no rows_scanned: %v", rd)
+	}
+	if returned != 1 {
+		t.Errorf("rows_returned = %v, want 1", returned)
+	}
+	if scanned < returned {
+		t.Errorf("rows_scanned = %v, want at least rows_returned = %v", scanned, returned)
+	}
+}
+
 // TestDBQueryLogError confirms a failed statement is recorded with an error status and that,
 // when an event log is linked, it also raises a query_error event independent of the
 // query-log level (doc 20 §10.4, §11.3).

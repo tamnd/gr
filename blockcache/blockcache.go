@@ -98,16 +98,28 @@ type Cache struct {
 	// lock the cache already holds, and the engine never touches the metric registry from here.
 	hits   uint64
 	misses uint64
+
+	// evictCapacity and evictInvalidation are the cumulative counts of entries that left the cache,
+	// split by why (doc 20 §4.4). A capacity eviction is a cold entry the budget sweep cooled all the
+	// way to nothing under size pressure; an invalidation is an entry dropped because its base is no
+	// longer authoritative, either lazily on a version-mismatched lookup or eagerly when a checkpoint
+	// folds a new base. A high invalidation rate against the capacity rate is the write-heavy-churn
+	// signal the §16.3 scan-resistance discussion reads. Both are bumped under mu at the remove sites.
+	evictCapacity     uint64
+	evictInvalidation uint64
 }
 
-// Stats is a point-in-time view of the cache's lookup outcomes and resident population (doc 20
-// §4.4), the numbers the column-cache metrics expose. Hits and Misses are cumulative since the
-// cache was created; Blocks and Bytes are the current resident counts the budget bounds.
+// Stats is a point-in-time view of the cache's lookup outcomes, resident population, and eviction
+// counts (doc 20 §4.4), the numbers the column-cache metrics expose. Hits and Misses are cumulative
+// since the cache was created, as are EvictCapacity and EvictInvalidation; Blocks and Bytes are the
+// current resident counts the budget bounds.
 type Stats struct {
-	Hits   uint64
-	Misses uint64
-	Blocks int
-	Bytes  int
+	Hits              uint64
+	Misses            uint64
+	Blocks            int
+	Bytes             int
+	EvictCapacity     uint64
+	EvictInvalidation uint64
 }
 
 // New creates a property-block cache bounded to maxBytes of value memory. A maxBytes
@@ -180,6 +192,9 @@ func (c *Cache) live(k Key, version uint64) (*entry, bool) {
 	}
 	e := el.Value.(*entry)
 	if e.version != version {
+		// A version mismatch means a checkpoint produced a new base, so the cached entry is stale: drop
+		// it as an invalidation, not a capacity eviction (doc 20 §4.4).
+		c.evictInvalidation++
 		c.remove(el)
 		return nil, false
 	}
@@ -265,6 +280,9 @@ func (c *Cache) Invalidate(k Key) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.entries[k]; ok {
+		// The eager checkpoint-fold path: the base is no longer authoritative, so this is an
+		// invalidation like the version-mismatch drop, not a capacity eviction (doc 20 §4.4).
+		c.evictInvalidation++
 		c.remove(el)
 	}
 }
@@ -324,6 +342,9 @@ func (c *Cache) cool(el *list.Element) {
 		e.comp = nil
 		e.res = stub
 	default: // stub
+		// The budget sweep has cooled this cold entry to nothing and now drops it: a capacity eviction,
+		// the size-pressure form (doc 20 §4.4).
+		c.evictCapacity++
 		c.remove(el)
 	}
 }
@@ -367,13 +388,20 @@ func (c *Cache) Bytes() int {
 	return c.curBytes
 }
 
-// Stats returns the cumulative hit and miss counts and the current resident population in one
-// lock acquisition (doc 20 §4.4), the snapshot the column-cache metrics read. Taking the four
-// numbers together under mu keeps the hit rate and the size consistent, and the lock is the
-// cache's own, never the engine's, so the metrics path reads it without risk of the write-path
-// deadlock that an engine-lock read would invite.
+// Stats returns the cumulative hit, miss, and eviction counts and the current resident population in
+// one lock acquisition (doc 20 §4.4), the snapshot the column-cache metrics read. Taking the numbers
+// together under mu keeps the hit rate and the size consistent, and the lock is the cache's own, never
+// the engine's, so the metrics path reads it without risk of the write-path deadlock that an
+// engine-lock read would invite.
 func (c *Cache) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return Stats{Hits: c.hits, Misses: c.misses, Blocks: c.ring.Len(), Bytes: c.curBytes}
+	return Stats{
+		Hits:              c.hits,
+		Misses:            c.misses,
+		Blocks:            c.ring.Len(),
+		Bytes:             c.curBytes,
+		EvictCapacity:     c.evictCapacity,
+		EvictInvalidation: c.evictInvalidation,
+	}
 }

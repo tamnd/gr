@@ -885,6 +885,49 @@ func TestMetricsColcacheAccesses(t *testing.T) {
 	}
 }
 
+func TestMetricsColcacheEvictions(t *testing.T) {
+	db := openMem(t, "mxcolevict.gr")
+	defer db.Close()
+
+	for i := 0; i < 5; i++ {
+		mustExec(t, db, "CREATE (:Person {email: 'a@x'})", nil)
+	}
+	// Fold the properties into the segmented base so property reads go through the column cache.
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+
+	read := func() {
+		res, err := db.Run(context.Background(), "MATCH (p:Person) RETURN p.email", nil)
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		drainResult(t, res)
+	}
+
+	// The first scan decodes the segments and caches them at the current checkpoint epoch.
+	read()
+	if c := db.Metrics().Counter("gr_colcache_evictions_total", Labels{"reason": "invalidation"}); c != 0 {
+		t.Fatalf("invalidations before any new base = %d, want 0", c)
+	}
+
+	// More writes plus a checkpoint rebuild the base and bump the epoch, so the cached segments are now
+	// stale. The next scan finds them version-mismatched and drops them, the invalidation reason: a
+	// write-driven churn of the property cache, distinct from a budget eviction.
+	for i := 0; i < 5; i++ {
+		mustExec(t, db, "CREATE (:Person {email: 'b@x'})", nil)
+	}
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+	read()
+
+	snap := db.Metrics()
+	if c := snap.Counter("gr_colcache_evictions_total", Labels{"reason": "invalidation"}); c == 0 {
+		t.Fatal("invalidations after a new base and a re-scan = 0, want the stale segments dropped")
+	}
+	// Nothing forced the cache past its budget, so no capacity evictions: the reasons stay distinct.
+	if c := snap.Counter("gr_colcache_evictions_total", Labels{"reason": "capacity"}); c != 0 {
+		t.Fatalf("capacity evictions on a small warm cache = %d, want 0", c)
+	}
+}
+
 func TestMetricsFileSizeBytes(t *testing.T) {
 	db := openMem(t, "mxfilesize.gr")
 	defer db.Close()

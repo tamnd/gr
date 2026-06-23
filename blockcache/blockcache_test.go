@@ -139,6 +139,43 @@ func TestInvalidateDrops(t *testing.T) {
 	}
 }
 
+// TestEvictionStatsBySplitReason proves the eviction counters split a block leaving the
+// cache by why: a budget sweep that cools a cold entry to nothing is a capacity eviction,
+// a version-mismatched lookup and an eager Invalidate are invalidations (doc 20 §4.4).
+func TestEvictionStatsBySplitReason(t *testing.T) {
+	// A version mismatch drops the stale entry as an invalidation.
+	c := New(1 << 20)
+	k := Key{Column: 1}
+	c.PutDecoded(k, 1, []int64{1}, 8, nil, nil, nil)
+	if _, ok := c.GetDecoded(k, 2); ok {
+		t.Fatal("a version-2 lookup hit a version-1 entry")
+	}
+	if s := c.Stats(); s.EvictInvalidation != 1 || s.EvictCapacity != 0 {
+		t.Fatalf("after a version mismatch: invalidation=%d capacity=%d, want 1 and 0", s.EvictInvalidation, s.EvictCapacity)
+	}
+
+	// An eager Invalidate is the second invalidation form.
+	c.PutDecoded(k, 1, []int64{1}, 8, nil, nil, nil)
+	c.Invalidate(k)
+	if s := c.Stats(); s.EvictInvalidation != 2 {
+		t.Fatalf("after an eager Invalidate: invalidation=%d, want 2", s.EvictInvalidation)
+	}
+
+	// Budget pressure on cold entries cools them stage by stage to a stub and finally evicts
+	// them, the capacity reason. Each entry is 100 bytes decoded plus 10 compressed against a
+	// 120-byte budget, so a run of cold inserts forces full evictions.
+	cap := New(120)
+	for col := uint32(0); col < 8; col++ {
+		cap.PutDecoded(Key{Column: col}, 1, []int64{int64(col)}, 100, make([]byte, 10), nil, nil)
+	}
+	if s := cap.Stats(); s.EvictCapacity == 0 {
+		t.Fatalf("capacity evictions after eight cold inserts on a one-entry budget = 0, want some")
+	}
+	if s := cap.Stats(); s.EvictInvalidation != 0 {
+		t.Fatalf("capacity-only workload reported %d invalidations, want 0", s.EvictInvalidation)
+	}
+}
+
 // TestZeroBudgetKeepsStubs proves a cache with no value budget still retains zone-map
 // stubs for segment skipping, cooling away every value vector on insert.
 func TestZeroBudgetKeepsStubs(t *testing.T) {

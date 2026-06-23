@@ -11,6 +11,7 @@ import (
 
 	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/bind"
+	"github.com/tamnd/gr/catalog"
 	"github.com/tamnd/gr/engine"
 	"github.com/tamnd/gr/metric"
 	"github.com/tamnd/gr/parse"
@@ -1512,6 +1513,9 @@ func (db *DB) measureQuery(kind, cypher string, params map[string]value.Value, s
 		db.metrics.finish(kind, metricStatusOf(err), time.Since(start))
 		// A failure has no plan to capture, so the query-log entry carries none (doc 20 §10.6).
 		db.logQuery(kind, cypher, params, start, queryStatus(err), err, 0, nil)
+		// A rejected write also raises the structured constraint event when the failure is one
+		// (doc 20 §11.3); a non-constraint error emits nothing here.
+		db.emitConstraintEvent(err)
 		return res, err
 	}
 	if res != nil && res.cursor != nil {
@@ -1546,6 +1550,35 @@ func (db *DB) measureQuery(kind, cypher string, params map[string]value.Value, s
 	}
 	db.logQuery(kind, cypher, params, start, "ok", nil, int(returned), planText)
 	return res, nil
+}
+
+// constraintKindLabel maps a constraint kind to the lowercase label the event and the
+// gr_constraint_checks_total metric share (doc 20 §6.4, §11.3), so an operator joins a violation
+// event to its enforcement counter on the same vocabulary.
+func constraintKindLabel(kind catalog.ConstraintKind) string {
+	switch kind {
+	case catalog.ExistsNode:
+		return "exists"
+	case catalog.TypedNode:
+		return "type"
+	default:
+		return "unique"
+	}
+}
+
+// emitConstraintEvent raises the structured constraint_violation event when err is a typed
+// constraint error (doc 20 §11.3). It is the one place that unwraps the engine error into the
+// event's fields, so both the eager error path and the streaming Close path call it with whatever
+// error they finished on and a non-constraint error (or a nil event log) costs only the type
+// check.
+func (db *DB) emitConstraintEvent(err error) {
+	if db.events == nil || err == nil {
+		return
+	}
+	var cerr *engine.ConstraintError
+	if errors.As(err, &cerr) {
+		db.events.ConstraintViolation(constraintKindLabel(cerr.Kind), cerr.Constraint, cerr.Label, cerr.Property, cerr.Value)
+	}
 }
 
 // graphObserver implements exec.GraphObserver against the query metrics (doc 20 §6): it counts a

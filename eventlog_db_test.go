@@ -278,6 +278,86 @@ func TestDBNoConfigChangeEventOnRead(t *testing.T) {
 	}
 }
 
+// TestDBConstraintViolationEvent confirms a write that violates a uniqueness constraint
+// emits a constraint_violation event carrying the constraint kind, name, label, property,
+// and the offending value (doc 20 §11.3). The write runs through Run so it crosses the
+// measureQuery boundary where the event fires.
+func TestDBConstraintViolationEvent(t *testing.T) {
+	el, read := captureDBEvents()
+	fsys := vfs.NewMem()
+	db, err := Open("con.gr", Options{VFS: fsys, SaltSeed: 1, EventLog: el})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx := context.Background()
+	for _, stmt := range []string{
+		"CREATE CONSTRAINT person_email FOR (p:Person) REQUIRE p.email IS UNIQUE",
+		"CREATE (:Person {email: 'a@x'})",
+	} {
+		if _, err := db.Run(ctx, stmt, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Run(ctx, "CREATE (:Person {email: 'a@x'})", nil); err == nil {
+		t.Fatal("colliding insert was accepted")
+	}
+
+	var con map[string]any
+	for _, e := range read() {
+		if e["event"] == EventConstraintViolation {
+			con = e
+		}
+	}
+	if con == nil {
+		t.Fatalf("no constraint_violation event after a rejected write; entries = %v", read())
+	}
+	if con["kind"] != "unique" {
+		t.Errorf("kind = %v, want unique", con["kind"])
+	}
+	if con["constraint"] != "person_email" {
+		t.Errorf("constraint = %v, want person_email", con["constraint"])
+	}
+	if con["label"] != "Person" {
+		t.Errorf("label = %v, want Person", con["label"])
+	}
+	if con["property"] != "email" {
+		t.Errorf("property = %v, want email", con["property"])
+	}
+	if con["value"] != `"a@x"` {
+		t.Errorf("value = %q, want \"a@x\"", con["value"])
+	}
+}
+
+// TestDBNoConstraintEventOnCleanWrite confirms a write that satisfies its constraints
+// emits no constraint_violation event.
+func TestDBNoConstraintEventOnCleanWrite(t *testing.T) {
+	el, read := captureDBEvents()
+	fsys := vfs.NewMem()
+	db, err := Open("conok.gr", Options{VFS: fsys, SaltSeed: 1, EventLog: el})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx := context.Background()
+	for _, stmt := range []string{
+		"CREATE CONSTRAINT person_email FOR (p:Person) REQUIRE p.email IS UNIQUE",
+		"CREATE (:Person {email: 'a@x'})",
+		"CREATE (:Person {email: 'b@x'})",
+	} {
+		if _, err := db.Run(ctx, stmt, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, e := range read() {
+		if e["event"] == EventConstraintViolation {
+			t.Errorf("a clean write emitted a constraint_violation event: %v", e)
+		}
+	}
+}
+
 // TestDBNoRecoveryEventOnCleanOpen confirms a fresh open that recovered nothing emits
 // no recovery_complete event, only the open event.
 func TestDBNoRecoveryEventOnCleanOpen(t *testing.T) {

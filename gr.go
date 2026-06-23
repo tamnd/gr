@@ -1845,6 +1845,9 @@ func (r *Result) Close() error {
 		// stream errored, the row count is what it yielded, and the plan is the one it ran for
 		// the slow-query log's captured plan (doc 20 §10.6). A clean stream logs no error.
 		r.mdb.logQuery(r.mkind, r.qlcypher, r.qlparams, r.mstart, queryStatus(r.err), r.err, int(r.rowsReturned), r.PlanText)
+		// A streaming write that errored on a constraint at commit raises the structured
+		// constraint event here too (doc 20 §11.3), the same as the eager error path.
+		r.mdb.emitConstraintEvent(r.err)
 	}
 	if cerr != nil {
 		return cerr

@@ -504,6 +504,59 @@ func TestDBNoTracerDisabled(t *testing.T) {
 	}
 }
 
+// TestDBTracerOperatorSpans confirms that setting tracing_detail=operator emits per-operator
+// child spans under gr.execute (doc 20 §12.2): a read query over two nodes emits at least
+// a NodeScan span with a non-negative row count, and the spans are ended when Close returns.
+func TestDBTracerOperatorSpans(t *testing.T) {
+	tr := &recordingTracer{}
+	db := openMemTraced(t, "trace_ops.gr", tr)
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Run(context.Background(), "CREATE (:Person {name: 'Ada'}), (:Person {name: 'Bob'})", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Run(context.Background(), "PRAGMA tracing_detail = 'operator'", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := db.Query("MATCH (n:Person) RETURN n.name", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for res.Next() {
+	}
+	if err := res.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var opSpans []*recordingSpan
+	for _, s := range tr.spans {
+		if len(s.name) > len("gr.operator.") && s.name[:len("gr.operator.")] == "gr.operator." {
+			opSpans = append(opSpans, s)
+		}
+	}
+	if len(opSpans) == 0 {
+		t.Fatalf("no gr.operator.* spans emitted at detail=operator: spans = %v", spanNames(tr.spans))
+	}
+	for _, s := range opSpans {
+		if !s.ended {
+			t.Errorf("operator span %q was not ended", s.name)
+		}
+		if s.ints["gr.operator.rows"] < 0 {
+			t.Errorf("operator span %q has negative rows: %d", s.name, s.ints["gr.operator.rows"])
+		}
+	}
+}
+
+// spanNames returns the names of all spans in order, for diagnostic messages.
+func spanNames(spans []*recordingSpan) []string {
+	names := make([]string, len(spans))
+	for i, s := range spans {
+		names[i] = s.name
+	}
+	return names
+}
+
 // openMemTraced opens an in-memory database with a tracer installed.
 func openMemTraced(t *testing.T, path string, tr Tracer) *DB {
 	t.Helper()

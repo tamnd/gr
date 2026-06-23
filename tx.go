@@ -325,9 +325,11 @@ func (tx *Tx) runRead(ctx context.Context, cypher string, q *ast.Query, params m
 	// gr_query_execute_duration_seconds (doc 20 §3.1). The gr.execute trace span covers the same
 	// boundary as a child of the root, ended at Close with the scanned and returned rows (doc 20
 	// §12.2).
-	_, espan := tx.db.startPhaseSpan(ctx, "gr.execute")
+	ectx, espan := tx.db.startPhaseSpan(ctx, "gr.execute")
 	execStart := time.Now()
-	cur, err := exec.Open(op, tx.readCtx(b, params))
+	ec := tx.readCtx(b, params)
+	ec.Tracer = tx.db.newOpTracer(ectx)
+	cur, err := exec.Open(op, ec)
 	if err != nil {
 		endExecuteSpan(espan, 0, 0, err)
 		return nil, err

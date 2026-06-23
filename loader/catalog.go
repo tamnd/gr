@@ -120,3 +120,29 @@ func (c *CatalogBuilder) LabelName(tok int) string {
 	}
 	return c.labelOrd[tok]
 }
+
+// LabelNames returns all interned label strings in token order.
+func (c *CatalogBuilder) LabelNames() []string { return c.labelOrd }
+
+// RelTypeNames returns all interned relationship-type strings in token order.
+func (c *CatalogBuilder) RelTypeNames() []string { return c.relTypeOrd }
+
+// PropKeyNames returns all interned property-key strings in token order.
+func (c *CatalogBuilder) PropKeyNames() []string { return c.propKeyOrd }
+
+// GroupPrimaryLabel returns the primary-label token for group g.
+func (c *CatalogBuilder) GroupPrimaryLabel(g LabelGroup) int {
+	return c.groups[g].primaryToken
+}
+
+// GroupLabels returns the label set for nodes in group g.
+// Currently groups are identified by a single primary label, so the result has
+// one element. Additional labels declared on individual rows are stored per-node
+// in the node record store (written in pass 4).
+func (c *CatalogBuilder) GroupLabels(g LabelGroup) []string {
+	primary := c.labelOrd[c.groups[g].primaryToken]
+	if primary == "" {
+		return nil
+	}
+	return []string{primary}
+}

@@ -25,12 +25,10 @@ func (l *Loader) pass2BuildNodeColumns(fb *fileBuilder) error {
 			return err
 		}
 	}
-	// Flush all remaining partial segments.
-	for g, builders := range fb.groupBuilders {
-		for _, b := range builders {
-			if err := b.Flush(); err != nil {
-				return fmt.Errorf("loader: flush group %d column: %w", g, err)
-			}
+	// Flush all remaining partial segments (one builder per unique property key).
+	for key, b := range fb.keyBuilders {
+		if err := b.Flush(); err != nil {
+			return fmt.Errorf("loader: flush column key %d: %w", key, err)
 		}
 	}
 	return nil
@@ -91,13 +89,14 @@ func (l *Loader) pass2Buffered(
 		if !ok {
 			continue
 		}
+		gpos := fb.GlobalPos(entry.Group, entry.DenseID)
 		builders := fb.ensureBuilders(entry.Group, propCols)
 		for i, pc := range propCols {
 			raw := fields[pc.colIdx]
 			val, present, _ := parseCSVField(raw, pc.pt, pc.isList, arrDelim)
 			cell := colseg.Cell{Present: present, Value: val}
-			if berr := builders[i].Append(entry.DenseID, cell); berr != nil {
-				return fmt.Errorf("loader: buffered src %d pos %d col %d: %w", srcIdx, entry.DenseID, i, berr)
+			if berr := builders[i].Append(gpos, cell); berr != nil {
+				return fmt.Errorf("loader: buffered src %d pos %d col %d: %w", srcIdx, gpos, i, berr)
 			}
 		}
 	}
@@ -142,7 +141,7 @@ func (l *Loader) pass2File(
 		}
 
 		g := entry.Group
-		pos := entry.DenseID
+		gpos := fb.GlobalPos(g, entry.DenseID)
 
 		// Get or create the column builders for this group.
 		builders := fb.ensureBuilders(g, propCols)
@@ -153,13 +152,13 @@ func (l *Loader) pass2File(
 			val, present, perr := parseCSVField(raw, pc.pt, pc.isList, arrDelim)
 			if perr != nil {
 				// Bad value: write absent and continue (already counted in pass 1).
-				if berr := builders[i].Append(pos, colseg.Cell{Present: false}); berr != nil {
+				if berr := builders[i].Append(gpos, colseg.Cell{Present: false}); berr != nil {
 					return fmt.Errorf("loader: %s: group %d col %d: %w", fileName, g, i, berr)
 				}
 				continue
 			}
 			cell := colseg.Cell{Present: present, Value: val}
-			if berr := builders[i].Append(pos, cell); berr != nil {
+			if berr := builders[i].Append(gpos, cell); berr != nil {
 				return fmt.Errorf("loader: %s: group %d col %d: %w", fileName, g, i, berr)
 			}
 		}
@@ -194,11 +193,10 @@ func (l *Loader) propColDescs(hdr *NodeHeader) []propColDesc {
 // Pass2BuildNodeColumns is exported for testing. In production use, Run calls
 // it in sequence after Pass1ScanNodes.
 func (l *Loader) Pass2BuildNodeColumns(fsys vfs.VFS, outputPath string) (*fileBuilder, error) {
-	fb, err := openFileBuilder(fsys, outputPath, l.catalog.Groups())
+	fb, err := openFileBuilder(fsys, outputPath, l.catalog)
 	if err != nil {
 		return nil, err
 	}
-	fb.groupBuilders = make([][](*colBuilder), l.catalog.Groups())
 	if err := l.pass2BuildNodeColumns(fb); err != nil {
 		_ = fb.Close()
 		return nil, err

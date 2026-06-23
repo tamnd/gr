@@ -133,11 +133,11 @@ func TestPass2SingleGroupProps(t *testing.T) {
 	defer fb.Close()
 
 	// Group 0 (Person): check name and age columns.
-	s := fb.nodeStore(0)
+	s := fb.nodeStore
 	nameTok := uint32(l.catalog.PropKeyToken("name"))
 	ageTok := uint32(l.catalog.PropKeyToken("age"))
 
-	// Dense position 0 = Ada, 1 = Bob, 2 = Cy.
+	// Dense position 0 = Ada, 1 = Bob, 2 = Cy (single group → globalPos == denseID).
 	checkString := func(pos uint64, want string) {
 		t.Helper()
 		v, ok, err := s.Get(nameTok, pos)
@@ -193,26 +193,27 @@ func TestPass2TwoGroups(t *testing.T) {
 
 	cat := l.Catalog()
 	// Person is first-seen primary label => group 0; Movie => group 1.
+	// Global positions: Person 0..1, Movie starts at groupBase[1]=2.
 	nameTok := uint32(cat.PropKeyToken("name"))
 	titleTok := uint32(cat.PropKeyToken("title"))
 
-	s0 := fb.nodeStore(0) // Person
-	s1 := fb.nodeStore(1) // Movie
+	s := fb.nodeStore
 
-	v0, ok0, err0 := s0.Get(nameTok, 0)
+	v0, ok0, err0 := s.Get(nameTok, 0) // Alice at globalPos 0
 	if err0 != nil || !ok0 {
 		t.Fatalf("group 0 name[0]: err=%v ok=%v", err0, ok0)
 	}
-	if s, _ := v0.AsString(); s != "Alice" {
-		t.Errorf("group 0 name[0]: got %q, want Alice", s)
+	if n, _ := v0.AsString(); n != "Alice" {
+		t.Errorf("group 0 name[0]: got %q, want Alice", n)
 	}
 
-	v1, ok1, err1 := s1.Get(titleTok, 0)
+	movieBase := fb.groupBase[1] // global start of Movie group
+	v1, ok1, err1 := s.Get(titleTok, movieBase)
 	if err1 != nil || !ok1 {
 		t.Fatalf("group 1 title[0]: err=%v ok=%v", err1, ok1)
 	}
-	if s, _ := v1.AsString(); s != "Matrix" {
-		t.Errorf("group 1 title[0]: got %q, want Matrix", s)
+	if n, _ := v1.AsString(); n != "Matrix" {
+		t.Errorf("group 1 title[0]: got %q, want Matrix", n)
 	}
 }
 
@@ -234,10 +235,10 @@ func TestPass2GapFillAbsent(t *testing.T) {
 	}
 	defer fb.Close()
 
-	s := fb.nodeStore(0)
+	s := fb.nodeStore
 	nameTok := uint32(l.catalog.PropKeyToken("name"))
 
-	// pos 0 and 2 should be present; pos 1 absent.
+	// pos 0 and 2 should be present; pos 1 absent (single group → globalPos == denseID).
 	_, ok0, _ := s.Get(nameTok, 0)
 	_, ok1, _ := s.Get(nameTok, 1)
 	_, ok2, _ := s.Get(nameTok, 2)
@@ -272,10 +273,10 @@ func TestPass2SkippedRowHasNoColumn(t *testing.T) {
 	}
 	defer fb.Close()
 
-	s := fb.nodeStore(0)
+	s := fb.nodeStore
 	nameTok := uint32(l.catalog.PropKeyToken("name"))
 
-	// Two accepted nodes: p1=Ada at pos 0, p2=Bob at pos 1.
+	// Two accepted nodes: p1=Ada at pos 0, p2=Bob at pos 1 (single group → globalPos == denseID).
 	v0, ok0, _ := s.Get(nameTok, 0)
 	v1, ok1, _ := s.Get(nameTok, 1)
 

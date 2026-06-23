@@ -121,14 +121,8 @@ func (l *Loader) pass3CountFile(
 		}
 		rt := uint32(relType)
 
-		// Determine node group for the source and destination nodes to get node count.
-		srcGroup := su.Group
-		dstGroup := ev.Group
-		srcCount := l.catalog.GroupCount(srcGroup)
-		dstCount := l.catalog.GroupCount(dstGroup)
-
-		fb.ensureCSR(rt, csrFwd, srcCount).Count(su.DenseID)
-		fb.ensureCSR(rt, csrBwd, dstCount).Count(ev.DenseID)
+		fb.ensureCSR(rt, csrFwd).Count(fb.GlobalPos(su.Group, su.DenseID))
+		fb.ensureCSR(rt, csrBwd).Count(fb.GlobalPos(ev.Group, ev.DenseID))
 
 		l.stats.Rels++
 
@@ -259,13 +253,16 @@ func (l *Loader) pass3ScatterRow(
 
 	eid := fb.nextEdgeID(rt)
 
+	srcGPos := fb.GlobalPos(su.Group, su.DenseID)
+	dstGPos := fb.GlobalPos(ev.Group, ev.DenseID)
+
 	fwd := fb.relCSR[csrKey{rt, csrFwd}]
 	bwd := fb.relCSR[csrKey{rt, csrBwd}]
 	if fwd != nil {
-		fwd.Scatter(su.DenseID, ev.DenseID, eid)
+		fwd.Scatter(srcGPos, dstGPos, eid)
 	}
 	if bwd != nil {
-		bwd.Scatter(ev.DenseID, su.DenseID, eid)
+		bwd.Scatter(dstGPos, srcGPos, eid)
 	}
 	l.stats.Rels++
 	return nil

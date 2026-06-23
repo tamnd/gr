@@ -101,6 +101,25 @@ func endPhaseSpan(span Span, err error) {
 	span.End()
 }
 
+// endExecuteSpan closes the gr.execute phase span when the executor finishes (doc 20 §12.2),
+// recording the work and the output as attributes (doc 20 §12.3): rows_scanned is what the scans
+// and expands touched and rows_returned is what the cursor yielded, the two numbers whose ratio
+// is the amplification a scan-heavy query reveals. It is nil-safe so the read path ends the span
+// whether or not tracing is on, and marks the span failed when the stream errored.
+func endExecuteSpan(span Span, scanned, returned int, err error) {
+	if span == nil {
+		return
+	}
+	span.SetInt("gr.execute.rows_scanned", int64(scanned))
+	span.SetInt("gr.execute.rows_returned", int64(returned))
+	if err != nil {
+		span.SetStatus(false, queryStatus(err))
+	} else {
+		span.SetStatus(true, "ok")
+	}
+	span.End()
+}
+
 // endQuerySpan closes the root span at a query's completion boundary (doc 20 §12.2), recording
 // the outcome and the output cardinality as attributes (doc 20 §12.3) so a trace shows the
 // status and the rows the same way the query-log entry does. It is nil-safe so the eager, error,

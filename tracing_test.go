@@ -352,6 +352,58 @@ func TestDBTracerPlanSpan(t *testing.T) {
 	}
 }
 
+// TestDBTracerExecuteSpan confirms a streaming read emits a gr.execute child span ended at Close
+// with the scanned and returned rows (doc 20 §12.2, §12.3): the span stays open across the stream
+// the way the root span does, and reports the work and the output once the cursor drains.
+func TestDBTracerExecuteSpan(t *testing.T) {
+	tr := &recordingTracer{}
+	db := openMemTraced(t, "trace_exec.gr", tr)
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Run(context.Background(), "CREATE (:Person {name: 'a'}), (:Person {name: 'b'})", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := db.Run(context.Background(), "MATCH (p:Person) RETURN p.name AS name", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := tr.lastNamed("gr.execute")
+	if exec == nil {
+		t.Fatal("no gr.execute span emitted for a read")
+	}
+	// The stream is open, so the execute span must not have ended yet.
+	exec.mu.Lock()
+	endedEarly := exec.ended
+	exec.mu.Unlock()
+	if endedEarly {
+		t.Error("gr.execute span ended before the stream was drained")
+	}
+
+	rows := 0
+	for res.Next() {
+		rows++
+	}
+	if err := res.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("read %d rows, want 2", rows)
+	}
+	if !exec.ended {
+		t.Error("gr.execute span was not ended at Close")
+	}
+	if !exec.ok {
+		t.Error("gr.execute span was marked failed for a clean read")
+	}
+	if exec.ints["gr.execute.rows_returned"] != 2 {
+		t.Errorf("gr.execute.rows_returned = %d, want 2", exec.ints["gr.execute.rows_returned"])
+	}
+	if exec.ints["gr.execute.rows_scanned"] < 2 {
+		t.Errorf("gr.execute.rows_scanned = %d, want at least 2", exec.ints["gr.execute.rows_scanned"])
+	}
+}
+
 // TestDBNoTracerDisabled confirms a database opened without a tracer neither panics nor starts
 // spans, the embedded default.
 func TestDBNoTracerDisabled(t *testing.T) {

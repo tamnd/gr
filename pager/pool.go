@@ -52,6 +52,14 @@ func (p *Pager) ReadPage(id format.PageID) (*Frame, error) {
 	if p.io != nil {
 		p.io.ObservePageRead(time.Since(start).Seconds())
 	}
+	// Attribute the disk read to its store so the per-store breakdown can localize a read spike to one
+	// subsystem (doc 20 §4.2). Page 0 carries the file header rather than a page header, so it reports as
+	// catalog (file metadata); every other page names its store in its header type.
+	if id == 0 {
+		p.pagesRead[storeCatalog].Add(1)
+	} else {
+		p.pagesRead[storeOf(format.ReadHeader(buf).Type)].Add(1)
+	}
 	if id != 0 && !verifyPage(buf) {
 		return nil, ErrBadChecksum
 	}
@@ -246,6 +254,13 @@ func (p *Pager) Commit() error {
 		}
 		if p.io != nil {
 			p.io.ObservePageWrite(time.Since(start).Seconds())
+		}
+		// Attribute the write-back to its store (doc 20 §4.2). Page 0 is the file header, counted as
+		// catalog; every other frame names its store in its header type.
+		if fr.PageID == 0 {
+			p.pagesWrittenByStore[storeCatalog].Add(1)
+		} else {
+			p.pagesWrittenByStore[storeOf(format.ReadHeader(fr.Image).Type)].Add(1)
 		}
 	}
 	// Count the images written back, the page write-back volume the checkpoint metrics attribute to a

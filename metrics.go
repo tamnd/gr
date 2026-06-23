@@ -55,6 +55,7 @@ func (db *DB) Metrics() MetricsSnapshot {
 	db.syncBufferPoolMetrics()
 	db.syncCacheMemoryMetrics()
 	db.syncCheckpointMetrics()
+	db.syncPageStoreMetrics()
 	db.syncWalMetrics()
 	db.syncMvccGCMetrics()
 	return db.metrics.reg.Snapshot()
@@ -214,6 +215,33 @@ func (db *DB) syncCheckpointMetrics() {
 	if c := m.checkpointPagesWritten; c != nil && pages > m.lastCkptPagesWritten {
 		c.Add(pages - m.lastCkptPagesWritten)
 		m.lastCkptPagesWritten = pages
+	}
+}
+
+// syncPageStoreMetrics mirrors the pager's cumulative per-store page read and write counts into the
+// registry at snapshot time (doc 20 §4.2): it advances gr_pages_read_total{store} and
+// gr_pages_written_total{store} by the pages read and written under each store since the last sync. The
+// pager owns the authoritative per-store atomics, bumped lock-free on the read fault and commit
+// write-back paths, so neither path touches the registry; this bridge runs only on a scrape. The delta
+// add keeps each counter monotonic, and pageStoreMu serializes two concurrent scrapes so neither
+// double-counts. Reading the counts is a lock-free atomic load through the engine, never the engine
+// lock, so a long-held write transaction cannot deadlock a snapshot.
+func (db *DB) syncPageStoreMetrics() {
+	if db.eng == nil {
+		return
+	}
+	m := db.metrics
+	m.pageStoreMu.Lock()
+	defer m.pageStoreMu.Unlock()
+	for _, s := range db.eng.PagesByStore() {
+		if c := m.pagesReadByStore[s.Store]; c != nil && s.Read > m.lastPagesRead[s.Store] {
+			c.Add(s.Read - m.lastPagesRead[s.Store])
+			m.lastPagesRead[s.Store] = s.Read
+		}
+		if c := m.pagesWrittenByStore[s.Store]; c != nil && s.Written > m.lastPagesWritten[s.Store] {
+			c.Add(s.Written - m.lastPagesWritten[s.Store])
+			m.lastPagesWritten[s.Store] = s.Written
+		}
 	}
 }
 
@@ -494,6 +522,14 @@ var metricCheckpointTriggers = []string{"wal_threshold", "timer", "manual", "clo
 // operator sees which store dominates the fold's write amplification.
 var metricCheckpointStores = []string{"node", "rel"}
 
+// metricPageStores is the bounded domain of the store label on gr_pages_read_total and
+// gr_pages_written_total (doc 20 §4.2): the logical stores a page belongs to. It matches the pager's
+// own store labels (the pager classifies each page by its header type and returns these strings), so a
+// rising read or write count under one label localizes the I/O to that subsystem: propcol rising is an
+// analytical scan, relgroup rising is supernode traversal, freelist rising is allocation churn. All
+// eight are pre-registered so a fresh database exposes every store's series at zero from the start.
+var metricPageStores = []string{"node", "rel", "relgroup", "propcol", "dynamic", "index", "catalog", "freelist"}
+
 // metricMvccElements is the bounded domain of the element label on the MVCC metrics (doc 20 §5.1):
 // the two graph element kinds versions are kept for, node and rel. It labels
 // gr_mvcc_gc_reclaimed_total so the version-reclaim throughput is readable per element.
@@ -640,6 +676,19 @@ type queryMetrics struct {
 	// mirrors it delta-style under checkpointSegMu, and lastCkptPagesWritten holds the last value.
 	checkpointPagesWritten *metric.Counter
 	lastCkptPagesWritten   uint64
+
+	// pagesReadByStore holds gr_pages_read_total and pagesWrittenByStore gr_pages_written_total, both
+	// keyed by store (doc 20 §4.2): the per-store breakdown of file I/O that localizes a read or write
+	// spike to one subsystem. The pager owns the authoritative per-store cumulative atomics, bumped
+	// lock-free on the read fault and commit write-back paths; the sync step mirrors them delta-style
+	// under pageStoreMu, the same bridge the checkpoint segment counters use. lastPagesRead and
+	// lastPagesWritten hold the last mirrored cumulative value per store, the basis for the monotonic
+	// delta add, so a scrape advances each counter by only the pages read or written since the last one.
+	pagesReadByStore    map[string]*metric.Counter
+	pagesWrittenByStore map[string]*metric.Counter
+	pageStoreMu         sync.Mutex
+	lastPagesRead       map[string]uint64
+	lastPagesWritten    map[string]uint64
 
 	// walBytesWritten holds gr_wal_bytes_written_total and walFrames gr_wal_frames_written_total keyed
 	// by kind (doc 20 §5.2): the WAL write-amplified durability throughput and the per-kind frame
@@ -857,6 +906,16 @@ func newQueryMetrics() *queryMetrics {
 		"Adjacency delta entries folded into the base CSR by checkpoints", "entries", nil)
 	m.checkpointPagesWritten = reg.Counter("gr_checkpoint_pages_written_total",
 		"Page images written back to the database file by checkpoints", "pages", nil)
+	m.pagesReadByStore = make(map[string]*metric.Counter, len(metricPageStores))
+	m.pagesWrittenByStore = make(map[string]*metric.Counter, len(metricPageStores))
+	m.lastPagesRead = make(map[string]uint64, len(metricPageStores))
+	m.lastPagesWritten = make(map[string]uint64, len(metricPageStores))
+	for _, store := range metricPageStores {
+		m.pagesReadByStore[store] = reg.Counter("gr_pages_read_total",
+			"Pages read from the file, by store", "pages", metric.Labels{"store": store})
+		m.pagesWrittenByStore[store] = reg.Counter("gr_pages_written_total",
+			"Pages written to the file, by store", "pages", metric.Labels{"store": store})
+	}
 	m.walBytesWritten = reg.Counter("gr_wal_bytes_written_total",
 		"Bytes appended to the write-ahead log", "bytes", nil)
 	m.walFrames = make(map[string]*metric.Counter, len(metricWalFrameKinds))

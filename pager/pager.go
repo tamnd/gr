@@ -62,6 +62,59 @@ var (
 	ErrBadChecksum = errors.New("gr/pager: page checksum mismatch")
 )
 
+// store enumerates the file's logical stores for per-store page I/O accounting (doc 20 §4.2). The order
+// fixes the array slot each store's read and write counters live in, and storeLabels gives the label each
+// slot reports. The set matches the catalogue's store label domain (doc 20 §4.2, doc 03 §4); page types
+// without a store of their own (the header, the section directory, generic data, statistics, credentials)
+// fold into catalog, since they are all small file-metadata stores an operator reasons about together.
+type store int
+
+const (
+	storeNode store = iota
+	storeRel
+	storeRelGroup
+	storePropCol
+	storeDynamic
+	storeIndex
+	storeCatalog
+	storeFreelist
+	numStores
+)
+
+var storeLabels = [numStores]string{"node", "rel", "relgroup", "propcol", "dynamic", "index", "catalog", "freelist"}
+
+// storeOf maps a page type to the store its reads and writes are attributed to (doc 20 §4.2). The id-map
+// is index infrastructure, so it reports as index; everything without a store of its own reports as
+// catalog (the default), the small file-metadata bucket.
+func storeOf(t format.PageType) store {
+	switch t {
+	case format.PageTypeNode:
+		return storeNode
+	case format.PageTypeRel:
+		return storeRel
+	case format.PageTypeRelGroup:
+		return storeRelGroup
+	case format.PageTypeColumn:
+		return storePropCol
+	case format.PageTypeDynamic:
+		return storeDynamic
+	case format.PageTypeIDMap:
+		return storeIndex
+	case format.PageTypeFree:
+		return storeFreelist
+	default:
+		return storeCatalog
+	}
+}
+
+// StorePageIO is one store's cumulative page read and write counts since open (doc 20 §4.2), the per-store
+// breakdown of file I/O the gr_pages_read_total{store} and gr_pages_written_total{store} counters expose.
+type StorePageIO struct {
+	Store   string
+	Read    uint64
+	Written uint64
+}
+
 // Frame is a cached page. Callers read and mutate Data (the full page image),
 // call Pager.MarkDirty after mutating, and Unpin when done.
 type Frame struct {
@@ -117,6 +170,15 @@ type Pager struct {
 	// Commit adds the frames it wrote, including the header frame. It is an atomic so a reader can load
 	// it without the pool lock; the engine reads it around its checkpoint to mirror the fold's writes.
 	pagesWritten atomic.Uint64
+
+	// pagesRead and pagesWrittenByStore are the cumulative per-store page read and write counts since
+	// open, the per-store breakdown of file I/O that localizes a read or write spike to one subsystem
+	// (doc 20 §4.2). A read is counted when ReadPage faults a page in from disk (a cache hit reads no
+	// page), a write when Commit copies a page image into the file. Each slot is an atomic, so a reader
+	// loads the pair without the pool lock, and the page's own header type picks the slot, so no separate
+	// page-to-store map is needed.
+	pagesRead           [numStores]atomic.Uint64
+	pagesWrittenByStore [numStores]atomic.Uint64
 
 	// io observes the latency of each page read and write against the VFS (doc 20 §4.2), or is nil when
 	// no observer is wired (a test pager). It is set from Options before open does any I/O and never
@@ -325,6 +387,21 @@ func (p *Pager) Recovered() bool { return p.recovered }
 // since open (doc 20 §5.4). The engine reads it around a checkpoint to attribute the fold's write-back
 // volume; it is a lock-free atomic load, so it never contends the pool lock.
 func (p *Pager) PagesWritten() uint64 { return p.pagesWritten.Load() }
+
+// PagesByStore returns the cumulative per-store page read and write counts since open (doc 20 §4.2), one
+// entry per store in label order. The counts are lock-free atomic loads, so the metrics snapshot path
+// reads them without the pool lock or the engine lock, the same discipline the hit and miss counts use.
+func (p *Pager) PagesByStore() []StorePageIO {
+	out := make([]StorePageIO, numStores)
+	for i := range out {
+		out[i] = StorePageIO{
+			Store:   storeLabels[i],
+			Read:    p.pagesRead[i].Load(),
+			Written: p.pagesWrittenByStore[i].Load(),
+		}
+	}
+	return out
+}
 
 // WALStats returns the write-ahead log's cumulative write counters and current size (doc 20 §5.2), or
 // a zero value on a read-only pager that has no writable WAL. The WAL's own accessor is a lock-free

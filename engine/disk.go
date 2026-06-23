@@ -725,6 +725,12 @@ func (e *DiskEngine) PageSize() uint32 { return e.p.PageSize() }
 // the engine lock.
 func (e *DiskEngine) BufferPoolStats() pager.PoolStats { return e.p.PoolStats() }
 
+// PagesByStore returns the pager's cumulative per-store page read and write counts since open (doc 20
+// §4.2), the per-store breakdown the gr_pages_read_total{store} and gr_pages_written_total{store}
+// counters expose. It reads the pager's lock-free per-store atomics, never the engine lock, so the
+// metrics snapshot path calls it freely even while a write transaction holds the engine lock.
+func (e *DiskEngine) PagesByStore() []pager.StorePageIO { return e.p.PagesByStore() }
+
 // WALStats returns the write-ahead log's cumulative write counters and current size (doc 20 §5.2), the
 // numbers the WAL metrics expose. It reads the WAL's own lock-free atomics through the pager, never the
 // engine lock, so the metrics snapshot path calls it freely even while a write transaction holds the

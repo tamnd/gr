@@ -43,6 +43,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return runExportCmd(args[1:], stdout, stderr)
 		case "info":
 			return runInfoCmd(args[1:], stdout, stderr)
+		case "health":
+			return runHealthCmd(args[1:], stdout, stderr)
 		case "backup":
 			return runBackupCmd(args[1:], stdout, stderr)
 		case "restore":
@@ -203,6 +205,7 @@ Usage:
   gr import database file --as label | --as-rel type --from L:col --to L:col
   gr export database --nodes|--rels|--query ... --to file
   gr info  database
+  gr health database
   gr backup source dest
   gr restore dest source
 
@@ -211,9 +214,10 @@ script. With no database argument gr opens a transient in-memory database.
 
 The serve subcommand serves the HTTP/JSON API over a database; the dump and
 load subcommands write and replay a logical Cypher dump; the info subcommand
-prints a database's facts; the backup and restore subcommands copy a consistent
-physical image and replace a database from one. Run "gr serve -h", "gr dump -h",
-or "gr load -h" for their flags.
+prints a database's facts; the health subcommand prints its live health report
+and exits non-zero when the engine cannot serve; the backup and restore
+subcommands copy a consistent physical image and replace a database from one. Run
+"gr serve -h", "gr dump -h", or "gr load -h" for their flags.
 
 Flags:
   -c, --cypher STMT     Run one statement and exit (repeatable)

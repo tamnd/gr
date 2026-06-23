@@ -34,6 +34,7 @@ import (
 	"bytes"
 	"errors"
 	"math"
+	"strings"
 
 	"github.com/tamnd/gr/colcodec"
 	"github.com/tamnd/gr/format"
@@ -290,6 +291,24 @@ func Decode(blob []byte) (value.Type, []Cell, error) {
 		}
 	}
 	return valueType, cells, nil
+}
+
+// SegmentCodec names the codec a segment body is encoded with, lowercased, for the
+// decode-time metric label (doc 20 §4.4). A union-plane segment serializes each value
+// on its own and has no single body codec, so it reports "union". The blob is only
+// peeked at the header, never fully decoded.
+func SegmentCodec(blob []byte) (string, error) {
+	if len(blob) < 8 {
+		return "", ErrBadSegment
+	}
+	if blob[6]&flagUnion != 0 {
+		return "union", nil
+	}
+	c, err := colcodec.PeekCodec(blob[5:])
+	if err != nil {
+		return "", err
+	}
+	return strings.ToLower(c.String()), nil
 }
 
 // planeForFlags recovers the value plane: the union flag forces the union plane,

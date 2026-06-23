@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"time"
+
 	"github.com/tamnd/gr/blockcache"
 	"github.com/tamnd/gr/colseg"
 	"github.com/tamnd/gr/colsegstore"
@@ -9,6 +11,17 @@ import (
 	"github.com/tamnd/gr/store"
 	"github.com/tamnd/gr/value"
 )
+
+// SegmentDecodeObserver receives the wall-clock time in seconds of each column-segment decode the
+// colcache miss path runs, with the segment body's codec name (doc 20 §4.4): the cost side that
+// pairs with the cache hit rate to show what a miss buys. The root wires one that observes into the
+// gr_colcache_decode_seconds{codec} histogram; until then it is nil and segGet times nothing. The
+// observe is lock-free on the metric side (an atomic bucket add), so segGet calls it on the read
+// path without taking the registry lock. The interface keeps the engine free of the metric package,
+// the same decoupling the page-I/O and constraint observers use.
+type SegmentDecodeObserver interface {
+	ObserveSegmentDecode(codec string, seconds float64)
+}
 
 // segPositions is how many positions a checkpoint packs into one column segment.
 // It is the decode granularity of a point read (a read decodes one covering
@@ -115,9 +128,15 @@ func (e *DiskEngine) segGet(base *colsegstore.Store, colID, key uint32, pos uint
 	if v, hit := e.bc.GetDecoded(ck, e.epoch); hit {
 		return cellAt(v.([]colseg.Cell), pos-firstPos)
 	}
-	cells, err := base.DecodeSegment(key, ord)
+	start := time.Now()
+	cells, codec, err := base.DecodeSegment(key, ord)
 	if err != nil {
 		return value.Null, false, err
+	}
+	// Time only a real decode, the cost a cache miss pays, and label it by the codec so a slow plane
+	// stands out (doc 20 §4.4). The observe is a lock-free atomic add, so it does not serialize reads.
+	if e.decodeObs != nil {
+		e.decodeObs.ObserveSegmentDecode(codec, time.Since(start).Seconds())
 	}
 	e.bc.PutDecoded(ck, e.epoch, cells, len(cells)*segCellBytes, nil, nil, nil)
 	return cellAt(cells, pos-firstPos)

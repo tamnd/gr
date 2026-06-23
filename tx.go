@@ -200,6 +200,10 @@ func (tx *Tx) Run(ctx context.Context, cypher string, params Params, opts ...Run
 	}
 	cfg := tx.db.resolveRun(opts)
 	start := time.Now()
+	// One id and one root span cover the whole statement, parse included, the same as the
+	// database-level Run (doc 20 §12.2).
+	id := tx.db.queryID()
+	ctx, span := tx.db.startQuerySpan(ctx, id, "")
 	vals, err := toValues(params)
 	if err != nil {
 		return nil, err
@@ -210,16 +214,20 @@ func (tx *Tx) Run(ctx context.Context, cypher string, params Params, opts ...Run
 		// though it never reaches gr_queries_total (doc 20 §3.1), and the query log records the
 		// failed statement with an empty kind (doc 20 §10.2).
 		tx.db.metrics.recordError(err)
-		tx.db.logQuery("", cypher, vals, start, queryStatus(err), err, 0, nil)
+		tx.db.logQuery(id, "", cypher, vals, start, queryStatus(err), err, 0, nil)
+		endQuerySpan(span, queryStatus(err), 0)
 		return nil, err
 	}
 	// The query metrics (doc 20 §3.1) wrap the dispatch the same way the database-level Run
 	// does, recording against the database's one registry, so a query run inside a managed
 	// transaction counts the same as an auto-commit one.
 	kind := metricQueryKind(q)
+	if span != nil {
+		span.SetString("gr.query.kind", kind)
+	}
 	tx.db.metrics.begin(kind)
 	res, err := tx.runDispatch(q, cypher, vals, cfg)
-	return tx.db.measureQuery(kind, cypher, vals, start, res, err)
+	return tx.db.measureQuery(kind, cypher, vals, start, id, span, res, err)
 }
 
 // runDispatch routes a parsed statement inside a managed transaction, the body of Run with

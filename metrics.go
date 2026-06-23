@@ -1506,26 +1506,31 @@ func metricErrorClass(err error) string {
 // executed result (a write, a schema or admin command, a pragma, an EXPLAIN) is complete now,
 // so it records immediately; a streaming read is not finished until the caller drains and
 // closes it, so it carries the recording on the result and fires it once at Close, which is
-// where the parse-through-last-row latency actually ends.
-func (db *DB) measureQuery(kind, cypher string, params map[string]value.Value, start time.Time, res *Result, err error) (*Result, error) {
+// where the parse-through-last-row latency actually ends. id is the correlation id the query-log
+// entry and the trace span share, and span is the root gr.query span the caller started; both
+// finalize at the same boundary as the metrics (doc 20 §12.2).
+func (db *DB) measureQuery(kind, cypher string, params map[string]value.Value, start time.Time, id string, span Span, res *Result, err error) (*Result, error) {
 	if err != nil {
 		db.metrics.recordError(err)
 		db.metrics.finish(kind, metricStatusOf(err), time.Since(start))
 		// A failure has no plan to capture, so the query-log entry carries none (doc 20 §10.6).
-		db.logQuery(kind, cypher, params, start, queryStatus(err), err, 0, nil)
+		db.logQuery(id, kind, cypher, params, start, queryStatus(err), err, 0, nil)
 		// A rejected write also raises the structured constraint event when the failure is one
 		// (doc 20 §11.3); a non-constraint error emits nothing here.
 		db.emitConstraintEvent(err)
+		endQuerySpan(span, queryStatus(err), 0)
 		return res, err
 	}
 	if res != nil && res.cursor != nil {
 		res.mdb = db
 		res.mkind = kind
 		res.mstart = start
-		// The streaming read's query-log entry is deferred to Close with the latency, so stash
-		// what the entry needs that the result does not already carry (doc 20 §10).
+		// The streaming read's query-log entry and trace span are deferred to Close with the
+		// latency, so stash what they need that the result does not already carry (doc 20 §10, §12).
 		res.qlcypher = cypher
 		res.qlparams = params
+		res.qlid = id
+		res.span = span
 		return res, nil
 	}
 	// An eager result is complete now: its returned count is the buffered row count and its
@@ -1548,7 +1553,8 @@ func (db *DB) measureQuery(kind, cypher string, params map[string]value.Value, s
 	if res != nil {
 		planText = res.PlanText
 	}
-	db.logQuery(kind, cypher, params, start, "ok", nil, int(returned), planText)
+	db.logQuery(id, kind, cypher, params, start, "ok", nil, int(returned), planText)
+	endQuerySpan(span, "ok", int(returned))
 	return res, nil
 }
 

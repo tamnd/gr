@@ -324,11 +324,10 @@ func hashParam(v any) string {
 	return "sha256:" + hex.EncodeToString(sum[:6])
 }
 
-// mintQueryID returns the correlation id one execution carries through its query-log entry
-// and its query_slow or query_error event (doc 20 §10.2, §11.3), a random 128-bit token
-// hex-encoded so entries from different opens never collide in a shared log sink. It is
-// minted only when a query log is configured, so the random draw never lands on the fast
-// path of a database that logs nothing.
+// mintQueryID returns the correlation id one execution carries through its query-log entry,
+// its query_slow or query_error event, and its trace span (doc 20 §10.2, §11.3, §12.3), a
+// random 128-bit token hex-encoded so entries from different opens never collide in a shared
+// log sink.
 func mintQueryID() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -337,20 +336,32 @@ func mintQueryID() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
+// queryID mints the correlation id one statement carries through its trace span and its
+// query-log entry (doc 20 §10.2, §12.3) when either a tracer or a query log is configured, so
+// the two join on the same id. It returns the empty string when neither is, leaving the random
+// draw off the fast path of a database that neither traces nor logs.
+func (db *DB) queryID() string {
+	if db.tracer == nil && db.querylog == nil {
+		return ""
+	}
+	id, _ := mintQueryID()
+	return id
+}
+
 // logQuery records one completed statement to the query log when one is configured (doc 20
-// §10), the embedded counterpart of the server's recordQuery. It mints the correlation id
-// the entry and its events share, converts the internal parameter values to the plain Go
-// values the redaction policy inspects, stamps the duration from start, and hands the record
-// to the log, which decides by its level and slow threshold whether to write it and raises
-// the query_slow or query_error event. A nil query log makes this a no-op, so the call sites
-// never guard it, and the parameter conversion runs only when a log is present. plan renders
-// the captured plan for a slow entry and is nil when the statement failed before a plan
-// existed. The user is "embedded", the library-call principal the spec names (doc 20 §10.2).
-func (db *DB) logQuery(kind, cypher string, params map[string]value.Value, start time.Time, status string, qerr error, rows int, plan func() string) {
+// §10), the embedded counterpart of the server's recordQuery. It converts the internal
+// parameter values to the plain Go values the redaction policy inspects, stamps the duration
+// from start, and hands the record to the log, which decides by its level and slow threshold
+// whether to write it and raises the query_slow or query_error event. A nil query log makes
+// this a no-op, so the call sites never guard it, and the parameter conversion runs only when a
+// log is present. id is the correlation id the caller already minted so the entry, its events,
+// and the trace span share it (doc 20 §12.3). plan renders the captured plan for a slow entry
+// and is nil when the statement failed before a plan existed. The user is "embedded", the
+// library-call principal the spec names (doc 20 §10.2).
+func (db *DB) logQuery(id, kind, cypher string, params map[string]value.Value, start time.Time, status string, qerr error, rows int, plan func() string) {
 	if db.querylog == nil {
 		return
 	}
-	id, _ := mintQueryID()
 	db.querylog.Record(QueryRecord{
 		StartedAt:    start,
 		QueryID:      id,

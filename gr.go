@@ -121,6 +121,14 @@ type DB struct {
 	// query_slow and query_error events (doc 20 §11.3).
 	querylog *QueryLog
 
+	// tracer emits the per-query span tree (doc 20 §12), nil when none is configured, the
+	// embedded default. The root gr.query span starts at a statement's begin boundary on the
+	// Run and Query seams and ends where the query metrics and the query log finalize:
+	// measureQuery for an eager result or an error, and the streaming read's Close. Its
+	// gr.query.id attribute is the same correlation id the query-log entry carries, so a trace
+	// and its log entry join.
+	tracer Tracer
+
 	// metrics is the database's metric registry and the pre-resolved query-metric handles
 	// (doc 20 §3.1). It is always built at Open, so db.Metrics never returns nil and the
 	// always-on collection runs whether or not a query log or event log is configured.
@@ -191,6 +199,12 @@ type Options struct {
 	// [NewQueryLog]. When an EventLog is configured too, gr links them at Open so a slow or
 	// failed query also raises the lighter query_slow and query_error events (doc 20 §11.3).
 	QueryLog *QueryLog
+	// Tracer receives the per-query span tree (doc 20 §12): the root gr.query span for each
+	// statement on the Run and Query seams, carrying the same correlation id as the query-log
+	// entry so a trace and its log entry join. nil, the default, disables tracing, so an
+	// embedded database emits no spans until the embedder bridges its OpenTelemetry tracer to
+	// the [Tracer] seam.
+	Tracer Tracer
 }
 
 // Open opens the database at path, creating it with a fresh graph structure if it
@@ -235,6 +249,7 @@ func Open(path string, opt Options) (*DB, error) {
 		readOnly:    opt.ReadOnly,
 		events:      opt.EventLog,
 		querylog:    opt.QueryLog,
+		tracer:      opt.Tracer,
 		metrics:     metrics,
 	}
 	// Link the query log to the event log so a slow or failed query also raises the lighter
@@ -585,9 +600,13 @@ func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, erro
 	// ErrReadQuery and counts as a read error). It does not route through Run, so it
 	// records its own query metrics here (doc 20 §3.1).
 	start := time.Now()
+	// Query carries no context, so its root span is a root in the trace; the propagation seam
+	// that adopts a caller's trace context runs on the context-carrying Run path (doc 20 §12.4).
+	id := db.queryID()
+	_, span := db.startQuerySpan(context.Background(), id, "read")
 	db.metrics.begin("read")
 	res, err := db.query(cypher, params, db.lazyDefault())
-	return db.measureQuery("read", cypher, params, start, res, err)
+	return db.measureQuery("read", cypher, params, start, id, span, res, err)
 }
 
 // query is the body of Query with the resolved property-materialization mode threaded
@@ -744,6 +763,11 @@ func (db *DB) Run(ctx context.Context, cypher string, params Params, opts ...Run
 	}
 	cfg := db.resolveRun(opts)
 	start := time.Now()
+	// One correlation id and one root span cover the whole statement, parse included, so a parse
+	// failure still traces and logs under the same id (doc 20 §12.2). The kind is unknown until
+	// the parse succeeds, so the span gets it then.
+	id := db.queryID()
+	ctx, span := db.startQuerySpan(ctx, id, "")
 	vals, err := toValues(params)
 	if err != nil {
 		return nil, err
@@ -755,16 +779,20 @@ func (db *DB) Run(ctx context.Context, cypher string, params Params, opts ...Run
 		// a failed query, so the query log records it too, with an empty kind the way the server
 		// surface does (doc 20 §10.2): the failure is carried by the status and error.
 		db.metrics.recordError(err)
-		db.logQuery("", cypher, vals, start, queryStatus(err), err, 0, nil)
+		db.logQuery(id, "", cypher, vals, start, queryStatus(err), err, 0, nil)
+		endQuerySpan(span, queryStatus(err), 0)
 		return nil, err
 	}
 	// The query metrics (doc 20 §3.1) wrap the dispatch: begin raises the in-flight gauge,
 	// runDispatch executes, and measureQuery records the outcome and latency, recording an
 	// eager result now and deferring a streaming read to its Close.
 	kind := metricQueryKind(q)
+	if span != nil {
+		span.SetString("gr.query.kind", kind)
+	}
 	db.metrics.begin(kind)
 	res, err := db.runDispatch(q, cypher, vals, cfg)
-	return db.measureQuery(kind, cypher, vals, start, res, err)
+	return db.measureQuery(kind, cypher, vals, start, id, span, res, err)
 }
 
 // runDispatch routes a parsed statement to its execution path, the body of Run with the
@@ -1693,6 +1721,12 @@ type Result struct {
 	// empty for an eager result, which logs at dispatch, and for a database with no query log.
 	qlcypher string
 	qlparams map[string]value.Value
+	// qlid is the correlation id this streaming read's deferred query-log entry and trace span
+	// share (doc 20 §12.3), and span is the root gr.query span measureQuery started and Close
+	// ends where the parse-through-last-row latency ends. Both are zero for an eager result,
+	// which finalizes at dispatch, and for a database with neither a query log nor a tracer.
+	qlid string
+	span Span
 
 	// planOp and planStats carry the plan this result ran so PlanText can render the
 	// EXPLAIN-grade tree the slow-query log captures (doc 20 §10.6). planStats is the
@@ -1844,10 +1878,13 @@ func (r *Result) Close() error {
 		// parse-through-last-row latency ends (doc 20 §10): the status follows whether the
 		// stream errored, the row count is what it yielded, and the plan is the one it ran for
 		// the slow-query log's captured plan (doc 20 §10.6). A clean stream logs no error.
-		r.mdb.logQuery(r.mkind, r.qlcypher, r.qlparams, r.mstart, queryStatus(r.err), r.err, int(r.rowsReturned), r.PlanText)
+		r.mdb.logQuery(r.qlid, r.mkind, r.qlcypher, r.qlparams, r.mstart, queryStatus(r.err), r.err, int(r.rowsReturned), r.PlanText)
 		// A streaming write that errored on a constraint at commit raises the structured
 		// constraint event here too (doc 20 §11.3), the same as the eager error path.
 		r.mdb.emitConstraintEvent(r.err)
+		// The root gr.query span ends here too, where the stream's latency ends (doc 20 §12.2),
+		// carrying the outcome and the rows it yielded.
+		endQuerySpan(r.span, queryStatus(r.err), int(r.rowsReturned))
 	}
 	if cerr != nil {
 		return cerr

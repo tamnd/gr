@@ -227,6 +227,12 @@ func (db *DB) walCheckpoint(arg value.Value) (*Result, error) {
 	default:
 		return nil, fmt.Errorf("%w: unknown wal_checkpoint mode %q", ErrConfigRange, mode)
 	}
+	// Capture the engine's cumulative per-checkpoint counts before the fold so the difference
+	// after it is exactly this checkpoint's work, the figures the checkpoint_complete event
+	// carries (doc 20 §11.3). The counts are lock-free atomics the checkpoint bumps under the
+	// engine lock, so reading them on either side of the call is safe and never takes the lock.
+	pagesBefore := db.eng.CheckpointPagesWrittenTotal()
+	foldedBefore := db.eng.CheckpointDeltaFoldedTotal()
 	start := time.Now()
 	if err := db.eng.Checkpoint(); err != nil {
 		return nil, err
@@ -235,6 +241,15 @@ func (db *DB) walCheckpoint(arg value.Value) (*Result, error) {
 	// This PRAGMA is the manual trigger (doc 20 §5.4); the timer and wal_threshold triggers
 	// record their own when the automatic checkpoint scheduler lands.
 	db.metrics.recordCheckpoint("manual", done.Sub(start), done.Unix())
+	// Emit the checkpoint_complete event with the work this checkpoint did, the operational
+	// narrative an operator reads for checkpoint cadence and durations (doc 20 §11.3). The
+	// checkpoint_start event waits on the WAL-backlog substrate its wal_backlog_bytes field
+	// needs, so only the completion event fires today.
+	db.events.CheckpointComplete(
+		int(db.eng.CheckpointPagesWrittenTotal()-pagesBefore),
+		int(db.eng.CheckpointDeltaFoldedTotal()-foldedBefore),
+		done.Sub(start),
+	)
 	return &Result{cols: []string{"wal_checkpoint"}, buf: []eval.Row{{"wal_checkpoint": value.String(strings.ToLower(mode))}}}, nil
 }
 

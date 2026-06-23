@@ -2,6 +2,7 @@ package gr
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"strings"
@@ -79,6 +80,45 @@ func TestDBOpenCloseEvents(t *testing.T) {
 	}
 	if closed["clean"] != true {
 		t.Errorf("clean = %v, want true on a normal close", closed["clean"])
+	}
+}
+
+// TestDBCheckpointEvent confirms a wal_checkpoint PRAGMA emits a checkpoint_complete
+// event carrying the work the checkpoint did and its duration, the operational
+// narrative an operator reads for checkpoint cadence (doc 20 §11.3).
+func TestDBCheckpointEvent(t *testing.T) {
+	el, read := captureDBEvents()
+	fsys := vfs.NewMem()
+	db, err := Open("ckpt.gr", Options{VFS: fsys, SaltSeed: 1, EventLog: el})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE (:Person {name: 'a'})", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Run(context.Background(), "PRAGMA wal_checkpoint", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var ckpt map[string]any
+	for _, e := range read() {
+		if e["event"] == EventCheckpointComplete {
+			ckpt = e
+		}
+	}
+	if ckpt == nil {
+		t.Fatalf("no checkpoint_complete event after a checkpoint; entries = %v", read())
+	}
+	if _, ok := ckpt["duration_ms"]; !ok {
+		t.Errorf("checkpoint event has no duration_ms: %v", ckpt)
+	}
+	if pw, ok := ckpt["pages_written"].(float64); !ok || pw < 0 {
+		t.Errorf("pages_written = %v, want a nonnegative count", ckpt["pages_written"])
+	}
+	if _, ok := ckpt["delta_folded"]; !ok {
+		t.Errorf("checkpoint event has no delta_folded: %v", ckpt)
 	}
 }
 

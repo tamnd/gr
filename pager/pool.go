@@ -164,13 +164,15 @@ func (p *Pager) evict() {
 
 // PoolStats is a point-in-time view of the buffer pool's lookup outcomes and resident population
 // (doc 20 §4.1), the numbers the buffer-pool metrics expose. Hits and Misses are cumulative since
-// open; Resident is the frames currently holding a page and Bytes the memory they occupy. The four
-// are read together under the pool lock so the hit rate and the fill level are consistent.
+// open; Resident is the frames currently holding a page and Bytes the memory they occupy, and Budget
+// is the configured ceiling on that memory, the page cap times the page size (doc 20 §4.5). They are
+// read together under the pool lock so the hit rate and the fill level are consistent.
 type PoolStats struct {
 	Hits     uint64
 	Misses   uint64
 	Resident int
 	Bytes    int
+	Budget   int
 }
 
 // PoolStats returns the buffer pool's cumulative hit and miss counts and its current resident
@@ -185,6 +187,7 @@ func (p *Pager) PoolStats() PoolStats {
 		Misses:   p.misses,
 		Resident: len(p.pool),
 		Bytes:    len(p.pool) * int(p.pageSize),
+		Budget:   p.maxPool * int(p.pageSize),
 	}
 }
 

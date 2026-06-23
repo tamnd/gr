@@ -1077,8 +1077,18 @@ func TestMetricsUnifiedCacheMemory(t *testing.T) {
 		t.Fatalf("unified column memory = %d, want %d to match the standalone gauge", col, standalone)
 	}
 	// The budget-used sum is exactly the caches that account bytes today.
-	if used := snap.Gauge("gr_cache_budget_used_bytes", nil); used != bp+col {
+	used := snap.Gauge("gr_cache_budget_used_bytes", nil)
+	if used != bp+col {
 		t.Fatalf("budget used = %d, want %d (bufferpool + column)", used, bp+col)
+	}
+	// The configured budget is the ceiling the used bytes stay under (invariant 9): the sum of the
+	// buffer-pool and column-cache budgets, well above what this tiny database fills.
+	budget := snap.Gauge("gr_cache_budget_bytes", nil)
+	if budget <= 0 {
+		t.Fatalf("cache budget = %d, want > 0", budget)
+	}
+	if budget < used {
+		t.Fatalf("cache budget = %d, want at least the used %d", budget, used)
 	}
 }
 

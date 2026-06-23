@@ -262,18 +262,23 @@ func (c *Column) Locate(pos uint64) (ord int, firstPos uint64, ok bool, err erro
 
 // DecodeSegment reads and decodes the whole segment at ordinal ord into its cells.
 // The caller pairs it with Locate: Locate finds the ordinal cheaply, this decodes it
-// only when the decoded cells are not already cached.
-func (c *Column) DecodeSegment(ord int) ([]colseg.Cell, error) {
+// only when the decoded cells are not already cached. The returned codec name is the
+// segment body's encoding, for the decode-time metric (doc 20 §4.4).
+func (c *Column) DecodeSegment(ord int) ([]colseg.Cell, string, error) {
 	s, err := c.readSeg(ord)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	buf := make([]byte, s.blobLen)
 	if err := c.blob.Read(int(s.blobOff), int(s.blobLen), buf); err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	codec, err := colseg.SegmentCodec(buf)
+	if err != nil {
+		return nil, "", err
 	}
 	_, cells, err := colseg.Decode(buf)
-	return cells, err
+	return cells, codec, err
 }
 
 // readSeg decodes the directory record at index i.

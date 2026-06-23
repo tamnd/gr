@@ -526,6 +526,14 @@ var metricColcacheResults = []string{"hit", "miss"}
 // each series at zero.
 var metricColcacheEvictReasons = []string{"capacity", "invalidation"}
 
+// metricColcacheCodecs is the bounded domain of the codec label on gr_colcache_decode_seconds (doc 20
+// §4.4): the segment body encoding a colcache miss had to decode. The names are the lowercased colcodec
+// ids the column store actually writes (raw, constant, rle, for, delta, dictionary, deltafor, block),
+// plus union for a per-value tagged segment that has no single body codec. The latency split by codec
+// shows which plane costs the most to decode, so a slow scan can be traced to a heavy encoding rather
+// than a cold cache. All are pre-registered so a fresh database exposes every codec's series at zero.
+var metricColcacheCodecs = []string{"raw", "constant", "rle", "for", "delta", "dictionary", "deltafor", "block", "union"}
+
 // metricCheckpointTriggers is the bounded domain of the trigger label on gr_checkpoint_total (doc
 // 20 §5.4): what drove a checkpoint. manual is the PRAGMA wal_checkpoint a caller runs by hand, the
 // only trigger wired today; wal_threshold (the WAL grew past its limit), timer (the periodic
@@ -637,6 +645,13 @@ type queryMetrics struct {
 	colcacheEvictions         map[string]*metric.Counter
 	lastColcacheEvictCapacity uint64
 	lastColcacheEvictInval    uint64
+
+	// colcacheDecode holds gr_colcache_decode_seconds keyed by codec, the wall-clock time a colcache
+	// miss spent decoding a segment, split by its body encoding (doc 20 §4.4). Unlike the cumulative
+	// cache counts this is observed straight from the engine's decode site through segmentDecodeObserver,
+	// lock-free, so it needs no sync step or last* mirror: the engine observes into the per-codec
+	// histogram on each miss and the snapshot reads it.
+	colcacheDecode map[string]*metric.Histogram
 
 	// bufferpoolAccesses holds gr_bufferpool_accesses_total keyed by result (hit, miss), and
 	// bufferpoolResident and bufferpoolBytes the fill-level gauges. The pager owns the
@@ -896,6 +911,12 @@ func newQueryMetrics() *queryMetrics {
 	for _, reason := range metricColcacheEvictReasons {
 		m.colcacheEvictions[reason] = reg.Counter("gr_colcache_evictions_total",
 			"Property blocks evicted from the cache, by reason", "evictions", metric.Labels{"reason": reason})
+	}
+	m.colcacheDecode = make(map[string]*metric.Histogram, len(metricColcacheCodecs))
+	for _, codec := range metricColcacheCodecs {
+		m.colcacheDecode[codec] = reg.Histogram("gr_colcache_decode_seconds",
+			"Time to decode a property segment on a cache miss, by codec", "seconds",
+			queryLatencyBuckets, metric.Labels{"codec": codec})
 	}
 	m.bufferpoolAccesses = make(map[string]*metric.Counter, len(metricBufferpoolResults))
 	for _, r := range metricBufferpoolResults {
@@ -1614,6 +1635,19 @@ func (o pageIOObserver) ObservePageRead(seconds float64) {
 func (o pageIOObserver) ObservePageWrite(seconds float64) {
 	if o.m.pageWriteSeconds != nil {
 		o.m.pageWriteSeconds.Observe(seconds)
+	}
+}
+
+// segmentDecodeObserver implements engine.SegmentDecodeObserver against the query metrics (doc 20
+// §4.4): it observes each segment-decode time into gr_colcache_decode_seconds for the segment's codec.
+// The histogram observes lock-free, so the engine calls this straight off the colcache miss path
+// without the registry lock. A codec name outside the pre-registered domain is dropped rather than
+// creating an unbounded series, so a future codec shows up as a missing series instead of label churn.
+type segmentDecodeObserver struct{ m *queryMetrics }
+
+func (o segmentDecodeObserver) ObserveSegmentDecode(codec string, seconds float64) {
+	if h := o.m.colcacheDecode[codec]; h != nil {
+		h.Observe(seconds)
 	}
 }
 

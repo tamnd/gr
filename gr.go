@@ -227,6 +227,10 @@ func Open(path string, opt Options) (*DB, error) {
 	// feeds gr_constraint_checks_total (doc 20 §6.4). A database with no declared constraints never
 	// calls it, so this costs nothing until a constraint exists.
 	db.eng.SetConstraintObserver(constraintObserver{db.metrics})
+	// The colcache miss path times each segment decode, so give the engine the observer that feeds
+	// gr_colcache_decode_seconds{codec} (doc 20 §4.4). Until a query reads a property through the
+	// segmented base, no decode runs and the observer is never called.
+	db.eng.SetSegmentDecodeObserver(segmentDecodeObserver{db.metrics})
 	// Register the per-index entry gauge for any index this open already carries (doc 20 §6.4), so a
 	// reopened database with indexes exposes their sizes from the first scrape. New indexes register
 	// lazily on the next snapshot.

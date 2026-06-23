@@ -928,6 +928,53 @@ func TestMetricsColcacheEvictions(t *testing.T) {
 	}
 }
 
+func TestMetricsColcacheDecode(t *testing.T) {
+	db := openMem(t, "mxcoldecode.gr")
+	defer db.Close()
+
+	for i := 0; i < 5; i++ {
+		mustExec(t, db, "CREATE (:Person {email: 'a@x'})", nil)
+	}
+	// Fold the properties into the segmented base so a property read decodes a real segment.
+	runPragma(t, db, "PRAGMA wal_checkpoint")
+
+	codecs := []string{"raw", "constant", "rle", "for", "delta", "dictionary", "deltafor", "block", "union"}
+	decodeCount := func(snap MetricsSnapshot) (total uint64) {
+		for _, c := range codecs {
+			total += snap.Histogram("gr_colcache_decode_seconds", Labels{"codec": c}).Count
+		}
+		return
+	}
+
+	// No property read has gone through the segmented base yet, so nothing has been decoded.
+	if c := decodeCount(db.Metrics()); c != 0 {
+		t.Fatalf("segment decodes before any read = %d, want 0", c)
+	}
+
+	read := func() {
+		res, err := db.Run(context.Background(), "MATCH (p:Person) RETURN p.email", nil)
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		drainResult(t, res)
+	}
+
+	// The first scan misses the cache and decodes its segments, so the decode histogram records the
+	// time under the segment's codec.
+	read()
+	snap := db.Metrics()
+	if c := decodeCount(snap); c == 0 {
+		t.Fatal("segment decodes after first scan = 0, want the miss-path decodes recorded")
+	}
+	first := decodeCount(snap)
+
+	// A second scan is served from the warm cache, so no further decode runs and the histogram holds.
+	read()
+	if c := decodeCount(db.Metrics()); c != first {
+		t.Fatalf("segment decodes after a warm re-scan = %d, want %d (no new decodes)", c, first)
+	}
+}
+
 func TestMetricsFileSizeBytes(t *testing.T) {
 	db := openMem(t, "mxfilesize.gr")
 	defer db.Close()

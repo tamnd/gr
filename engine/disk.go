@@ -152,6 +152,13 @@ type DiskEngine struct {
 	// base with a new segment layout and bumps it, so a read at the new epoch misses
 	// every entry cached against the old base.
 	epoch uint64
+
+	// decodeObs receives the wall-clock time of each segment decode the colcache miss path runs,
+	// labeled by the segment's codec, so a higher layer can chart decode cost without the engine
+	// importing a metric registry (doc 20 §4.4). It is nil until a caller sets it, and the segGet
+	// timing is skipped when it is nil. The observe is a lock-free atomic bucket add, so timing a
+	// decode does not serialize the read path.
+	decodeObs SegmentDecodeObserver
 }
 
 // Open opens or creates a graph database at path. A fresh file gets empty stores,
@@ -730,6 +737,11 @@ func (e *DiskEngine) BufferPoolStats() pager.PoolStats { return e.p.PoolStats() 
 // counters expose. It reads the pager's lock-free per-store atomics, never the engine lock, so the
 // metrics snapshot path calls it freely even while a write transaction holds the engine lock.
 func (e *DiskEngine) PagesByStore() []pager.StorePageIO { return e.p.PagesByStore() }
+
+// SetSegmentDecodeObserver installs the observer the colcache miss path reports segment decode times
+// to (doc 20 §4.4). It is set once after Open, before the database is shared, since segment decodes
+// run only on later query read paths and not during open itself.
+func (e *DiskEngine) SetSegmentDecodeObserver(o SegmentDecodeObserver) { e.decodeObs = o }
 
 // WALStats returns the write-ahead log's cumulative write counters and current size (doc 20 §5.2), the
 // numbers the WAL metrics expose. It reads the WAL's own lock-free atomics through the pager, never the

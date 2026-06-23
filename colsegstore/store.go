@@ -221,11 +221,12 @@ func (s *Store) Locate(key uint32, pos uint64) (ord int, firstPos uint64, ok boo
 
 // DecodeSegment decodes the whole segment at ordinal ord of key's column into its
 // cells. The engine calls it only on a cache miss, then caches the returned cells. A
-// key with no column returns nil cells.
-func (s *Store) DecodeSegment(key uint32, ord int) ([]colseg.Cell, error) {
+// key with no column returns nil cells. The returned codec name is the segment body's
+// encoding, for the decode-time metric (doc 20 §4.4).
+func (s *Store) DecodeSegment(key uint32, ord int) ([]colseg.Cell, string, error) {
 	col, ok, err := s.column(key)
 	if err != nil || !ok {
-		return nil, err
+		return nil, "", err
 	}
 	return col.DecodeSegment(ord)
 }

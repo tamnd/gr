@@ -76,8 +76,10 @@ const (
 
 // QueryRecord is one query execution's facts, assembled by a server surface and handed to
 // the query log (doc 20 §10.2). A surface fills what it knows; the engine-internal fields
-// the spec also lists (peak memory, plan time, rows scanned, spill) wait on the executor
-// instrumentation that produces them and are omitted until then.
+// the spec also lists (peak memory, plan time, spill) wait on the executor instrumentation
+// that produces them and are omitted until then. Rows scanned is wired: the scan counter the
+// metrics path already reads feeds it, so the amplification ratio (doc 20 §16.2) is on the
+// record.
 type QueryRecord struct {
 	StartedAt    time.Time      // when the query started, the entry's ts
 	QueryID      string         // unique per execution, correlates log, trace, and slow-query entries
@@ -91,6 +93,7 @@ type QueryRecord struct {
 	Err          error          // on a non-ok status, the failure
 	Duration     time.Duration  // end-to-end query duration
 	RowsReturned int            // result row count
+	RowsScanned  int            // rows scans and expands touched, the work; the scanned/returned ratio is the amplification
 	TxID         string         // the transaction the query ran in
 	// Plan, when set, renders the EXPLAIN-grade plan tree the query ran (doc 20 §10.6). It
 	// is a thunk, not the rendered text, so the cost of serializing the plan is paid only
@@ -215,6 +218,7 @@ func (l *QueryLog) Record(r QueryRecord) {
 		slog.String("status", r.Status),
 		slog.Float64("duration_ms", float64(r.Duration)/float64(time.Millisecond)),
 		slog.Int("rows_returned", r.RowsReturned),
+		slog.Int("rows_scanned", r.RowsScanned),
 	}
 	if r.TxID != "" {
 		attrs = append(attrs, slog.String("tx_id", r.TxID))
@@ -356,9 +360,11 @@ func (db *DB) queryID() string {
 // this a no-op, so the call sites never guard it, and the parameter conversion runs only when a
 // log is present. id is the correlation id the caller already minted so the entry, its events,
 // and the trace span share it (doc 20 §12.3). plan renders the captured plan for a slow entry
-// and is nil when the statement failed before a plan existed. The user is "embedded", the
-// library-call principal the spec names (doc 20 §10.2).
-func (db *DB) logQuery(id, kind, cypher string, params map[string]value.Value, start time.Time, status string, qerr error, rows int, plan func() string) {
+// and is nil when the statement failed before a plan existed. rows and scanned are the output
+// cardinality and the work the query touched, whose ratio is the amplification the slow-query
+// log surfaces (doc 20 §16.2); a statement that failed before it ran reports zero for both. The
+// user is "embedded", the library-call principal the spec names (doc 20 §10.2).
+func (db *DB) logQuery(id, kind, cypher string, params map[string]value.Value, start time.Time, status string, qerr error, rows, scanned int, plan func() string) {
 	if db.querylog == nil {
 		return
 	}
@@ -373,6 +379,7 @@ func (db *DB) logQuery(id, kind, cypher string, params map[string]value.Value, s
 		Err:          qerr,
 		Duration:     time.Since(start),
 		RowsReturned: rows,
+		RowsScanned:  scanned,
 		Plan:         plan,
 	})
 }

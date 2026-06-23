@@ -805,7 +805,7 @@ func (db *DB) Run(ctx context.Context, cypher string, params Params, opts ...Run
 		// a failed query, so the query log records it too, with an empty kind the way the server
 		// surface does (doc 20 §10.2): the failure is carried by the status and error.
 		db.metrics.recordError(err)
-		db.logQuery(id, "", cypher, vals, start, queryStatus(err), err, 0, nil)
+		db.logQuery(id, "", cypher, vals, start, queryStatus(err), err, 0, 0, nil)
 		endQuerySpan(span, queryStatus(err), 0)
 		return nil, err
 	}
@@ -1923,7 +1923,7 @@ func (r *Result) Close() error {
 		// parse-through-last-row latency ends (doc 20 §10): the status follows whether the
 		// stream errored, the row count is what it yielded, and the plan is the one it ran for
 		// the slow-query log's captured plan (doc 20 §10.6). A clean stream logs no error.
-		r.mdb.logQuery(r.qlid, r.mkind, r.qlcypher, r.qlparams, r.mstart, queryStatus(r.err), r.err, int(r.rowsReturned), r.PlanText)
+		r.mdb.logQuery(r.qlid, r.mkind, r.qlcypher, r.qlparams, r.mstart, queryStatus(r.err), r.err, int(r.rowsReturned), int(scanned), r.PlanText)
 		// A streaming write that errored on a constraint at commit raises the structured
 		// constraint event here too (doc 20 §11.3), the same as the eager error path.
 		r.mdb.emitConstraintEvent(r.err)

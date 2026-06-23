@@ -1514,7 +1514,7 @@ func (db *DB) measureQuery(kind, cypher string, params map[string]value.Value, s
 		db.metrics.recordError(err)
 		db.metrics.finish(kind, metricStatusOf(err), time.Since(start))
 		// A failure has no plan to capture, so the query-log entry carries none (doc 20 §10.6).
-		db.logQuery(id, kind, cypher, params, start, queryStatus(err), err, 0, nil)
+		db.logQuery(id, kind, cypher, params, start, queryStatus(err), err, 0, 0, nil)
 		// A rejected write also raises the structured constraint event when the failure is one
 		// (doc 20 §11.3); a non-constraint error emits nothing here.
 		db.emitConstraintEvent(err)
@@ -1538,12 +1538,14 @@ func (db *DB) measureQuery(kind, cypher string, params map[string]value.Value, s
 	// latency (doc 20 §3.1). A write with no RETURN has no output columns and buffers a single
 	// effect row the caller never reads, so its output cardinality is zero, not that row.
 	returned := int64(0)
+	scanned := int64(0)
 	if res != nil {
 		returned = int64(len(res.buf))
 		if len(res.cols) == 0 {
 			returned = 0
 		}
-		db.metrics.recordRows(returned, scanLoad(res.mscan))
+		scanned = scanLoad(res.mscan)
+		db.metrics.recordRows(returned, scanned)
 	}
 	db.metrics.finish(kind, "ok", time.Since(start))
 	// An eager result is finished, so its query-log entry is complete here, with the plan it
@@ -1553,7 +1555,7 @@ func (db *DB) measureQuery(kind, cypher string, params map[string]value.Value, s
 	if res != nil {
 		planText = res.PlanText
 	}
-	db.logQuery(id, kind, cypher, params, start, "ok", nil, int(returned), planText)
+	db.logQuery(id, kind, cypher, params, start, "ok", nil, int(returned), int(scanned), planText)
 	endQuerySpan(span, "ok", int(returned))
 	return res, nil
 }

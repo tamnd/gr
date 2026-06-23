@@ -82,6 +82,41 @@ func TestDBQueryLogRecordsStatements(t *testing.T) {
 	}
 }
 
+// TestDBQueryLogPlanMs confirms a query-log entry carries plan_ms, the time the plan phase
+// took, so a slow-query investigation can tell whether the latency came from the plan or the
+// execute phase (doc 20 §10.2). A cache miss computes the plan, so plan_ms is positive; a
+// cache hit skips most work, but the cache lookup itself still takes measurable time.
+func TestDBQueryLogPlanMs(t *testing.T) {
+	ql, read := captureQueryLog(QueryLogAll, RedactAll, time.Hour)
+	fsys := vfs.NewMem()
+	db, err := Open("pm.gr", Options{VFS: fsys, SaltSeed: 1, QueryLog: ql})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Run(context.Background(), "CREATE (:Person {name: 'Ada'})", nil); err != nil {
+		t.Fatal(err)
+	}
+	res, err := db.Query("MATCH (n:Person) RETURN n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainResult(t, res)
+
+	entries := read()
+	for _, e := range entries {
+		planMs, ok := e["plan_ms"]
+		if !ok {
+			t.Errorf("entry has no plan_ms field: %v", e)
+			continue
+		}
+		if v, _ := planMs.(float64); v < 0 {
+			t.Errorf("plan_ms = %v, want >= 0", v)
+		}
+	}
+}
+
 // TestDBQueryLogRowsScanned confirms a read entry carries rows_scanned, the work the query
 // touched, alongside rows_returned, so the slow-query log surfaces the scanned/returned
 // amplification (doc 20 §10.2, §16.2). The query scans every Person and returns the one that

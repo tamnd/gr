@@ -217,7 +217,7 @@ func (tx *Tx) Run(ctx context.Context, cypher string, params Params, opts ...Run
 		// though it never reaches gr_queries_total (doc 20 §3.1), and the query log records the
 		// failed statement with an empty kind (doc 20 §10.2).
 		tx.db.metrics.recordError(err)
-		tx.db.logQuery(id, "", cypher, vals, start, queryStatus(err), err, 0, 0, nil)
+		tx.db.logQuery(id, "", cypher, vals, start, queryStatus(err), err, 0, 0, 0, nil)
 		endQuerySpan(span, queryStatus(err), 0)
 		return nil, err
 	}
@@ -288,6 +288,7 @@ func (tx *Tx) runDispatch(ctx context.Context, q *ast.Query, cypher string, vals
 func (tx *Tx) runRead(ctx context.Context, cypher string, q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
 	var b *bind.Bound
 	var op plan.Op
+	var planDur time.Duration
 	// st is the statistics the captured plan is rendered against for the slow-query log (doc 20
 	// §10.6): a read inside a write transaction binds structurally with no cost model, so it has
 	// none and PlanText shows the bare tree; a plain read's plan was cost-chosen, so the listing
@@ -306,17 +307,18 @@ func (tx *Tx) runRead(ctx context.Context, cypher string, q *ast.Query, params m
 			return nil, err
 		}
 		b, op = bound, plan.Plan(bound)
-		tx.db.metrics.recordPlan("miss", time.Since(pstart))
+		planDur = time.Since(pstart)
+		tx.db.metrics.recordPlan("miss", planDur)
 		if pspan != nil {
 			pspan.SetString("gr.plan.cache", "miss")
 		}
 		endPhaseSpan(pspan, nil)
 	} else {
-		entry, err := tx.db.compile(ctx, cypher)
+		entry, dur, err := tx.db.compile(ctx, cypher)
 		if err != nil {
 			return nil, err
 		}
-		b, op = entry.Bound, entry.Op
+		b, op, planDur = entry.Bound, entry.Op, dur
 		st = engineStats{tx.db.eng}
 	}
 	// The executor span starts once the plan is ready; Close records the time since it as
@@ -330,7 +332,7 @@ func (tx *Tx) runRead(ctx context.Context, cypher string, q *ast.Query, params m
 		endExecuteSpan(espan, 0, 0, err)
 		return nil, err
 	}
-	return &Result{cols: cur.Cols(), cursor: cur, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy), mscan: cur.ScanCount(), mexec: execStart, planOp: op, planStats: st, execSpan: espan}, nil
+	return &Result{cols: cur.Cols(), cursor: cur, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy), mscan: cur.ScanCount(), mexec: execStart, planOp: op, planStats: st, execSpan: espan, planDur: planDur}, nil
 }
 
 // runWrite executes a write statement eagerly and returns a result over its
@@ -341,11 +343,11 @@ func (tx *Tx) runRead(ctx context.Context, cypher string, q *ast.Query, params m
 // catalog view (doc 13 §9), so the write takes no lock it does not already hold and
 // leaves no orphan token on rollback (doc 13 §16).
 func (tx *Tx) runWrite(ctx context.Context, q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
-	cols, buf, summary, scanned, op, err := tx.db.execWriteBuffered(ctx, tx.etx, q, params)
+	cols, buf, summary, scanned, op, planDur, err := tx.db.execWriteBuffered(ctx, tx.etx, q, params)
 	if err != nil {
 		return nil, err
 	}
-	return &Result{cols: cols, buf: buf, summary: summary, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy), mscan: scanned, planOp: op}, nil
+	return &Result{cols: cols, buf: buf, summary: summary, tx: tx.etx, ownTx: false, mat: tx.db.materializer(tx.etx, lazy), mscan: scanned, planOp: op, planDur: planDur}, nil
 }
 
 // Exec runs a Cypher write statement against the transaction and returns a summary

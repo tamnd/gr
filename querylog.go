@@ -92,6 +92,7 @@ type QueryRecord struct {
 	Status       string         // ok / error / timeout / killed
 	Err          error          // on a non-ok status, the failure
 	Duration     time.Duration  // end-to-end query duration
+	PlanMs       float64        // time the plan phase took in milliseconds; zero when the planner was skipped (parse failure, EXPLAIN)
 	RowsReturned int            // result row count
 	RowsScanned  int            // rows scans and expands touched, the work; the scanned/returned ratio is the amplification
 	TxID         string         // the transaction the query ran in
@@ -217,6 +218,7 @@ func (l *QueryLog) Record(r QueryRecord) {
 		slog.String("kind", r.Kind),
 		slog.String("status", r.Status),
 		slog.Float64("duration_ms", float64(r.Duration)/float64(time.Millisecond)),
+		slog.Float64("plan_ms", r.PlanMs),
 		slog.Int("rows_returned", r.RowsReturned),
 		slog.Int("rows_scanned", r.RowsScanned),
 	}
@@ -364,7 +366,7 @@ func (db *DB) queryID() string {
 // cardinality and the work the query touched, whose ratio is the amplification the slow-query
 // log surfaces (doc 20 §16.2); a statement that failed before it ran reports zero for both. The
 // user is "embedded", the library-call principal the spec names (doc 20 §10.2).
-func (db *DB) logQuery(id, kind, cypher string, params map[string]value.Value, start time.Time, status string, qerr error, rows, scanned int, plan func() string) {
+func (db *DB) logQuery(id, kind, cypher string, params map[string]value.Value, start time.Time, status string, qerr error, rows, scanned int, planDur time.Duration, plan func() string) {
 	if db.querylog == nil {
 		return
 	}
@@ -378,6 +380,7 @@ func (db *DB) logQuery(id, kind, cypher string, params map[string]value.Value, s
 		Status:       status,
 		Err:          qerr,
 		Duration:     time.Since(start),
+		PlanMs:       float64(planDur) / float64(time.Millisecond),
 		RowsReturned: rows,
 		RowsScanned:  scanned,
 		Plan:         plan,

@@ -673,10 +673,19 @@ func importSummary(opt importOptions, res importResult) string {
 	return fmt.Sprintf("imported %d relationships", res.rels)
 }
 
-// runImportCmd implements the `gr import` subcommand (doc 17 §7.2): it opens a database
-// read-write and loads CSV/TSV rows as nodes.
+// runImportCmd implements the `gr import` subcommand (doc 17 §7.2).
+//
+// Two paths are supported:
+//
+//  1. Bulk import (--nodes / --rels): uses the 4-pass offline loader for fast
+//     initial population. The database file must not exist (or --append).
+//
+//  2. Transactional import (FILE --as LABEL): row-by-row CREATE/MERGE inside
+//     batched write transactions; works on any open database.
 func runImportCmd(args []string, stdout, stderr io.Writer) int {
 	if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
+		bulkImportUsage(stderr)
+		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Usage: gr import DATABASE FILE (--as LABEL | --as-rel TYPE --from LABEL:COL --to LABEL:COL) [--id-col COL] [--from-key COL] [--to-key COL] [--type COL:TYPE] [--merge] [--no-header]")
 		return exitUsage
 	}
@@ -684,6 +693,18 @@ func runImportCmd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "gr: import needs a database")
 		return exitUsage
 	}
+
+	// Detect the bulk import path.
+	if isBulkImport(args) {
+		opt, _, err := parseBulkImportArgs(args)
+		if err != nil {
+			fmt.Fprintln(stderr, "gr:", err)
+			return exitUsage
+		}
+		return runBulkImport(opt, stderr)
+	}
+
+	// Transactional import path (original behavior).
 	dbPath := args[0]
 	opt, err := parseImportArgs(args[1:])
 	if err != nil {

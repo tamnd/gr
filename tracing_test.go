@@ -301,6 +301,57 @@ func TestDBTracerParseSpanFailed(t *testing.T) {
 	}
 }
 
+// TestDBTracerPlanSpan confirms a read emits a gr.plan child span carrying the plan-cache
+// outcome (doc 20 §12.2, §12.3): the first run of a statement misses the plan cache and the
+// second hits it.
+func TestDBTracerPlanSpan(t *testing.T) {
+	tr := &recordingTracer{}
+	db := openMemTraced(t, "trace_plan.gr", tr)
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Run(context.Background(), "CREATE (:Person {name: 'a'})", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	const read = "MATCH (p:Person) RETURN p.name AS name"
+	res, err := db.Run(context.Background(), read, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for res.Next() {
+	}
+	if err := res.Close(); err != nil {
+		t.Fatal(err)
+	}
+	plan := tr.lastNamed("gr.plan")
+	if plan == nil {
+		t.Fatal("no gr.plan span emitted for a read")
+	}
+	if !plan.ended {
+		t.Error("gr.plan span was not ended")
+	}
+	if plan.strs["gr.plan.cache"] != "miss" {
+		t.Errorf("first run gr.plan.cache = %q, want miss", plan.strs["gr.plan.cache"])
+	}
+
+	res2, err := db.Run(context.Background(), read, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for res2.Next() {
+	}
+	if err := res2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	plan2 := tr.lastNamed("gr.plan")
+	if plan2 == nil {
+		t.Fatal("no gr.plan span on the repeat read")
+	}
+	if plan2.strs["gr.plan.cache"] != "hit" {
+		t.Errorf("repeat run gr.plan.cache = %q, want hit", plan2.strs["gr.plan.cache"])
+	}
+}
+
 // TestDBNoTracerDisabled confirms a database opened without a tracer neither panics nor starts
 // spans, the embedded default.
 func TestDBNoTracerDisabled(t *testing.T) {

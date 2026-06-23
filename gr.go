@@ -603,20 +603,20 @@ func (db *DB) Query(cypher string, params map[string]value.Value) (*Result, erro
 	// Query carries no context, so its root span is a root in the trace; the propagation seam
 	// that adopts a caller's trace context runs on the context-carrying Run path (doc 20 §12.4).
 	id := db.queryID()
-	_, span := db.startQuerySpan(context.Background(), id, "read")
+	qctx, span := db.startQuerySpan(context.Background(), id, "read")
 	db.metrics.begin("read")
-	res, err := db.query(cypher, params, db.lazyDefault())
+	res, err := db.query(qctx, cypher, params, db.lazyDefault())
 	return db.measureQuery("read", cypher, params, start, id, span, res, err)
 }
 
 // query is the body of Query with the resolved property-materialization mode threaded
 // in, so the auto-commit read path and the per-run Run path (which may override the
 // mode with WithLazyProperties) share one implementation.
-func (db *DB) query(cypher string, params map[string]value.Value, lazy bool) (*Result, error) {
+func (db *DB) query(ctx context.Context, cypher string, params map[string]value.Value, lazy bool) (*Result, error) {
 	if db.eng == nil {
 		return nil, ErrClosed
 	}
-	entry, err := db.compile(cypher)
+	entry, err := db.compile(ctx, cypher)
 	if err != nil {
 		return nil, err
 	}
@@ -795,14 +795,14 @@ func (db *DB) Run(ctx context.Context, cypher string, params Params, opts ...Run
 		span.SetString("gr.query.kind", kind)
 	}
 	db.metrics.begin(kind)
-	res, err := db.runDispatch(q, cypher, vals, cfg)
+	res, err := db.runDispatch(ctx, q, cypher, vals, cfg)
 	return db.measureQuery(kind, cypher, vals, start, id, span, res, err)
 }
 
 // runDispatch routes a parsed statement to its execution path, the body of Run with the
 // metric instrumentation lifted out so the throughput, latency, and in-flight metrics record
 // once around the whole dispatch (doc 20 §3.1).
-func (db *DB) runDispatch(q *ast.Query, cypher string, vals map[string]value.Value, cfg runConfig) (*Result, error) {
+func (db *DB) runDispatch(ctx context.Context, q *ast.Query, cypher string, vals map[string]value.Value, cfg runConfig) (*Result, error) {
 	if q.Explain {
 		return db.explain(q, db.eng, indexLookup{db.eng}, engineStats{db.eng})
 	}
@@ -825,7 +825,7 @@ func (db *DB) runDispatch(q *ast.Query, cypher string, vals map[string]value.Val
 	if queryHasWrites(q) {
 		return db.runAutoWrite(q, vals, cfg.lazy)
 	}
-	return db.query(cypher, vals, cfg.lazy)
+	return db.query(ctx, cypher, vals, cfg.lazy)
 }
 
 // runAutoWrite executes a write statement in an implicit write transaction and
@@ -1312,7 +1312,12 @@ func summaryOf(e *exec.SideEffects) Summary {
 // replaced, which resets the basis so the check does not re-fire until the data
 // drifts again. Drift is a relative-fraction test, so uniform growth does not trigger
 // it, and a re-plan on a false positive only costs a compile, never correctness.
-func (db *DB) compile(cypher string) (*plan.Entry, error) {
+func (db *DB) compile(ctx context.Context, cypher string) (entry *plan.Entry, err error) {
+	// The gr.plan phase span wraps the whole compile, so a plan-cache miss shows as a slow
+	// gr.plan span and a hit as a fast one (doc 20 §12.2). The cache outcome is the span's one
+	// attribute (doc 20 §12.3); the defer ends the span marked failed on a bind or parse error.
+	_, span := db.startPhaseSpan(ctx, "gr.plan")
+	defer func() { endPhaseSpan(span, err) }()
 	start := time.Now()
 	key := plan.Key{Text: plan.NormalizeText(cypher), Catalog: db.eng.CatalogVersion()}
 	st := engineStats{db.eng}
@@ -1320,6 +1325,9 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 	if ok && !plan.Drifted(cached.Stats, st, db.drift()) {
 		db.metrics.recordCacheLookup("hit")
 		db.metrics.recordPlan("hit", time.Since(start))
+		if span != nil {
+			span.SetString("gr.plan.cache", "hit")
+		}
 		return cached, nil
 	}
 	// Either the cache had no plan for this text or the plan it had has drifted off its
@@ -1357,9 +1365,12 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 		return nil, err
 	}
 	op := plan.SeekRewrite(plan.PlanWithStats(b, st), b, indexLookup{db.eng}, st)
-	entry := &plan.Entry{Bound: b, Op: op, Stats: plan.Snapshot(op, st)}
+	entry = &plan.Entry{Bound: b, Op: op, Stats: plan.Snapshot(op, st)}
 	db.cache.Put(key, entry)
 	db.metrics.recordPlan("miss", time.Since(start))
+	if span != nil {
+		span.SetString("gr.plan.cache", "miss")
+	}
 	return entry, nil
 }
 

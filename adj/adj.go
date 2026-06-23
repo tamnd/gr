@@ -698,6 +698,47 @@ func SlotType(s uint32) uint32 { return s / 2 }
 // SlotDir returns the direction half of a slot key.
 func SlotDir(s uint32) Dir { return Dir(s % 2) }
 
+// SlotCount returns the number of (relType, direction) slots in the adjacency directory.
+func (a *Adj) SlotCount() int { return a.dir.Count() }
+
+// SlotOffsets returns the CSR offset array for slot s, or nil if the slot is empty.
+// The offset array maps each node position to the [start, end) range in the neighbor
+// array; it must be non-decreasing. Called by the integrity checker (doc 23 §8.5).
+func (a *Adj) SlotOffsets(s uint32) ([]uint64, error) { return a.slotOffsets(s) }
+
+// SlotNeighbors returns the neighbor and edge id arrays for slot s. These parallel
+// the offset array: nbrs[offsets[i]..offsets[i+1]] are the destinations of edges
+// from node i; edges[...] are the corresponding relationship ids. Used by the
+// integrity checker for adjacency-symmetry verification (doc 23 §8.5).
+func (a *Adj) SlotNeighbors(s uint32) (nbrs, edges []uint64, err error) {
+	c, err := a.readDir(s)
+	if err != nil {
+		return nil, nil, err
+	}
+	if c.nbrBytes == 0 {
+		return nil, nil, nil
+	}
+	log, err := store.OpenLog(a.p, c.logHead, int(c.offBytes+c.nbrBytes+c.edgBytes))
+	if err != nil {
+		return nil, nil, err
+	}
+	// neighbor array follows the offset array
+	nbrBlob := make([]byte, c.nbrBytes)
+	if err := log.Read(int(c.offBytes), int(c.nbrBytes), nbrBlob); err != nil {
+		return nil, nil, err
+	}
+	edgeBlob := make([]byte, c.edgBytes)
+	if err := log.Read(int(c.offBytes+c.nbrBytes), int(c.edgBytes), edgeBlob); err != nil {
+		return nil, nil, err
+	}
+	nbrs, err = decodeArray(nbrBlob)
+	if err != nil {
+		return nil, nil, err
+	}
+	edges, err = decodeArray(edgeBlob)
+	return nbrs, edges, err
+}
+
 // DeltaLen reports how many (source, slot) neighbor entries are pending in the
 // delta. It is zero immediately after a checkpoint.
 func (a *Adj) DeltaLen() int {

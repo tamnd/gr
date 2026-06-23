@@ -49,6 +49,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return runBackupCmd(args[1:], stdout, stderr)
 		case "restore":
 			return runRestoreCmd(args[1:], stdin, stdout, stderr)
+		case "check":
+			return runCheckCmd(args[1:], stdout, stderr)
 		}
 	}
 	cfg, err := parseArgs(args)
@@ -208,6 +210,7 @@ Usage:
   gr health database
   gr backup source dest
   gr restore dest source
+  gr check  [--level quick|default|full|forensic] database
 
 Open the interactive shell on a database, run a one-shot statement, or run a
 script. With no database argument gr opens a transient in-memory database.
@@ -216,8 +219,9 @@ The serve subcommand serves the HTTP/JSON API over a database; the dump and
 load subcommands write and replay a logical Cypher dump; the info subcommand
 prints a database's facts; the health subcommand prints its live health report
 and exits non-zero when the engine cannot serve; the backup and restore
-subcommands copy a consistent physical image and replace a database from one. Run
-"gr serve -h", "gr dump -h", or "gr load -h" for their flags.
+subcommands copy a consistent physical image and replace a database from one;
+the check subcommand verifies a file's structural integrity. Run "gr serve -h",
+"gr dump -h", "gr load -h", or "gr check --help" for their flags.
 
 Flags:
   -c, --cypher STMT     Run one statement and exit (repeatable)

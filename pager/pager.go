@@ -460,3 +460,56 @@ func (p *Pager) DrainWALFsyncDurations() []float64 {
 
 // PayloadSize returns usable payload bytes per page.
 func (p *Pager) PayloadSize() int { return format.PayloadSize(p.pageSize) }
+
+// PageCount returns the number of pages currently allocated in the file, from the header.
+func (p *Pager) PageCount() uint64 { return p.header.PageCount }
+
+// ScanPages calls fn with the raw bytes of every page in the file, in order from 0 to
+// PageCount-1. The bytes are a private copy — fn must not retain them. fn returning a
+// non-nil error stops the scan and ScanPages returns that error. Page 0 (the header page)
+// is included; its raw bytes are read without checksum validation (it carries the file
+// Header, not the generic page trailer). All other pages are read raw: the checksum is
+// included in the slice and the caller is responsible for validating it.
+func (p *Pager) ScanPages(fn func(id format.PageID, raw []byte) error) error {
+	buf := make([]byte, p.pageSize)
+	for id := format.PageID(0); id < format.PageID(p.header.PageCount); id++ {
+		if _, err := p.db.ReadAt(buf, int64(id)*int64(p.pageSize)); err != nil {
+			return err
+		}
+		if err := fn(id, buf); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WalkFreeList returns the complete set of page ids that are on the free list,
+// detecting cycles and out-of-range pointers. Each trunk page is itself a freed page
+// (the trunk-and-leaf layout, doc 03 §16.11), so it is included in the returned set.
+func (p *Pager) WalkFreeList() (map[format.PageID]bool, error) {
+	free := make(map[format.PageID]bool)
+	id := format.PageID(p.header.FreeListRoot)
+	for id != format.NoPage {
+		if free[id] {
+			return free, errors.New("free-list cycle detected")
+		}
+		if id >= format.PageID(p.header.PageCount) {
+			return free, errors.New("free-list page id out of range")
+		}
+		free[id] = true
+		hf, err := p.ReadPage(id)
+		if err != nil {
+			return free, err
+		}
+		body := p.payload(hf)
+		count := int(format.U32(body[flCountOff:]))
+		next := format.PageID(format.U64(body[flNextOff:]))
+		for i := range count {
+			pid := format.PageID(format.U64(body[flArrayOff+i*8:]))
+			free[pid] = true
+		}
+		p.Unpin(hf)
+		id = next
+	}
+	return free, nil
+}

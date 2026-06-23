@@ -31,6 +31,12 @@ type Pos struct {
 // operator tree but the engine never runs it, so the result is the plan listing
 // rather than the statement's rows. The prefix attaches to the statement as a
 // whole, so it travels with the query whatever its body is.
+//
+// Profile marks a statement the PROFILE prefix introduced: the engine plans it the
+// same way EXPLAIN does, then executes it with the operators instrumented and
+// renders the same plan tree annotated with each operator's actual rows and time
+// (doc 20 §9). A statement carries at most one of the two prefixes; the parser
+// rejects both at once.
 type Query struct {
 	Pos
 	First   *SingleQuery
@@ -39,6 +45,7 @@ type Query struct {
 	Admin   AdminCommand
 	Pragma  *PragmaCommand
 	Explain bool
+	Profile bool
 }
 
 // SchemaCommand is a data-definition statement that changes the catalog rather

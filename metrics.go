@@ -1433,13 +1433,16 @@ func (m *queryMetrics) recordError(err error) {
 }
 
 // metricQueryKind classifies a parsed statement into its query-metric kind label (doc 20
-// §3.1): EXPLAIN is its own kind (it never executes the underlying statement), then admin,
-// pragma, and schema by their clause, then a statement with write clauses is a write and the
-// rest are reads. PROFILE is not yet a distinct statement form, so it is not split out here.
+// §3.1): EXPLAIN is its own kind (it never executes the underlying statement), PROFILE its own
+// (it executes the statement instrumented and yields the annotated plan, not the rows), then
+// admin, pragma, and schema by their clause, then a statement with write clauses is a write and
+// the rest are reads.
 func metricQueryKind(q *ast.Query) string {
 	switch {
 	case q.Explain:
 		return "explain"
+	case q.Profile:
+		return "profile"
 	case q.Admin != nil:
 		return "admin"
 	case q.Pragma != nil:

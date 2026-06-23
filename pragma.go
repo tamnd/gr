@@ -32,6 +32,10 @@ var ErrPragmaCommand = errors.New("gr: PRAGMA statements run through Run, not Qu
 // configuration outside the operator pipeline, so it has no plan to render (doc 24 §3).
 var ErrExplainPragma = errors.New("gr: cannot EXPLAIN a PRAGMA")
 
+// ErrProfilePragma is returned by PROFILE of a PRAGMA. A PRAGMA runs outside the
+// operator pipeline, so it has no execution to instrument (doc 24 §3, doc 20 §9).
+var ErrProfilePragma = errors.New("gr: cannot PROFILE a PRAGMA")
+
 // ErrUnknownPragma is returned when a PRAGMA names a knob the engine does not know (doc 24
 // §24.4). An unknown name is a loud error rather than a silent no-op, so a typo
 // (PRAGMA synchronus) is caught rather than swallowed (doc 24 §3.8).

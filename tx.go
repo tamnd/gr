@@ -235,6 +235,12 @@ func (tx *Tx) runDispatch(q *ast.Query, cypher string, vals map[string]value.Val
 		}
 		return tx.db.explain(q, tx.db.eng, indexLookup{tx.db.eng}, engineStats{tx.db.eng})
 	}
+	if q.Profile {
+		// PROFILE executes the statement and rolls it back to leave nothing behind (doc
+		// 20 §9.6), which it cannot do inside a transaction the caller owns and will
+		// commit; it runs through the database-level Run, against its own transaction.
+		return nil, ErrProfile
+	}
 	if q.Schema != nil {
 		return nil, ErrSchemaCommand
 	}
@@ -335,6 +341,9 @@ func (tx *Tx) Exec(cypher string, params map[string]value.Value) (Summary, error
 	}
 	if q.Explain {
 		return Summary{}, ErrExplain
+	}
+	if q.Profile {
+		return Summary{}, ErrProfile
 	}
 	if q.Schema != nil {
 		// A schema command runs its own write transaction (execSchema), which would

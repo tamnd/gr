@@ -79,6 +79,12 @@ type Ctx struct {
 	// operators report through it as they open; the library wires it to the metric registry. It
 	// is nil for an uninstrumented run, where the report is a nil check and nothing more.
 	Graph GraphObserver
+	// Profile, when set, collects each operator's actual rows and time during the run (doc 20
+	// §9): Open wraps every operator in the profiling shim and the shim records into it on each
+	// pull, keyed by the plan node the operator came from. The library reads it after the cursor
+	// drains to render PROFILE's annotated tree. It is nil for an ordinary run, where no shim is
+	// inserted and the executor is exactly the uninstrumented one.
+	Profile *Profile
 }
 
 // GraphObserver receives graph-operator execution events for the graph-specific metric catalogue
@@ -272,8 +278,14 @@ type Cursor struct {
 // Open compiles the logical plan into an operator tree and starts it. The cursor
 // streams rows lazily; nothing beyond the operator setup runs until Next is
 // called. The caller must Close the cursor.
+//
+// When the context carries a Profile, every operator is wrapped in the profiling
+// shim as it compiles, so the instrumented run records each operator's actual rows
+// and time (doc 20 §9.2). With no Profile the shim is never inserted and the tree
+// is exactly the uninstrumented one.
 func Open(root plan.Op, ctx *Ctx) (*Cursor, error) {
-	op, err := compile(root)
+	c := &compiler{prof: ctx.Profile}
+	op, err := c.compile(root)
 	if err != nil {
 		return nil, err
 	}
@@ -331,10 +343,27 @@ func (c *Cursor) Close() error { return c.root.close() }
 // is drained, the amplification numerator for gr_query_rows_scanned.
 func (c *Cursor) ScanCount() *atomic.Int64 { return c.ctx.Scanned }
 
+// compiler lowers a logical plan into its executor operator tree (doc 12 §2.1). It
+// carries the profiling shim across the recursion: when prof is non-nil every
+// operator is wrapped as it compiles, so the instrumented run records each operator's
+// actual rows and time against the plan node it came from (doc 20 §9.2). A nil prof
+// is the uninstrumented path, where wrap returns the operator untouched.
+type compiler struct {
+	prof *Profile
+}
+
+// compile lowers a plan with no profiling instrumentation, the plain compile the
+// operators that recompile a subplan at run time use (a parallel join's build side, a
+// morsel worker's input): their work runs inside a parent operator's pull, whose
+// inclusive time already covers it, so the nested tree needs no shim of its own.
+func compile(o plan.Op) (operator, error) {
+	return (&compiler{}).compile(o)
+}
+
 // compile lowers one logical operator into its executor operator, recursively
 // compiling its inputs. Relationship-uniqueness peers are threaded by compileRel.
-func compile(o plan.Op) (operator, error) {
-	op, _, err := compileRel(o, nil)
+func (c *compiler) compile(o plan.Op) (operator, error) {
+	op, _, err := c.compileRel(o, nil)
 	return op, err
 }
 
@@ -345,50 +374,65 @@ func compile(o plan.Op) (operator, error) {
 // pipeline breaker (a projection, an aggregate, an unwind, a set operation, or an
 // Optional's correlated boundary) starts a fresh pattern scope and returns an
 // empty set, because relationship-uniqueness is scoped to a single MATCH.
-func compileRel(o plan.Op, peers []string) (operator, []string, error) {
+//
+// It wraps the operator it builds in the profiling shim before returning, so an
+// instrumented run measures every node once at the point it is produced; an
+// uninstrumented run gets the operator back unchanged.
+func (c *compiler) compileRel(o plan.Op, peers []string) (operator, []string, error) {
+	op, sib, err := c.compileRelInner(o, peers)
+	if err != nil {
+		return nil, nil, err
+	}
+	return c.prof.wrap(o, op), sib, nil
+}
+
+// compileRelInner is the operator-building body compileRel wraps. It holds the per
+// operator-kind lowering and the relationship-uniqueness peer threading; the shim
+// insertion lives in its caller so it happens once for every node.
+func (c *compiler) compileRelInner(o plan.Op, peers []string) (operator, []string, error) {
 	switch x := o.(type) {
 	case *plan.Unit:
 		return &unitOp{}, peers, nil
 	case *plan.Create:
-		input, err := compile(x.Input)
+		input, err := c.compile(x.Input)
 		if err != nil {
 			return nil, nil, err
 		}
 		return &createOp{spec: x, input: input}, nil, nil
 	case *plan.Merge:
-		input, err := compile(x.Input)
+		input, err := c.compile(x.Input)
 		if err != nil {
 			return nil, nil, err
 		}
-		match, args, err := compileInner(x.Match)
+		match, args, err := c.compileInner(x.Match)
 		if err != nil {
 			return nil, nil, err
 		}
 		return &mergeOp{spec: x, input: input, match: match, args: args}, nil, nil
 	case *plan.Foreach:
-		input, err := compile(x.Input)
+		input, err := c.compile(x.Input)
 		if err != nil {
 			return nil, nil, err
 		}
-		body, args, err := compileInner(x.Body)
+		body, args, err := c.compileInner(x.Body)
 		if err != nil {
 			return nil, nil, err
 		}
 		return &foreachOp{input: input, body: body, args: args}, nil, nil
 	case *plan.Set:
-		input, err := compile(x.Input)
+		input, err := c.compile(x.Input)
 		if err != nil {
 			return nil, nil, err
 		}
 		return &setOp{spec: x, input: input}, nil, nil
 	case *plan.Remove:
-		input, err := compile(x.Input)
+		input, err := c.compile(x.Input)
 		if err != nil {
 			return nil, nil, err
 		}
 		return &removeOp{spec: x, input: input}, nil, nil
 	case *plan.Delete:
-		input, err := compile(x.Input)
+		input, err := c.compile(x.Input)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -400,7 +444,7 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 	case *plan.NodeIndexSeek:
 		return &nodeIndexSeekOp{spec: x}, peers, nil
 	case *plan.Expand:
-		input, inPeers, err := compileRel(x.Input, peers)
+		input, inPeers, err := c.compileRel(x.Input, peers)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -413,7 +457,7 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 		}
 		return op, append(inPeers, x.Rel), nil
 	case *plan.Intersect:
-		input, inPeers, err := compileRel(x.Input, peers)
+		input, inPeers, err := c.compileRel(x.Input, peers)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -421,32 +465,32 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 		op := &intersectOp{spec: x, input: input, peers: sib}
 		return op, append(inPeers, x.Legs[0].Rel, x.Legs[1].Rel), nil
 	case *plan.Filter:
-		input, inPeers, err := compileRel(x.Input, peers)
+		input, inPeers, err := c.compileRel(x.Input, peers)
 		if err != nil {
 			return nil, nil, err
 		}
 		return &filterOp{pred: x.Pred, input: input}, inPeers, nil
 	case *plan.BindPath:
-		input, inPeers, err := compileRel(x.Input, peers)
+		input, inPeers, err := c.compileRel(x.Input, peers)
 		if err != nil {
 			return nil, nil, err
 		}
 		return &bindPathOp{spec: x, input: input}, inPeers, nil
 	case *plan.ShortestPath:
-		input, inPeers, err := compileRel(x.Input, peers)
+		input, inPeers, err := c.compileRel(x.Input, peers)
 		if err != nil {
 			return nil, nil, err
 		}
 		sib := append([]string(nil), inPeers...)
 		return &shortestPathOp{spec: x, input: input, peers: sib}, append(inPeers, x.Rel), nil
 	case *plan.Project:
-		input, err := compile(x.Input)
+		input, err := c.compile(x.Input)
 		if err != nil {
 			return nil, nil, err
 		}
 		return &projectOp{spec: x, input: input}, nil, nil
 	case *plan.Aggregate:
-		input, err := compile(x.Input)
+		input, err := c.compile(x.Input)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -457,7 +501,7 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 		// compiled the expand's input. The rel-variable names that input binds are
 		// the peers the counted edge must stay distinct from, the same sibling set
 		// the replaced Expand carried.
-		input, inPeers, err := compileRel(x.Input, nil)
+		input, inPeers, err := c.compileRel(x.Input, nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -466,7 +510,7 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 		// The product folds in only over an input that binds no relationship (the
 		// rewrite's guard), so there are no peers to thread and the input compiles in
 		// a fresh pattern scope.
-		input, err := compile(x.Input)
+		input, err := c.compile(x.Input)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -474,7 +518,7 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 	case *plan.Unwind:
 		var input operator
 		if x.Input != nil {
-			in, err := compile(x.Input)
+			in, err := c.compile(x.Input)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -482,50 +526,50 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 		}
 		return &unwindOp{expr: x.Expr, varName: x.Var, input: input}, nil, nil
 	case *plan.Sort:
-		input, inPeers, err := compileRel(x.Input, peers)
+		input, inPeers, err := c.compileRel(x.Input, peers)
 		if err != nil {
 			return nil, nil, err
 		}
 		return &sortOp{keys: x.Keys, input: input}, inPeers, nil
 	case *plan.Skip:
-		input, inPeers, err := compileRel(x.Input, peers)
+		input, inPeers, err := c.compileRel(x.Input, peers)
 		if err != nil {
 			return nil, nil, err
 		}
 		return &skipOp{n: x.N, input: input}, inPeers, nil
 	case *plan.Limit:
-		input, inPeers, err := compileRel(x.Input, peers)
+		input, inPeers, err := c.compileRel(x.Input, peers)
 		if err != nil {
 			return nil, nil, err
 		}
 		return &limitOp{n: x.N, input: input}, inPeers, nil
 	case *plan.Join:
-		left, err := compile(x.Left)
+		left, err := c.compile(x.Left)
 		if err != nil {
 			return nil, nil, err
 		}
-		right, err := compile(x.Right)
+		right, err := c.compile(x.Right)
 		if err != nil {
 			return nil, nil, err
 		}
 		return &joinOp{on: x.On, left: left, right: right, rightPlan: x.Right}, nil, nil
 	case *plan.Optional:
-		input, err := compile(x.Input)
+		input, err := c.compile(x.Input)
 		if err != nil {
 			return nil, nil, err
 		}
-		inner, args, err := compileInner(x.Inner)
+		inner, args, err := c.compileInner(x.Inner)
 		if err != nil {
 			return nil, nil, err
 		}
 		newVars := diffVars(x.Inner, x.Input)
 		return &optionalOp{input: input, inner: inner, args: args, newVars: newVars}, nil, nil
 	case *plan.Union:
-		left, err := compile(x.Left)
+		left, err := c.compile(x.Left)
 		if err != nil {
 			return nil, nil, err
 		}
-		right, err := compile(x.Right)
+		right, err := c.compile(x.Right)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -538,8 +582,8 @@ func compileRel(o plan.Op, peers []string) (operator, []string, error) {
 // compileInner compiles a correlated subplan (an Optional's inner) and collects
 // the Argument operators inside it so the Optional can feed each the current
 // outer row before reopening the subplan.
-func compileInner(o plan.Op) (operator, []*argumentOp, error) {
-	op, err := compile(o)
+func (c *compiler) compileInner(o plan.Op) (operator, []*argumentOp, error) {
+	op, err := c.compile(o)
 	if err != nil {
 		return nil, nil, err
 	}

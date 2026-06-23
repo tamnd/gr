@@ -667,6 +667,12 @@ func nodeLabel(o Op) string {
 	return ""
 }
 
+// Children lists an operator's child subtrees in the order the plan renders them,
+// the exported view of the same shape the tree printers walk (doc 20 §9.1). PROFILE
+// uses it to find each operator's children when it derives an operator's own
+// (exclusive) time by subtracting its children's measured time from its own.
+func Children(o Op) []Op { return nodeChildren(o) }
+
 // nodeChildren lists an operator's child subtrees in the order String renders
 // them, skipping the nil input a leading Unwind carries. It and nodeLabel are the
 // two pieces every tree walk over the rendered shape needs.

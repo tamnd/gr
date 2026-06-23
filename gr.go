@@ -68,6 +68,16 @@ var ErrExplain = errors.New("gr: EXPLAIN runs through Run, not Query or Exec")
 // to render.
 var ErrExplainSchema = errors.New("gr: cannot EXPLAIN a schema command")
 
+// ErrProfile is returned when a PROFILE statement reaches an entry point that cannot
+// carry its annotated plan listing. PROFILE executes the statement and yields the
+// instrumented plan tree as rows, so it runs through Run or a transaction's Run, not
+// through the row-less Exec or the cache-backed Query.
+var ErrProfile = errors.New("gr: PROFILE runs through Run, not Query or Exec")
+
+// ErrProfileSchema is returned by PROFILE of a schema or administrative command,
+// which changes state outside the operator pipeline and so has no plan to instrument.
+var ErrProfileSchema = errors.New("gr: cannot PROFILE a schema command")
+
 // DB is an open gr database. It owns the storage engine, which owns the pager
 // over the underlying file; queries run against snapshots the engine hands out.
 // It also owns the plan cache, so a repeated query shape reuses its compiled plan.
@@ -729,6 +739,9 @@ func (db *DB) runDispatch(q *ast.Query, cypher string, vals map[string]value.Val
 	if q.Explain {
 		return db.explain(q, db.eng, indexLookup{db.eng}, engineStats{db.eng})
 	}
+	if q.Profile {
+		return db.profile(q, vals, cfg.lazy)
+	}
 	if q.Admin != nil {
 		return db.execAdmin(q.Admin)
 	}
@@ -827,6 +840,9 @@ func (db *DB) Exec(cypher string, params map[string]value.Value) (Summary, error
 	}
 	if q.Explain {
 		return Summary{}, ErrExplain
+	}
+	if q.Profile {
+		return Summary{}, ErrProfile
 	}
 	if q.Admin != nil {
 		// A mutation administrative statement reports an empty summary, since it changes
@@ -1255,6 +1271,11 @@ func (db *DB) compile(cypher string) (*plan.Entry, error) {
 		// shaped to carry; it runs through Run (doc 25 §7.2).
 		return nil, ErrExplain
 	}
+	if q.Profile {
+		// PROFILE executes against a freshly compiled, instrumented operator tree, not
+		// a cached plan, so it runs through Run (doc 20 §9).
+		return nil, ErrProfile
+	}
 	if q.Schema != nil {
 		return nil, ErrSchemaCommand
 	}
@@ -1334,6 +1355,174 @@ func explainResult(op plan.Op, st plan.Statistics) *Result {
 		buf[i] = eval.Row{"plan": value.String(ln)}
 	}
 	return &Result{cols: []string{"plan"}, buf: buf}
+}
+
+// profile executes a statement with the operators instrumented and renders the same
+// plan tree EXPLAIN shows, annotated with each operator's actual rows and time, then
+// a footer with the run's totals (doc 20 §9). A schema, administrative, or PRAGMA
+// statement runs outside the operator pipeline, so there is nothing to instrument and
+// PROFILE of one is rejected, the same boundary EXPLAIN draws. A read runs against a
+// snapshot; a write runs in a write transaction that is always rolled back, so PROFILE
+// of a write measures the execution and leaves the database unchanged (doc 20 §9.6).
+func (db *DB) profile(q *ast.Query, params map[string]value.Value, lazy bool) (*Result, error) {
+	switch {
+	case q.Schema != nil, q.Admin != nil:
+		return nil, ErrProfileSchema
+	case q.Pragma != nil:
+		return nil, ErrProfilePragma
+	case queryHasWrites(q):
+		return db.profileWrite(q, params)
+	default:
+		return db.profileRead(q, params)
+	}
+}
+
+// profileRead instruments a read statement against a fresh snapshot. It binds and
+// plans the statement the cache-backed read path would (cost-based plan with the seek
+// rewrite), so the tree it measures is the tree it would have run, then drains the
+// instrumented cursor and renders the annotated plan. The snapshot is read-only and
+// always aborted, since a read commits nothing.
+func (db *DB) profileRead(q *ast.Query, params map[string]value.Value) (*Result, error) {
+	st := engineStats{db.eng}
+	b, err := bind.Bind(q, bind.NewEngineCatalog(db.eng), false)
+	if err != nil {
+		return nil, err
+	}
+	op := plan.SeekRewrite(plan.PlanWithStats(b, st), b, indexLookup{db.eng}, st)
+	tx, err := db.eng.Begin(false)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Abort() }()
+	prof := exec.NewProfile()
+	ctx := db.execCtx(tx, b, params)
+	ctx.Profile = prof
+	total, scanned, returned, err := drainProfiled(op, ctx)
+	if err != nil {
+		return nil, err
+	}
+	return profileResult(op, st, prof, total, scanned, returned), nil
+}
+
+// profileWrite instruments a write statement, then rolls it back (doc 20 §9.6). It
+// interns the write's new names, binds and plans it the write path would (plan.Plan,
+// no cost model), runs the instrumented cursor to exhaustion so every operator is
+// measured, and aborts the transaction so nothing the write did survives. The
+// rendered tree carries no row estimates, since a write plan is not cardinality
+// chosen, and the engine statistics cannot be read under the held write lock anyway.
+func (db *DB) profileWrite(q *ast.Query, params map[string]value.Value) (*Result, error) {
+	tx, err := db.eng.Begin(true)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Abort() }()
+	if err := internWriteNames(tx, q); err != nil {
+		return nil, err
+	}
+	b, err := bind.Bind(q, bind.NewEngineCatalog(tx), false)
+	if err != nil {
+		return nil, err
+	}
+	op := plan.Plan(b)
+	prof := exec.NewProfile()
+	ctx := db.execCtx(tx, b, params)
+	ctx.Effects = &exec.SideEffects{}
+	ctx.Profile = prof
+	total, scanned, returned, err := drainProfiled(op, ctx)
+	if err != nil {
+		return nil, err
+	}
+	return profileResult(op, nil, prof, total, scanned, returned), nil
+}
+
+// drainProfiled opens the instrumented operator tree, pulls every row to drive the
+// whole plan, and reports the wall-clock time the run took, the rows the scans and
+// expands touched, and the rows the query returned (doc 20 §9.1). It discards the
+// rows themselves: PROFILE reports the shape of the work, not the data, so there is
+// nothing to materialize. The timer spans Open through the last Close, the executor
+// span the footer reports as total time.
+func drainProfiled(op plan.Op, ctx *exec.Ctx) (total time.Duration, scanned, returned int64, err error) {
+	start := time.Now()
+	cur, err := exec.Open(op, ctx)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	for {
+		_, ok, nerr := cur.Next()
+		if nerr != nil {
+			_ = cur.Close()
+			return 0, 0, 0, nerr
+		}
+		if !ok {
+			break
+		}
+		returned++
+	}
+	if cerr := cur.Close(); cerr != nil {
+		return 0, 0, 0, cerr
+	}
+	total = time.Since(start)
+	if sc := cur.ScanCount(); sc != nil {
+		scanned = sc.Load()
+	}
+	return total, scanned, returned, nil
+}
+
+// profileResult renders the instrumented plan into a streaming result: the annotated
+// tree one operator per row, a blank line, then the footer (doc 20 §9.1). Each
+// operator line carries its estimate (when statistics are available) and its actuals,
+// the measured rows and the inclusive and self time the shim recorded. The footer
+// reports the run's total time, the rows scanned, the rows returned, and the
+// amplification ratio between them, the headline efficiency number.
+//
+// The memory and spill columns doc 20 §9 names are omitted: the executor tracks no
+// per-operator memory and has no spill path yet, so there is no honest number to
+// print, and PROFILE reports what it measured rather than a fabricated zero.
+func profileResult(op plan.Op, st plan.Statistics, prof *exec.Profile, total time.Duration, scanned, returned int64) *Result {
+	annot := func(o plan.Op) string {
+		s := prof.Get(o)
+		if s == nil {
+			return "  (actual rows 0)"
+		}
+		self := s.Inclusive
+		for _, c := range plan.Children(o) {
+			if cs := prof.Get(c); cs != nil {
+				self -= cs.Inclusive
+			}
+		}
+		if self < 0 {
+			self = 0
+		}
+		return fmt.Sprintf("  (actual rows %d, time %s, self %s)",
+			s.Rows, roundDur(s.Inclusive), roundDur(self))
+	}
+	text := strings.TrimRight(plan.StringProfiled(op, st, annot), "\n")
+	lines := strings.Split(text, "\n")
+	lines = append(lines, "")
+	lines = append(lines, "total time "+roundDur(total).String())
+	lines = append(lines, fmt.Sprintf("rows scanned %d", scanned))
+	lines = append(lines, fmt.Sprintf("rows returned %d", returned))
+	lines = append(lines, "amplification "+amplification(scanned, returned))
+	buf := make([]eval.Row, len(lines))
+	for i, ln := range lines {
+		buf[i] = eval.Row{"plan": value.String(ln)}
+	}
+	return &Result{cols: []string{"plan"}, buf: buf}
+}
+
+// roundDur rounds a duration to the microsecond, so the listing reads in steady units
+// rather than nanosecond noise that changes run to run.
+func roundDur(d time.Duration) time.Duration { return d.Round(time.Microsecond) }
+
+// amplification renders the rows-scanned-over-rows-returned ratio, the work the query
+// did per row it produced (doc 20 §9.1). It reads as "Nx" so a high number reads as
+// the read amplification it is; with no rows returned the ratio is undefined, so it
+// reports the scanned count as the work that found nothing.
+func amplification(scanned, returned int64) string {
+	if returned <= 0 {
+		return fmt.Sprintf("%d scanned, 0 returned", scanned)
+	}
+	return fmt.Sprintf("%.1fx", float64(scanned)/float64(returned))
 }
 
 // indexLookup adapts the engine to the planner's IndexLookup seam, mapping the

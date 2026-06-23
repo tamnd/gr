@@ -149,12 +149,21 @@ func pos(t lex.Token) ast.Pos { return ast.Pos{Line: t.Line, Col: t.Col} }
 // --- query and clauses ---
 
 func (p *parser) query() (*ast.Query, error) {
-	// EXPLAIN is a soft keyword that prefixes a whole statement (doc 25 §7.2): it
-	// is recognized only here, at the very start, so it stays usable as an ordinary
-	// identifier everywhere else. It attaches to whatever statement follows, a read,
-	// a write, or a schema command, and the body is parsed unchanged.
+	// EXPLAIN and PROFILE are soft keywords that prefix a whole statement (doc 25
+	// §7.2, doc 20 §9): they are recognized only here, at the very start, so they
+	// stay usable as ordinary identifiers everywhere else. Either attaches to
+	// whatever statement follows, a read, a write, or a schema command, and the body
+	// is parsed unchanged. A statement carries at most one prefix; the two together
+	// are a parse error, since PROFILE already does everything EXPLAIN does and more.
 	explain := p.atWord("EXPLAIN")
 	if explain {
+		p.advance()
+	}
+	profile := p.atWord("PROFILE")
+	if profile {
+		if explain {
+			return nil, p.errAt(p.cur(), "PROFILE and EXPLAIN cannot both prefix a statement")
+		}
 		p.advance()
 	}
 	q, err := p.queryBody()
@@ -162,6 +171,7 @@ func (p *parser) query() (*ast.Query, error) {
 		return nil, err
 	}
 	q.Explain = explain
+	q.Profile = profile
 	return q, nil
 }
 

@@ -192,11 +192,23 @@ func TestDBRecoveryEvent(t *testing.T) {
 	}
 	defer func() { _ = db2.Close() }()
 
-	var rec map[string]any
+	var start, rec map[string]any
 	for _, e := range read() {
-		if e["event"] == EventRecoveryComplete {
+		switch e["event"] {
+		case EventRecoveryStart:
+			start = e
+		case EventRecoveryComplete:
 			rec = e
 		}
+	}
+	if start == nil {
+		t.Fatalf("no recovery_start event after a torn-commit reopen; entries = %v", read())
+	}
+	if sz, ok := start["wal_size"].(float64); !ok || sz <= 0 {
+		t.Errorf("recovery_start wal_size = %v, want the WAL backlog found at open", start["wal_size"])
+	}
+	if _, ok := start["last_checkpoint_lsn"]; !ok {
+		t.Errorf("recovery_start has no last_checkpoint_lsn: %v", start)
 	}
 	if rec == nil {
 		t.Fatalf("no recovery_complete event after a torn-commit reopen; entries = %v", read())
@@ -359,7 +371,7 @@ func TestDBNoConstraintEventOnCleanWrite(t *testing.T) {
 }
 
 // TestDBNoRecoveryEventOnCleanOpen confirms a fresh open that recovered nothing emits
-// no recovery_complete event, only the open event.
+// neither a recovery_start nor a recovery_complete event, only the open event.
 func TestDBNoRecoveryEventOnCleanOpen(t *testing.T) {
 	el, read := captureDBEvents()
 	fsys := vfs.NewMem()
@@ -369,7 +381,7 @@ func TestDBNoRecoveryEventOnCleanOpen(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 	for _, e := range read() {
-		if e["event"] == EventRecoveryComplete {
+		if e["event"] == EventRecoveryStart || e["event"] == EventRecoveryComplete {
 			t.Errorf("a clean open emitted a recovery event: %v", e)
 		}
 	}

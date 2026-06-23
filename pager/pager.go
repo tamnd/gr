@@ -191,6 +191,8 @@ type Pager struct {
 	recovered   bool          // true if open redid committed WAL frames after a crash
 	recoveredTx int           // committed transactions the recovery redid (doc 20 §11.3)
 	recoverDur  time.Duration // wall-clock the recovery took, for the recovery_complete event
+	recoverWAL  int64         // WAL byte size found at open, the backlog the recovery_start event reports
+	recoverFrom uint64        // durable change counter before replay, the recovery_start event's last_checkpoint_lsn
 }
 
 func (o Options) withDefaults() Options {
@@ -322,6 +324,14 @@ func (p *Pager) recover(saltSeed uint64) error {
 		if len(res.Frames) > 0 {
 			p.recovered = true
 			p.recoveredTx = res.Commits
+			// Capture what the recovery_start event reports before the replay changes anything:
+			// the WAL backlog found on disk and the durable change counter the replay starts from,
+			// the last checkpoint point (doc 20 §11.3). The header still holds the pre-replay
+			// durable value here, since loadHeader reloads it only after the frames are applied.
+			if sz, serr := wf.Size(); serr == nil {
+				p.recoverWAL = sz
+			}
+			p.recoverFrom = p.header.ChangeCounter
 		}
 		// Redo committed frames into the database file (idempotent: full images).
 		for _, fr := range res.Frames {
@@ -398,6 +408,13 @@ func (p *Pager) Recovered() bool { return p.recovered }
 // how long the recovery took (doc 20 §11.3). They are zero when the open did not recover.
 func (p *Pager) RecoveryStats() (txReplayed int, lastSeq uint64, dur time.Duration) {
 	return p.recoveredTx, p.header.ChangeCounter, p.recoverDur
+}
+
+// RecoveryStartStats returns what the recovery_start event reports before the replay runs (doc 20
+// §11.3): the WAL byte size found at open, the backlog to redo, and the durable change counter the
+// replay starts from, the last checkpoint point. They are zero when the open did not recover.
+func (p *Pager) RecoveryStartStats() (walSizeBytes int64, lastCheckpointLSN uint64) {
+	return p.recoverWAL, p.recoverFrom
 }
 
 // PagesWritten returns the cumulative count of page images Commit has copied into the database file

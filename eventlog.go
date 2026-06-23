@@ -115,6 +115,16 @@ func (l *EventLog) Close(path string, clean bool) {
 	)
 }
 
+// RecoveryStart records that crash recovery began on open (doc 20 §11.3): the WAL backlog found
+// on disk and the last checkpoint point the replay starts from, the work-to-do figures paired with
+// the transactions-and-duration figures the completion event carries.
+func (l *EventLog) RecoveryStart(walSizeBytes int64, lastCheckpointLSN uint64) {
+	l.Event(slog.LevelInfo, EventRecoveryStart, "recovery started",
+		slog.Int64("wal_size", walSizeBytes),
+		slog.Uint64("last_checkpoint_lsn", lastCheckpointLSN),
+	)
+}
+
 // RecoveryComplete records that crash recovery finished (doc 20 §11.3): how many transactions
 // were replayed, the last applied LSN, and how long recovery took.
 func (l *EventLog) RecoveryComplete(transactionsReplayed int, lastLSN uint64, d time.Duration) {

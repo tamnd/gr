@@ -1,7 +1,6 @@
 # GoReleaser turns one tag push into everything a user might install from: raw
-# archives, Linux packages (deb, rpm, apk), a multi-arch container image, and
-# entries for the package managers (Homebrew, Scoop). `git tag vX.Y.Z && git
-# push --tags` fans out to all of them through .github/workflows/release.yml.
+# archives, Linux packages (deb, rpm, apk), checksums, and SBOM+signing.
+# `git tag vX.Y.Z && git push --tags` runs through .github/workflows/release.yml.
 #
 # gr is pure Go (CGO_ENABLED=0), so every target cross-compiles from the
 # Linux amd64 CI runner without a native toolchain (ADR-18, doc 21 §1).
@@ -84,50 +83,6 @@ nfpms:
       - src: ./CONFORMANCE.md
         dst: /usr/share/doc/gr/CONFORMANCE.md
 
-dockers:
-  - id: gr-amd64
-    ids:
-      - gr
-    image_templates:
-      - "ghcr.io/tamnd/gr:{{ .Version }}-amd64"
-      - "ghcr.io/tamnd/gr:latest-amd64"
-    goarch: amd64
-    use: buildx
-    build_flag_templates:
-      - "--platform=linux/amd64"
-      - "--label=org.opencontainers.image.title=gr"
-      - "--label=org.opencontainers.image.version={{ .Version }}"
-      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
-      - "--label=org.opencontainers.image.source=https://github.com/tamnd/gr"
-      - "--label=org.opencontainers.image.licenses=Apache-2.0"
-
-  - id: gr-arm64
-    ids:
-      - gr
-    image_templates:
-      - "ghcr.io/tamnd/gr:{{ .Version }}-arm64"
-      - "ghcr.io/tamnd/gr:latest-arm64"
-    goarch: arm64
-    use: buildx
-    build_flag_templates:
-      - "--platform=linux/arm64"
-      - "--label=org.opencontainers.image.title=gr"
-      - "--label=org.opencontainers.image.version={{ .Version }}"
-      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
-      - "--label=org.opencontainers.image.source=https://github.com/tamnd/gr"
-      - "--label=org.opencontainers.image.licenses=Apache-2.0"
-
-docker_manifests:
-  - name_template: "ghcr.io/tamnd/gr:{{ .Version }}"
-    image_templates:
-      - "ghcr.io/tamnd/gr:{{ .Version }}-amd64"
-      - "ghcr.io/tamnd/gr:{{ .Version }}-arm64"
-
-  - name_template: "ghcr.io/tamnd/gr:latest"
-    image_templates:
-      - "ghcr.io/tamnd/gr:latest-amd64"
-      - "ghcr.io/tamnd/gr:latest-arm64"
-
 signs:
   - cmd: cosign
     certificate: "${artifact}.pem"
@@ -148,32 +103,6 @@ sboms:
       - "$sbom"
       - "--output"
       - "cyclonedx-json"
-
-brews:
-  - name: gr
-    ids:
-      - default
-    repository:
-      owner: tamnd
-      name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    homepage: https://github.com/tamnd/gr
-    description: An embedded, single-file, labeled-property-graph database for Go that speaks Cypher.
-    license: Apache-2.0
-    skip_upload: "{{ if .Env.HOMEBREW_TAP_GITHUB_TOKEN }}false{{ else }}true{{ end }}"
-
-scoops:
-  - name: gr
-    ids:
-      - default
-    repository:
-      owner: tamnd
-      name: scoop-bucket
-      token: "{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}"
-    homepage: https://github.com/tamnd/gr
-    description: An embedded, single-file, labeled-property-graph database for Go that speaks Cypher.
-    license: Apache-2.0
-    skip_upload: "{{ if .Env.SCOOP_BUCKET_GITHUB_TOKEN }}false{{ else }}true{{ end }}"
 
 release:
   github:

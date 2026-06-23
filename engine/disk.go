@@ -577,6 +577,14 @@ func (e *DiskEngine) StorageInfo() (StorageInfo, error) {
 // after a crash, feeding the open event's recovered flag (doc 20 §11.3).
 func (e *DiskEngine) Recovered() bool { return e.p.Recovered() }
 
+// RecoveryStats returns what the crash recovery on open redid (doc 20 §11.3): the committed
+// transactions replayed, the durable commit sequence the header records, and how long recovery
+// took. It feeds the recovery_complete event and is zero when the open did not recover. It reads
+// values the pager set during Open before any concurrent access, so it needs no engine lock.
+func (e *DiskEngine) RecoveryStats() (txReplayed int, lastSeq uint64, dur time.Duration) {
+	return e.p.RecoveryStats()
+}
+
 // CatalogVersion returns a monotonic version of the catalog: the total number of
 // interned names across the label, type, and property-key dictionaries. The
 // catalog is append-only (names are interned, never removed), so any schema

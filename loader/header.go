@@ -59,9 +59,9 @@ type ColDesc struct {
 // NodeHeader is the parsed header for a node file. It owns a ColDesc per
 // input column and tracks which column carries :ID and :LABEL.
 type NodeHeader struct {
-	Cols    []ColDesc
-	IDCol   int // index of the :ID column; -1 if absent
-	LblCol  int // index of the :LABEL column; -1 if absent
+	Cols        []ColDesc
+	IDCol       int    // index of the :ID column; -1 if absent
+	LblCol      int    // index of the :LABEL column; -1 if absent
 	PrefixLabel string // from --nodes=Label=... (set by the caller)
 }
 
@@ -183,6 +183,18 @@ func parseColDesc(f string) (ColDesc, error) {
 	// Special columns start with ':'.
 	if strings.HasPrefix(f, ":") {
 		return parseSpecialCol(f)
+	}
+	// A structural column may carry an optional leading name, the way
+	// neo4j-admin import writes `id:ID` or `start:START_ID`. When the token
+	// after the first colon is a structural marker, the part before it is the
+	// column's name (kept for readability; the loader stores the input id as a
+	// property only when IDProperty is set, never from this name). When it is a
+	// property type instead, the whole token is a property column.
+	if i := strings.IndexByte(f, ':'); i > 0 {
+		if cd, err := parseSpecialCol(f[i:]); err == nil {
+			cd.Name = f[:i]
+			return cd, nil
+		}
 	}
 	// Property column: name[:type]['[]'?]
 	return parsePropCol(f)

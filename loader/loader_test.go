@@ -117,6 +117,53 @@ func TestParseNodeHeaderBasic(t *testing.T) {
 	}
 }
 
+func TestParseNodeHeaderNamedID(t *testing.T) {
+	// neo4j-admin import writes the id column with a leading name (`id:ID`); the
+	// loader accepts it and treats the column as the id, not a property. A named
+	// id with an id space and a type suffix parses too.
+	fields := []string{"id:ID", "name:string", ":LABEL"}
+	hdr, err := parseNodeHeader(fields, "")
+	if err != nil {
+		t.Fatalf("parseNodeHeader: %v", err)
+	}
+	if hdr.IDCol != 0 {
+		t.Errorf("IDCol: got %d, want 0", hdr.IDCol)
+	}
+	if hdr.Cols[0].Role != RoleID {
+		t.Errorf("id col role: got %v, want RoleID", hdr.Cols[0].Role)
+	}
+	if hdr.Cols[0].Name != "id" {
+		t.Errorf("id col name: got %q, want %q", hdr.Cols[0].Name, "id")
+	}
+
+	fields = []string{"key:ID(person):long", ":LABEL"}
+	hdr, err = parseNodeHeader(fields, "")
+	if err != nil {
+		t.Fatalf("parseNodeHeader named id with space and type: %v", err)
+	}
+	if hdr.Cols[0].Role != RoleID || hdr.Cols[0].Name != "key" {
+		t.Errorf("named id: role=%v name=%q", hdr.Cols[0].Role, hdr.Cols[0].Name)
+	}
+	if hdr.Cols[0].IDSpace != "person" {
+		t.Errorf("named id space: got %q, want %q", hdr.Cols[0].IDSpace, "person")
+	}
+}
+
+func TestParseRelHeaderNamedEndpoints(t *testing.T) {
+	// A relationship header may name its endpoint columns the same way.
+	fields := []string{"src:START_ID", "dst:END_ID", ":TYPE"}
+	hdr, err := parseRelHeader(fields, "")
+	if err != nil {
+		t.Fatalf("parseRelHeader: %v", err)
+	}
+	if hdr.StartCol != 0 || hdr.EndCol != 1 {
+		t.Errorf("cols: start=%d end=%d", hdr.StartCol, hdr.EndCol)
+	}
+	if hdr.Cols[0].Role != RoleStartID || hdr.Cols[1].Role != RoleEndID {
+		t.Errorf("roles: start=%v end=%v", hdr.Cols[0].Role, hdr.Cols[1].Role)
+	}
+}
+
 func TestParseNodeHeaderMissingID(t *testing.T) {
 	_, err := parseNodeHeader([]string{"name:string", ":LABEL"}, "")
 	if err == nil {

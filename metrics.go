@@ -1514,7 +1514,7 @@ func (db *DB) measureQuery(kind, cypher string, params map[string]value.Value, s
 		db.metrics.recordError(err)
 		db.metrics.finish(kind, metricStatusOf(err), time.Since(start))
 		// A failure has no plan to capture, so the query-log entry carries none (doc 20 §10.6).
-		db.logQuery(id, kind, cypher, params, start, queryStatus(err), err, 0, 0, nil)
+		db.logQuery(id, kind, cypher, params, start, queryStatus(err), err, 0, 0, 0, nil)
 		// A rejected write also raises the structured constraint event when the failure is one
 		// (doc 20 §11.3); a non-constraint error emits nothing here.
 		db.emitConstraintEvent(err)
@@ -1552,10 +1552,12 @@ func (db *DB) measureQuery(kind, cypher string, params map[string]value.Value, s
 	// ran for the slow-query log's captured plan (doc 20 §10.6). A nil result (an effect-only
 	// path) has no plan to render.
 	var planText func() string
+	var planDur time.Duration
 	if res != nil {
 		planText = res.PlanText
+		planDur = res.planDur
 	}
-	db.logQuery(id, kind, cypher, params, start, "ok", nil, int(returned), int(scanned), planText)
+	db.logQuery(id, kind, cypher, params, start, "ok", nil, int(returned), int(scanned), planDur, planText)
 	endQuerySpan(span, "ok", int(returned))
 	return res, nil
 }

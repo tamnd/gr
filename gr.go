@@ -619,7 +619,7 @@ func (db *DB) query(ctx context.Context, cypher string, params map[string]value.
 	if db.eng == nil {
 		return nil, ErrClosed
 	}
-	entry, err := db.compile(ctx, cypher)
+	entry, compileDur, err := db.compile(ctx, cypher)
 	if err != nil {
 		return nil, err
 	}
@@ -642,7 +642,7 @@ func (db *DB) query(ctx context.Context, cypher string, params map[string]value.
 		_ = tx.Abort()
 		return nil, err
 	}
-	return &Result{cols: cur.Cols(), cursor: cur, tx: tx, ownTx: true, mat: db.materializer(tx, lazy), mscan: cur.ScanCount(), mexec: execStart, planOp: entry.Op, planStats: engineStats{db.eng}, execSpan: espan}, nil
+	return &Result{cols: cur.Cols(), cursor: cur, tx: tx, ownTx: true, mat: db.materializer(tx, lazy), mscan: cur.ScanCount(), mexec: execStart, planOp: entry.Op, planStats: engineStats{db.eng}, execSpan: espan, planDur: compileDur}, nil
 }
 
 // execCtx builds the execution context shared by every run of a statement: the
@@ -684,7 +684,7 @@ func (db *DB) execCtx(etx engine.Tx, b *bind.Bound, params map[string]value.Valu
 // lands before the caller sees a row, so a half-consumed result cannot leave the
 // statement partly applied at commit. It does not begin, commit, or abort the
 // transaction; the caller owns that.
-func (db *DB) execWriteBuffered(ctx context.Context, etx engine.Tx, q *ast.Query, params map[string]value.Value) ([]string, []eval.Row, Summary, *atomic.Int64, plan.Op, error) {
+func (db *DB) execWriteBuffered(ctx context.Context, etx engine.Tx, q *ast.Query, params map[string]value.Value) ([]string, []eval.Row, Summary, *atomic.Int64, plan.Op, time.Duration, error) {
 	// A write is never served from the plan cache, so the bind and plan below are a full
 	// compile: time them as a plan-cache miss for gr_query_plan_duration_seconds (doc 20 §3.1).
 	// The gr.plan span wraps the same work as a child of the root, always a miss for a write
@@ -693,15 +693,16 @@ func (db *DB) execWriteBuffered(ctx context.Context, etx engine.Tx, q *ast.Query
 	pstart := time.Now()
 	if err := internWriteNames(etx, q); err != nil {
 		endPhaseSpan(pspan, err)
-		return nil, nil, Summary{}, nil, nil, err
+		return nil, nil, Summary{}, nil, nil, 0, err
 	}
 	b, err := bind.Bind(q, bind.NewEngineCatalog(etx), false)
 	if err != nil {
 		endPhaseSpan(pspan, err)
-		return nil, nil, Summary{}, nil, nil, err
+		return nil, nil, Summary{}, nil, nil, 0, err
 	}
 	op := plan.Plan(b)
-	db.metrics.recordPlan("miss", time.Since(pstart))
+	planDur := time.Since(pstart)
+	db.metrics.recordPlan("miss", planDur)
 	if pspan != nil {
 		pspan.SetString("gr.plan.cache", "miss")
 	}
@@ -719,7 +720,7 @@ func (db *DB) execWriteBuffered(ctx context.Context, etx engine.Tx, q *ast.Query
 	if err != nil {
 		db.metrics.recordExecute("write", time.Since(estart))
 		endExecuteSpan(espan, 0, 0, err)
-		return nil, nil, Summary{}, nil, nil, err
+		return nil, nil, Summary{}, nil, nil, planDur, err
 	}
 	cols := cur.Cols()
 	var buf []eval.Row
@@ -729,7 +730,7 @@ func (db *DB) execWriteBuffered(ctx context.Context, etx engine.Tx, q *ast.Query
 			_ = cur.Close()
 			db.metrics.recordExecute("write", time.Since(estart))
 			endExecuteSpan(espan, int(scanLoad(ec.Scanned)), len(buf), err)
-			return nil, nil, Summary{}, nil, nil, err
+			return nil, nil, Summary{}, nil, nil, planDur, err
 		}
 		if !ok {
 			break
@@ -739,7 +740,7 @@ func (db *DB) execWriteBuffered(ctx context.Context, etx engine.Tx, q *ast.Query
 	if err := cur.Close(); err != nil {
 		db.metrics.recordExecute("write", time.Since(estart))
 		endExecuteSpan(espan, int(scanLoad(ec.Scanned)), len(buf), err)
-		return nil, nil, Summary{}, nil, nil, err
+		return nil, nil, Summary{}, nil, nil, planDur, err
 	}
 	db.metrics.recordExecute("write", time.Since(estart))
 	endExecuteSpan(espan, int(scanLoad(ec.Scanned)), len(buf), nil)
@@ -747,8 +748,9 @@ func (db *DB) execWriteBuffered(ctx context.Context, etx engine.Tx, q *ast.Query
 	// on the eager result and measureQuery reads it for gr_query_rows_scanned (doc 20 §3.1).
 	// The plan op rides back too, so the caller can render it for the slow-query log's captured
 	// plan (doc 20 §10.6); the write plan carries no cost estimates, so PlanText shows the bare
-	// tree.
-	return cols, buf, summaryOf(eff), ec.Scanned, op, nil
+	// tree. planDur is the time the bind+plan block took, so the query-log entry can report it
+	// as plan_ms (doc 20 §10.2).
+	return cols, buf, summaryOf(eff), ec.Scanned, op, planDur, nil
 }
 
 // cloneRow copies a row map so a buffered write result does not alias a row the
@@ -805,7 +807,7 @@ func (db *DB) Run(ctx context.Context, cypher string, params Params, opts ...Run
 		// a failed query, so the query log records it too, with an empty kind the way the server
 		// surface does (doc 20 §10.2): the failure is carried by the status and error.
 		db.metrics.recordError(err)
-		db.logQuery(id, "", cypher, vals, start, queryStatus(err), err, 0, 0, nil)
+		db.logQuery(id, "", cypher, vals, start, queryStatus(err), err, 0, 0, 0, nil)
 		endQuerySpan(span, queryStatus(err), 0)
 		return nil, err
 	}
@@ -862,7 +864,7 @@ func (db *DB) runAutoWrite(ctx context.Context, q *ast.Query, params map[string]
 	if err != nil {
 		return nil, err
 	}
-	cols, buf, summary, scanned, op, err := db.execWriteBuffered(ctx, tx, q, params)
+	cols, buf, summary, scanned, op, planDur, err := db.execWriteBuffered(ctx, tx, q, params)
 	if err != nil {
 		_ = tx.Abort()
 		return nil, err
@@ -870,7 +872,7 @@ func (db *DB) runAutoWrite(ctx context.Context, q *ast.Query, params map[string]
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	res := &Result{cols: cols, buf: buf, summary: summary, mscan: scanned, planOp: op}
+	res := &Result{cols: cols, buf: buf, summary: summary, mscan: scanned, planOp: op, planDur: planDur}
 	// A write commits before returning, so its buffered rows have no live snapshot to
 	// materialize their graph objects against. When the result carries rows, open a
 	// fresh read transaction over the just-committed state and let the result own it,
@@ -1334,7 +1336,7 @@ func summaryOf(e *exec.SideEffects) Summary {
 // replaced, which resets the basis so the check does not re-fire until the data
 // drifts again. Drift is a relative-fraction test, so uniform growth does not trigger
 // it, and a re-plan on a false positive only costs a compile, never correctness.
-func (db *DB) compile(ctx context.Context, cypher string) (entry *plan.Entry, err error) {
+func (db *DB) compile(ctx context.Context, cypher string) (entry *plan.Entry, planDur time.Duration, err error) {
 	// The gr.plan phase span wraps the whole compile, so a plan-cache miss shows as a slow
 	// gr.plan span and a hit as a fast one (doc 20 §12.2). The cache outcome is the span's one
 	// attribute (doc 20 §12.3); the defer ends the span marked failed on a bind or parse error.
@@ -1346,11 +1348,12 @@ func (db *DB) compile(ctx context.Context, cypher string) (entry *plan.Entry, er
 	cached, ok := db.cache.Get(key)
 	if ok && !plan.Drifted(cached.Stats, st, db.drift()) {
 		db.metrics.recordCacheLookup("hit")
-		db.metrics.recordPlan("hit", time.Since(start))
+		planDur = time.Since(start)
+		db.metrics.recordPlan("hit", planDur)
 		if span != nil {
 			span.SetString("gr.plan.cache", "hit")
 		}
-		return cached, nil
+		return cached, planDur, nil
 	}
 	// Either the cache had no plan for this text or the plan it had has drifted off its
 	// cardinality basis: both recompile, so both count as a lookup miss, and a present-but-drifted
@@ -1361,39 +1364,40 @@ func (db *DB) compile(ctx context.Context, cypher string) (entry *plan.Entry, er
 	}
 	q, err := parse.Parse(cypher)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if q.Explain {
 		// EXPLAIN returns a plan listing, which the cache-backed read path is not
 		// shaped to carry; it runs through Run (doc 25 §7.2).
-		return nil, ErrExplain
+		return nil, 0, ErrExplain
 	}
 	if q.Profile {
 		// PROFILE executes against a freshly compiled, instrumented operator tree, not
 		// a cached plan, so it runs through Run (doc 20 §9).
-		return nil, ErrProfile
+		return nil, 0, ErrProfile
 	}
 	if q.Schema != nil {
-		return nil, ErrSchemaCommand
+		return nil, 0, ErrSchemaCommand
 	}
 	if q.Admin != nil {
-		return nil, ErrAdminCommand
+		return nil, 0, ErrAdminCommand
 	}
 	if q.Pragma != nil {
-		return nil, ErrPragmaCommand
+		return nil, 0, ErrPragmaCommand
 	}
 	b, err := bind.Bind(q, bind.NewEngineCatalog(db.eng), false)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	op := plan.SeekRewrite(plan.PlanWithStats(b, st), b, indexLookup{db.eng}, st)
 	entry = &plan.Entry{Bound: b, Op: op, Stats: plan.Snapshot(op, st)}
 	db.cache.Put(key, entry)
-	db.metrics.recordPlan("miss", time.Since(start))
+	planDur = time.Since(start)
+	db.metrics.recordPlan("miss", planDur)
 	if span != nil {
 		span.SetString("gr.plan.cache", "miss")
 	}
-	return entry, nil
+	return entry, planDur, nil
 }
 
 // explain binds and plans a statement without interning, executing, or otherwise
@@ -1777,6 +1781,10 @@ type Result struct {
 	// returns the empty string.
 	planOp    plan.Op
 	planStats plan.Statistics
+	// planDur is the time the plan phase took, recorded on the result so the query-log
+	// entry can report it as plan_ms (doc 20 §10.2). It is zero for a parse failure and
+	// for a schema or EXPLAIN result that does not reach the planner.
+	planDur time.Duration
 }
 
 // PlanText renders the EXPLAIN-grade plan tree this result ran (doc 20 §10.6). It is the
@@ -1923,7 +1931,7 @@ func (r *Result) Close() error {
 		// parse-through-last-row latency ends (doc 20 §10): the status follows whether the
 		// stream errored, the row count is what it yielded, and the plan is the one it ran for
 		// the slow-query log's captured plan (doc 20 §10.6). A clean stream logs no error.
-		r.mdb.logQuery(r.qlid, r.mkind, r.qlcypher, r.qlparams, r.mstart, queryStatus(r.err), r.err, int(r.rowsReturned), int(scanned), r.PlanText)
+		r.mdb.logQuery(r.qlid, r.mkind, r.qlcypher, r.qlparams, r.mstart, queryStatus(r.err), r.err, int(r.rowsReturned), int(scanned), r.planDur, r.PlanText)
 		// A streaming write that errored on a constraint at commit raises the structured
 		// constraint event here too (doc 20 §11.3), the same as the eager error path.
 		r.mdb.emitConstraintEvent(r.err)

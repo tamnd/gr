@@ -585,6 +585,14 @@ func (e *DiskEngine) RecoveryStats() (txReplayed int, lastSeq uint64, dur time.D
 	return e.p.RecoveryStats()
 }
 
+// RecoveryStartStats returns what the recovery_start event reports before the replay runs (doc 20
+// §11.3): the WAL byte size found at open and the durable change counter the replay starts from. It
+// feeds the recovery_start event and is zero when the open did not recover. It reads values the
+// pager set during Open before any concurrent access, so it needs no engine lock.
+func (e *DiskEngine) RecoveryStartStats() (walSizeBytes int64, lastCheckpointLSN uint64) {
+	return e.p.RecoveryStartStats()
+}
+
 // CatalogVersion returns a monotonic version of the catalog: the total number of
 // interned names across the label, type, and property-key dictionaries. The
 // catalog is append-only (names are interned, never removed), so any schema

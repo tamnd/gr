@@ -337,12 +337,15 @@ func Open(path string, opt Options) (*DB, error) {
 	} else {
 		db.events.Open(path, 0, eng.PageSize(), eng.Recovered())
 	}
-	// When the open redid a committed WAL prefix after a crash, record the recovery_complete
-	// event with what it redid (doc 20 §11.3): the transactions replayed, the durable commit
-	// sequence the header now records as the last_lsn, and how long it took. The recovery_start
-	// event waits on the wal_size-at-open figure its field needs, so only the completion event
-	// fires today.
+	// When the open redid a committed WAL prefix after a crash, record the recovery pair (doc 20
+	// §11.3): recovery_start with the work it found (the WAL backlog on disk and the last
+	// checkpoint point the replay starts from), then recovery_complete with what it redid (the
+	// transactions replayed, the durable commit sequence the header now records as the last_lsn,
+	// and how long it took). Both fire from here at open, the begin-then-end pair an operator
+	// filters the log by to bracket a crash recovery.
 	if eng.Recovered() {
+		walSize, lastCheckpoint := eng.RecoveryStartStats()
+		db.events.RecoveryStart(walSize, lastCheckpoint)
 		txReplayed, lastSeq, dur := eng.RecoveryStats()
 		db.events.RecoveryComplete(txReplayed, lastSeq, dur)
 	}

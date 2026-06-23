@@ -28,6 +28,22 @@ type Loader struct {
 	idmap   *IDMapBuilder
 	bad     *BadLineSink
 	stats   LoadStats
+	// rowBuf holds the raw CSV rows buffered during pass 1 for streaming API
+	// sources (src.readers set). For file-path sources (src.Files set) it is nil
+	// and pass 2 re-opens the file. rowBuf[srcIdx] is the per-source row slice;
+	// each element is one data row's fields (already parsed by csvReader).
+	rowBuf [][]rowRecord
+	// hdrBuf holds the parsed NodeHeader for each source, cached from pass 1 so
+	// that streaming-API sources (whose readers are exhausted) don't need to
+	// re-parse the header in pass 2.
+	hdrBuf []*NodeHeader
+}
+
+// rowRecord is one buffered data row from the streaming API.
+type rowRecord struct {
+	fields []string
+	lineno int
+	name   string // source file/reader name for error messages
 }
 
 // New returns a Loader for a fresh .gr file, configured by opts. The actual
@@ -58,6 +74,8 @@ func New(opts Options) *Loader {
 		catalog: newCatalogBuilder(),
 		idmap:   newIDMapBuilder(),
 		bad:     newBadLineSink(badWriter),
+		rowBuf:  make([][]rowRecord, len(opts.Nodes)),
+		hdrBuf:  make([]*NodeHeader, len(opts.Nodes)),
 	}
 }
 
@@ -116,6 +134,8 @@ func (l *Loader) pass1Source(srcIdx int, src NodeSource) error {
 	if err != nil {
 		return err
 	}
+	// Cache the header so pass 2 can use it without re-reading the source.
+	l.hdrBuf[srcIdx] = hdr
 	defer func() {
 		for _, f := range files {
 			f.close()
@@ -133,8 +153,14 @@ func (l *Loader) pass1Source(srcIdx int, src NodeSource) error {
 	}
 
 	arrDelim := l.opts.arrayDelim()
+	var buf *[]rowRecord
+	if len(src.readers) > 0 {
+		// Streaming sources can't be re-read; buffer the rows for later passes.
+		l.rowBuf[srcIdx] = l.rowBuf[srcIdx][:0]
+		buf = &l.rowBuf[srcIdx]
+	}
 	for _, nf := range files {
-		if err := l.pass1File(nf.csv, nf.name, hdr, src, arrDelim); err != nil {
+		if err := l.pass1File(nf.csv, nf.name, hdr, src, arrDelim, buf); err != nil {
 			return err
 		}
 	}
@@ -142,10 +168,12 @@ func (l *Loader) pass1Source(srcIdx int, src NodeSource) error {
 }
 
 // pass1File processes one data file (already open as a csvReader) during pass 1.
+// When buf is non-nil each parsed row is appended to it (streaming API buffering).
 func (l *Loader) pass1File(
 	csv *csvReader, fileName string,
 	hdr *NodeHeader, src NodeSource,
 	arrDelim rune,
+	buf *[]rowRecord,
 ) error {
 	for {
 		ok, err := csv.Next()
@@ -200,6 +228,13 @@ func (l *Loader) pass1File(
 
 		l.idmap.Put(space, extID, IDMapEntry{Group: group, DenseID: dense})
 		l.stats.Nodes++
+
+		// Buffer the accepted row for streaming sources (can't be re-read in pass 2).
+		if buf != nil {
+			rec := rowRecord{fields: make([]string, len(fields)), lineno: csv.LineNo(), name: fileName}
+			copy(rec.fields, fields)
+			*buf = append(*buf, rec)
+		}
 	}
 	return nil
 }

@@ -19,6 +19,11 @@ type fileBuilder struct {
 	path          string
 	nstores       []*colsegstore.Store // nstores[g] = node column store for label group g
 	groupBuilders [][](*colBuilder)    // groupBuilders[g][i] = colBuilder for prop i of group g
+	// relCSR holds the in-memory CSR arrays built during pass 3.
+	// Keyed by csrKey{relType, dir}. Written to the pager in pass 4.
+	relCSR map[csrKey]*csrBuilder
+	// edgeCnt tracks the next dense edge id per relationship type (assigned in scatter order).
+	edgeCnt map[uint32]uint64
 }
 
 // openFileBuilder creates the output .gr file at path (or in fsys when non-nil)
@@ -32,7 +37,14 @@ func openFileBuilder(fsys vfs.VFS, path string, groupCount int) (*fileBuilder, e
 	if err != nil {
 		return nil, fmt.Errorf("loader: open %s: %w", path, err)
 	}
-	fb := &fileBuilder{p: p, fsys: fsys, path: path, nstores: make([]*colsegstore.Store, groupCount)}
+	fb := &fileBuilder{
+		p:       p,
+		fsys:    fsys,
+		path:    path,
+		nstores: make([]*colsegstore.Store, groupCount),
+		relCSR:  make(map[csrKey]*csrBuilder),
+		edgeCnt: make(map[uint32]uint64),
+	}
 	for g := range fb.nstores {
 		s, serr := colsegstore.CreateStore(p)
 		if serr != nil {
@@ -80,6 +92,27 @@ type propColDesc struct {
 	vtype    value.Type // storage value type
 	pt       PropType   // header declared type (for parsing)
 	isList   bool
+}
+
+// ensureCSR returns the CSRBuilder for (relType, dir), creating it (with the
+// given node count) on first call per (relType, dir) pair.
+func (fb *fileBuilder) ensureCSR(relType uint32, dir csrDir, nodeCount uint64) *csrBuilder {
+	k := csrKey{relType, dir}
+	if b, ok := fb.relCSR[k]; ok {
+		return b
+	}
+	b := newCSRBuilder(nodeCount)
+	fb.relCSR[k] = b
+	return b
+}
+
+// nextEdgeID returns the next dense edge id for the given relationship type and
+// increments the counter. Edge ids are assigned in scatter-scan order, which
+// equals input file order for serial loads.
+func (fb *fileBuilder) nextEdgeID(relType uint32) uint64 {
+	id := fb.edgeCnt[relType]
+	fb.edgeCnt[relType]++
+	return id
 }
 
 // Close commits any buffered pages and closes the pager.

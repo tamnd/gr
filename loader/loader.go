@@ -88,6 +88,12 @@ func New(opts Options) *Loader {
 	}
 }
 
+// Run executes all four passes and writes the output file.
+// It is the primary entry point for production use.
+func (l *Loader) Run(outputPath string) error {
+	return l.Pass4FinalizeAll(nil, outputPath)
+}
+
 // Pass1ScanNodes scans all node files and builds the id-map and label-group
 // assignment (doc 19 §4.1). After it returns, the Loader's IDMap and Catalog
 // are populated and the per-group node counts are final.

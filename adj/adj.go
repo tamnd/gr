@@ -739,6 +739,51 @@ func (a *Adj) writeSlotBlobs(offsets, nbrs, edges []uint64) (dirCell, error) {
 	}, nil
 }
 
+// BuildAdj creates an empty Adj for writing pre-built CSR arrays via WriteSlot.
+// It has no rel.Store and therefore must not call Checkpoint, Expand, or
+// rebuildDelta; it is used only by the bulk loader's pass 4 to write the initial
+// base CSR from the counting-sort arrays built in pass 3.
+func BuildAdj(p *pager.Pager, secs *store.Sections) (*Adj, error) {
+	dir, err := store.CreateVector(p, dirStride, format.PageTypeRelGroup)
+	if err != nil {
+		return nil, err
+	}
+	if err := secs.Set(store.SecAdjDir, dir.Head(), 0); err != nil {
+		return nil, err
+	}
+	if err := secs.Set(store.SecAdjMeta, 0, 0); err != nil {
+		return nil, err
+	}
+	return &Adj{
+		p: p, secs: secs, rels: nil, dir: dir,
+		delta:   map[uint32]map[uint64][]Neighbor{},
+		cache:   map[uint32]*base{},
+		degTail: map[uint32]map[uint64]int64{},
+		degStats: map[uint32]DegreeSummary{},
+	}, nil
+}
+
+// WriteSlot writes pre-built CSR arrays for (relType, direction) directly into
+// the adjacency directory. It grows the directory to reach the slot, encodes the
+// three arrays, and records the cell. It is called by the bulk loader's pass 4
+// to materialize the in-memory CSR from pass 3 without going through the normal
+// edge-insert → checkpoint path.
+func (a *Adj) WriteSlot(relType uint32, d Dir, offsets, nbrs, edges []uint64) error {
+	s := slot(relType, d)
+	// Grow the directory to include slot s.
+	empty := make([]byte, dirStride)
+	for a.dir.Count() <= int(s) {
+		if _, err := a.dir.Append(empty); err != nil {
+			return err
+		}
+	}
+	cell, err := a.writeSlotBlobs(offsets, nbrs, edges)
+	if err != nil {
+		return err
+	}
+	return a.writeDir(s, cell)
+}
+
 // encodeArray compresses a CSR array of unsigned positions with the colcodec
 // cascade. The uint64-to-int64 cast is bit-preserving and the matching cast in
 // decodeArray reverses it, so a dense id with its top bit set still round-trips.

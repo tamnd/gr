@@ -832,6 +832,25 @@ func (e *DiskEngine) SetSegmentDecodeObserver(o SegmentDecodeObserver) { e.decod
 // engine lock.
 func (e *DiskEngine) WALStats() wal.Stats { return e.p.WALStats() }
 
+// CheckPager returns the pager for the integrity checker. The checker holds the engine
+// read lock for its whole run, so it is safe to access the pager directly.
+func (e *DiskEngine) CheckPager() *pager.Pager { return e.p }
+
+// CheckAdj returns the adjacency index for the integrity checker.
+func (e *DiskEngine) CheckAdj() *adj.Adj { return e.adj }
+
+// CheckCatalog returns the catalog for the integrity checker.
+func (e *DiskEngine) CheckCatalog() *catalog.Catalog { return e.cat }
+
+// CheckNodeStore returns the node store for the integrity checker.
+func (e *DiskEngine) CheckNodeStore() *node.Store { return e.nodes }
+
+// CheckRelStore returns the relationship store for the integrity checker.
+func (e *DiskEngine) CheckRelStore() *rel.Store { return e.rels }
+
+// CheckConstraints returns the declared constraints for the integrity checker.
+func (e *DiskEngine) CheckConstraints() []ConstraintInfo { return e.ConstraintInfos() }
+
 // DrainWALFsyncDurations returns and clears the WAL's per-fsync durations in seconds buffered since the
 // last drain (doc 20 §5.2), the samples the metrics path observes into the fsync-latency histogram. It
 // forwards to the pager and on to the WAL, which takes only its own small buffer lock, never the engine

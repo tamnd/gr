@@ -520,6 +520,54 @@ func (db *DB) Backup(w io.Writer) (int64, error) {
 	return db.eng.Backup(w)
 }
 
+// CheckLevel controls the depth of the integrity check (doc 23 §8.2).
+type CheckLevel = engine.CheckLevel
+
+const (
+	// CheckQuick verifies page checksums only.
+	CheckQuick = engine.CheckQuick
+	// CheckDefault adds free-list, CSR structure, and catalog bijection checks.
+	CheckDefault = engine.CheckDefault
+	// CheckFull adds adjacency symmetry and constraint satisfaction checks.
+	CheckFull = engine.CheckFull
+	// CheckForensic is CheckFull with all findings always printed.
+	CheckForensic = engine.CheckForensic
+)
+
+// CheckSeverity classifies a finding by its severity (doc 23 §8.2).
+type CheckSeverity = engine.Severity
+
+const (
+	// CheckWarning is a non-critical anomaly.
+	CheckWarning = engine.Warning
+	// CheckInconsistency means a derived structure disagrees with the source data.
+	CheckInconsistency = engine.Inconsistency
+	// CheckCorruption means bytes are wrong or a structural invariant is broken.
+	CheckCorruption = engine.Corruption
+	// CheckFatal means the checker could not finish.
+	CheckFatal = engine.Fatal
+)
+
+// CheckFinding is one item in a CheckReport (doc 23 §8.2).
+type CheckFinding = engine.Finding
+
+// CheckStats counts what the checker examined (doc 23 §8.2).
+type CheckStats = engine.CheckStats
+
+// CheckReport is the result of db.Check (doc 23 §8.2). An empty Findings slice means
+// the file is clean at the requested level.
+type CheckReport = engine.CheckReport
+
+// Check runs the integrity checker on the open database at the given level (doc 23 §8).
+// It is safe to call on a live database; it takes the engine read lock for its whole
+// run so no concurrent write can change state under it.
+func (db *DB) Check(level CheckLevel) (CheckReport, error) {
+	if db.eng == nil {
+		return CheckReport{}, ErrClosed
+	}
+	return db.eng.Check(level), nil
+}
+
 // Info gathers the database's static and structural facts (doc 17 §6.15). The
 // geometry and free-page count come from the engine's storage info, the catalog
 // counts and index and constraint counts from the introspection surface, and the

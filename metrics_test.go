@@ -541,6 +541,57 @@ func TestMetricsExpand(t *testing.T) {
 	}
 }
 
+// TestMetricsVarLenExpand confirms the variable-length expand reports its recursive-traversal rate
+// and the depth distribution of the paths it reached, both labelled by relationship type (doc 20
+// §6.1).
+func TestMetricsVarLenExpand(t *testing.T) {
+	db, err := Open("mvarlen.gr", Options{VFS: vfs.NewMem()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	// A four-node chain a -> b -> c -> d over KNOWS, so a 1..3 variable-length expand from a reaches
+	// b, c, and d, three paths at depths one, two, and three.
+	if _, err := db.Run(ctx,
+		"CREATE (a:Person {n: 'a'})-[:KNOWS]->(b:Person {n: 'b'})-[:KNOWS]->(c:Person {n: 'c'})-[:KNOWS]->(:Person {n: 'd'})", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := db.Run(ctx, "MATCH (a:Person {n: 'a'})-[:KNOWS*1..3]->(x) RETURN x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := 0
+	for r.Next() {
+		rows++
+	}
+	if err := r.Err(); err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if rows != 3 {
+		t.Fatalf("variable-length matches = %d, want 3 (b, c, d)", rows)
+	}
+
+	// One source position, a, was expanded recursively, so the traversal counter is one.
+	if c := db.Metrics().Counter("gr_varlen_expand_total", Labels{"type": "KNOWS"}); c != 1 {
+		t.Errorf("variable-length expansions = %d, want 1", c)
+	}
+	// Three paths were reached, at depths one, two, and three, so the depth histogram holds three
+	// observations summing to six hops.
+	d := db.Metrics().Histogram("gr_varlen_depth", Labels{"type": "KNOWS"})
+	if d.Count != 3 {
+		t.Errorf("depth observations = %d, want 3", d.Count)
+	}
+	if d.Sum != 6 {
+		t.Errorf("depth sum = %v, want 6 (1 + 2 + 3)", d.Sum)
+	}
+}
+
 // TestMetricsExpandWildcard confirms an expand with no named type is attributed to the all-types
 // bucket: the type label is "*" rather than a relationship-type name (doc 20 §6.1).
 func TestMetricsExpandWildcard(t *testing.T) {

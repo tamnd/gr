@@ -76,6 +76,9 @@ func (o *varExpandOp) loadPaths(row eval.Row) error {
 	if !ok {
 		return nil
 	}
+	// One source position is being expanded recursively, the variable-length traversal rate (doc 20
+	// §6.1). Counted here, where a real source commits to a walk, the same point a fixed expand counts.
+	o.ctx.countVarLenExpand(o.relTok)
 	if o.noType && o.min > 0 {
 		// No type can match, so only the zero-hop path (if allowed) survives.
 		return o.emitZeroHopOnly(row, engine.NodeID(srcV))
@@ -144,6 +147,9 @@ func (o *varExpandOp) emit(row eval.Row, node engine.NodeID, rels []engine.RelID
 		out[o.spec.To] = value.Node(uint64(node))
 	}
 	o.out = append(o.out, out)
+	// One path of len(rels) hops reached, the depth distribution whose deep tail is an expensive
+	// traversal (doc 20 §6.1). Observed per emitted path, after the path passes its constraints.
+	o.ctx.countVarLenDepth(o.relTok, len(rels))
 	return nil
 }
 

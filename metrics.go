@@ -425,6 +425,15 @@ var expandFanoutBuckets = []float64{
 	1024, 4096, 16384, 65536, 262144, 1048576, 4194304,
 }
 
+// varlenDepthBuckets is the bucket layout for gr_varlen_depth (doc 20 §6.1), the hop count of a
+// variable-length path. The boundaries are tight at the low end, where most paths sit (a one- or
+// two-hop friend-of-friend), and reach into the dozens so a deep recursive traversal lands in a
+// distinct high bucket: the gap between a shallow p50 and a deep tail is the expensive-traversal
+// signal the histogram exists to show, the variable-length counterpart to the fan-out tail.
+var varlenDepthBuckets = []float64{
+	0, 1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 30, 50, 100,
+}
+
 // metricQueryKinds is the bounded domain of the kind label on the query metrics (doc 20 §3.1,
 // §7.2): the statement classes a query falls into. The handles for every kind are pre-resolved
 // at open so recording one is a map read and an atomic add, never a registry lock.
@@ -829,6 +838,12 @@ type queryMetrics struct {
 	// handles and every later one is a lock-free load. The key space is bounded by the schema's
 	// relationship types times three directions, so the cache stays small (§7.2).
 	expandHandles sync.Map // expandKey -> *expandHandles
+	// varlenHandles caches the per-type metric handles for the variable-length expand operator, keyed
+	// by relationship-type token. It works like expandHandles: the first variable-length expansion of
+	// a type resolves and stores the two handles and every later one is a lock-free load, so the
+	// per-source and per-path reports stay off the registry lock. The key space is the schema's
+	// relationship types plus the all-types token, so the cache stays small (§7.2).
+	varlenHandles sync.Map // engine.Token -> *varlenHandles
 }
 
 // constraintCheckKey identifies one gr_constraint_checks_total series: the constraint kind (unique,
@@ -864,6 +879,14 @@ type expandHandles struct {
 	neighbors *metric.Counter
 	fanout    *metric.Histogram
 	seconds   *metric.Histogram
+}
+
+// varlenHandles holds the two variable-length expand series for one relationship type: the expansion
+// counter and the reached-path-depth histogram, both labelled by type only. They are resolved
+// together on a type's first variable-length expansion since an expansion that runs also emits paths.
+type varlenHandles struct {
+	total *metric.Counter
+	depth *metric.Histogram
 }
 
 // sessionHandles holds the three session metric series for one protocol: the open-connection gauge,
@@ -1404,6 +1427,14 @@ func (g graphObserver) Expand(relType engine.Token, dir engine.Direction, fanout
 	g.m.recordExpand(relType, dir, fanout, dur)
 }
 
+func (g graphObserver) VarLenExpand(relType engine.Token) {
+	g.m.varlenHandlesFor(relType).total.Inc()
+}
+
+func (g graphObserver) VarLenDepth(relType engine.Token, depth int) {
+	g.m.varlenHandlesFor(relType).depth.Observe(float64(depth))
+}
+
 func (g graphObserver) WCOJIntersect(dur time.Duration) {
 	if g.m.wcojIntersect != nil {
 		g.m.wcojIntersect.Observe(dur.Seconds())
@@ -1511,6 +1542,32 @@ func (m *queryMetrics) expandHandlesFor(relType engine.Token, dir engine.Directi
 	}
 	actual, _ := m.expandHandles.LoadOrStore(key, h)
 	return actual.(*expandHandles)
+}
+
+// varlenHandlesFor returns the cached variable-length expand handles for a type, resolving and
+// registering them on the first call for that token. The type label is the relationship-type name,
+// or "*" when the operator expands every type or several, or the token does not resolve, the same
+// convention as the fixed expand metrics.
+func (m *queryMetrics) varlenHandlesFor(relType engine.Token) *varlenHandles {
+	if v, ok := m.varlenHandles.Load(relType); ok {
+		return v.(*varlenHandles)
+	}
+	typeLabel := "*"
+	if relType != 0 && m.relTypeName != nil {
+		if name, ok := m.relTypeName(relType); ok {
+			typeLabel = name
+		}
+	}
+	h := &varlenHandles{
+		total: m.reg.Counter("gr_varlen_expand_total",
+			"Variable-length path expansions, one per source position expanded, by type", "expands",
+			metric.Labels{"type": typeLabel}),
+		depth: m.reg.Histogram("gr_varlen_depth",
+			"Hop count of variable-length paths reached, by type; a deep tail is a deep traversal",
+			"hops", varlenDepthBuckets, metric.Labels{"type": typeLabel}),
+	}
+	actual, _ := m.varlenHandles.LoadOrStore(relType, h)
+	return actual.(*varlenHandles)
 }
 
 // metricExpandDir maps an engine direction to the dir label on the expand metrics (doc 20 §6.1).

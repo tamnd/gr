@@ -98,6 +98,14 @@ type GraphObserver interface {
 	// is the raw neighbor count the engine produced for this source, the per-source fan-out whose
 	// tail is the supernode signal.
 	Expand(relType engine.Token, dir engine.Direction, fanout int, dur time.Duration)
+	// VarLenExpand reports one variable-length path expansion from a source position along relType
+	// (doc 20 §6.1), the recursive-traversal rate. relType is the operator's single type token, or
+	// zero when it expands every type or several, the same convention as Expand.
+	VarLenExpand(relType engine.Token)
+	// VarLenDepth reports the hop count of one variable-length path the expansion produced (doc 20
+	// §6.1); the distribution's deep tail is a deep, expensive traversal. relType follows the same
+	// convention as VarLenExpand.
+	VarLenDepth(relType engine.Token, depth int)
 	// WCOJIntersect reports the time one worst-case-optimal multi-way intersection took, the cost
 	// of matching one input row's cyclic pattern (doc 20 §6.3).
 	WCOJIntersect(dur time.Duration)
@@ -156,6 +164,21 @@ func (c *Ctx) countBinaryJoin() {
 func (c *Ctx) countExpand(relType engine.Token, dir engine.Direction, fanout int, dur time.Duration) {
 	if c.Graph != nil {
 		c.Graph.Expand(relType, dir, fanout, dur)
+	}
+}
+
+// countVarLenExpand and countVarLenDepth report a variable-length expansion's work to the observer
+// when one is wired (doc 20 §6.1): the first once per source position the operator expands, the
+// second once per path it produces. With no observer set they are a nil check and nothing more.
+func (c *Ctx) countVarLenExpand(relType engine.Token) {
+	if c.Graph != nil {
+		c.Graph.VarLenExpand(relType)
+	}
+}
+
+func (c *Ctx) countVarLenDepth(relType engine.Token, depth int) {
+	if c.Graph != nil {
+		c.Graph.VarLenDepth(relType, depth)
 	}
 }
 

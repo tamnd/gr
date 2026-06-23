@@ -140,6 +140,10 @@ type DB struct {
 	// property read to first access from the transaction's snapshot. A per-run
 	// WithLazyProperties overrides it for one statement.
 	lazyProps bool
+	// tracingDetail is the tracing verbosity (doc 20 §12.2, tracing_detail pragma): "phase"
+	// (the default) emits only the four phase spans; "operator" also emits per-operator child
+	// spans under gr.execute. A nil tracer makes this a no-op regardless of the value.
+	tracingDetail string
 }
 
 // Options configure how a database is opened. The zero value is the default:
@@ -634,9 +638,11 @@ func (db *DB) query(ctx context.Context, cypher string, params map[string]value.
 	// snapshot is open; Close records the time since it (doc 20 §3.1). The gr.execute trace span
 	// covers the same boundary as a child of the root, ended at Close with the scanned and
 	// returned rows (doc 20 §12.2).
-	_, espan := db.startPhaseSpan(ctx, "gr.execute")
+	ectx, espan := db.startPhaseSpan(ctx, "gr.execute")
 	execStart := time.Now()
-	cur, err := exec.Open(entry.Op, db.execCtx(tx, entry.Bound, params))
+	ec := db.execCtx(tx, entry.Bound, params)
+	ec.Tracer = db.newOpTracer(ectx)
+	cur, err := exec.Open(entry.Op, ec)
 	if err != nil {
 		endExecuteSpan(espan, 0, 0, err)
 		_ = tx.Abort()
@@ -714,7 +720,8 @@ func (db *DB) execWriteBuffered(ctx context.Context, etx engine.Tx, q *ast.Query
 	// closes: it is gr_query_execute_duration_seconds for the write, the executor work alone with
 	// parse and plan excluded (doc 20 §3.1). The gr.execute span covers the same boundary as a
 	// child of the root, ended with the scanned and returned rows (doc 20 §12.2).
-	_, espan := db.startPhaseSpan(ctx, "gr.execute")
+	ectx, espan := db.startPhaseSpan(ctx, "gr.execute")
+	ec.Tracer = db.newOpTracer(ectx)
 	estart := time.Now()
 	cur, err := exec.Open(op, ec)
 	if err != nil {

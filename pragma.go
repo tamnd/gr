@@ -196,6 +196,23 @@ var pragmas = map[string]pragmaDesc{
 		tier: tierAction, typ: "action",
 		act: (*DB).walCheckpoint,
 	},
+	"tracing_detail": {
+		tier: tierSession, typ: "string",
+		get: func(db *DB) value.Value { return value.String(db.tracingDetailVal()) },
+		set: func(db *DB, v value.Value) error {
+			s, err := pragmaString("tracing_detail", v)
+			if err != nil {
+				return err
+			}
+			if s != "phase" && s != "operator" {
+				return fmt.Errorf("%w: tracing_detail must be 'phase' or 'operator', got %q", ErrConfigRange, s)
+			}
+			db.cfgMu.Lock()
+			db.tracingDetail = s
+			db.cfgMu.Unlock()
+			return nil
+		},
+	},
 }
 
 // walCheckpoint runs a WAL checkpoint now (doc 24 §3.7): it flushes every committed frame
@@ -362,6 +379,16 @@ func (db *DB) retries() int {
 	return db.maxRetries
 }
 
+// tracingDetailVal returns the tracing verbosity level under the config lock.
+func (db *DB) tracingDetailVal() string {
+	db.cfgMu.RLock()
+	defer db.cfgMu.RUnlock()
+	if db.tracingDetail == "" {
+		return "phase"
+	}
+	return db.tracingDetail
+}
+
 // drift returns the re-plan drift factor under the config lock.
 func (db *DB) drift() float64 {
 	db.cfgMu.RLock()
@@ -402,4 +429,11 @@ func pragmaFloat(name string, v value.Value) (float64, error) {
 		return f, nil
 	}
 	return 0, fmt.Errorf("%w: %s expects a number", ErrConfigType, name)
+}
+
+func pragmaString(name string, v value.Value) (string, error) {
+	if s, ok := v.AsString(); ok {
+		return s, nil
+	}
+	return "", fmt.Errorf("%w: %s expects a string", ErrConfigType, name)
 }

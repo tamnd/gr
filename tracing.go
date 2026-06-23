@@ -1,6 +1,10 @@
 package gr
 
-import "context"
+import (
+	"context"
+
+	"github.com/tamnd/gr/exec"
+)
 
 // Tracer is the seam gr emits spans through (doc 20 §12). It is deliberately a tiny subset of
 // the OpenTelemetry tracer shape, just enough to start a span under a parent carried in a
@@ -118,6 +122,49 @@ func endExecuteSpan(span Span, scanned, returned int, err error) {
 		span.SetStatus(true, "ok")
 	}
 	span.End()
+}
+
+// grOpTracer implements exec.OpTracer using gr's Tracer seam (doc 20 §12.2, the detailed
+// tracing level). It creates each operator span as a child of the gr.execute phase span by
+// using the execute context, so the span tree nests correctly under the root gr.query span.
+type grOpTracer struct {
+	ctx context.Context
+	db  *DB
+}
+
+// StartOp begins a span for the operator named kind (e.g. "NodeScan", "Expand") as a child
+// of the gr.execute phase span (doc 20 §12.2). It returns a grOpSpan whose End closes the
+// span with the actual row count, matching the gr.execute convention. A nil db.tracer returns
+// a nil span, so a database without a tracer never reaches this path.
+func (t *grOpTracer) StartOp(kind string) exec.OpSpan {
+	_, span := t.db.startPhaseSpan(t.ctx, "gr.operator."+kind)
+	return &grOpSpan{span: span}
+}
+
+// grOpSpan wraps gr.Span as exec.OpSpan, ending the span with the operator's row count as
+// the gr.operator.rows attribute (doc 20 §12.3).
+type grOpSpan struct {
+	span Span
+}
+
+func (s *grOpSpan) End(rows int) {
+	if s.span == nil {
+		return
+	}
+	s.span.SetInt("gr.operator.rows", int64(rows))
+	s.span.SetStatus(true, "ok")
+	s.span.End()
+}
+
+// newOpTracer returns a grOpTracer for the current tracing detail level (doc 20 §12.2): when
+// the detail is "operator" and a tracer is configured, operator spans are emitted as children
+// of the gr.execute span whose context ectx carries. When the detail is "phase" (the default),
+// or when no tracer is set, it returns nil and no shim is inserted.
+func (db *DB) newOpTracer(ectx context.Context) exec.OpTracer {
+	if db.tracer == nil || db.tracingDetailVal() != "operator" {
+		return nil
+	}
+	return &grOpTracer{ctx: ectx, db: db}
 }
 
 // endQuerySpan closes the root span at a query's completion boundary (doc 20 §12.2), recording

@@ -85,6 +85,11 @@ type Ctx struct {
 	// drains to render PROFILE's annotated tree. It is nil for an ordinary run, where no shim is
 	// inserted and the executor is exactly the uninstrumented one.
 	Profile *Profile
+	// Tracer, when set, emits per-operator trace spans as children of the gr.execute phase span
+	// (doc 20 §12.2, the detailed tracing level). Open wraps each operator in the tracing shim so
+	// the span covers open-through-close with the operator's row count. It is nil when
+	// tracing_detail is "phase" (the default) or when no tracer is configured.
+	Tracer OpTracer
 }
 
 // GraphObserver receives graph-operator execution events for the graph-specific metric catalogue
@@ -282,9 +287,12 @@ type Cursor struct {
 // When the context carries a Profile, every operator is wrapped in the profiling
 // shim as it compiles, so the instrumented run records each operator's actual rows
 // and time (doc 20 §9.2). With no Profile the shim is never inserted and the tree
-// is exactly the uninstrumented one.
+// is exactly the uninstrumented one. When the context carries a Tracer, every
+// operator is additionally wrapped in the tracing shim so its span covers its full
+// lifetime (doc 20 §12.2, the detailed level). Both shims are additive; having both
+// is valid, though unusual.
 func Open(root plan.Op, ctx *Ctx) (*Cursor, error) {
-	c := &compiler{prof: ctx.Profile}
+	c := &compiler{prof: ctx.Profile, tracer: ctx.Tracer}
 	op, err := c.compile(root)
 	if err != nil {
 		return nil, err
@@ -349,7 +357,8 @@ func (c *Cursor) ScanCount() *atomic.Int64 { return c.ctx.Scanned }
 // actual rows and time against the plan node it came from (doc 20 §9.2). A nil prof
 // is the uninstrumented path, where wrap returns the operator untouched.
 type compiler struct {
-	prof *Profile
+	prof   *Profile
+	tracer OpTracer
 }
 
 // compile lowers a plan with no profiling instrumentation, the plain compile the
@@ -383,7 +392,9 @@ func (c *compiler) compileRel(o plan.Op, peers []string) (operator, []string, er
 	if err != nil {
 		return nil, nil, err
 	}
-	return c.prof.wrap(o, op), sib, nil
+	op = c.prof.wrap(o, op)
+	op = wrapTrace(c.tracer, o, op)
+	return op, sib, nil
 }
 
 // compileRelInner is the operator-building body compileRel wraps. It holds the per

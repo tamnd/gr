@@ -1098,6 +1098,50 @@ func TestMetricsPageIO(t *testing.T) {
 	}
 }
 
+func TestMetricsPageStores(t *testing.T) {
+	fsys := vfs.NewMem()
+	db := openOn(t, fsys, "pagestores.gr")
+
+	// A run of node creates plus a few relationships writes the node store, the property columns, the
+	// catalog (token interning and the always-written header page), the index, and the relationship and
+	// relationship-group stores, so the per-store write breakdown attributes the commit's write-back to
+	// each subsystem rather than a single opaque total.
+	for i := 0; i < 50; i++ {
+		mustExec(t, db, "CREATE (:Person {note: 'value', n: 1})", nil)
+	}
+	mustExec(t, db, "MATCH (a:Person), (b:Person) WITH a, b LIMIT 30 CREATE (a)-[:KNOWS]->(b)", nil)
+
+	snap := db.Metrics()
+	for _, store := range []string{"node", "rel", "relgroup", "propcol", "index", "catalog"} {
+		if c := snap.Counter("gr_pages_written_total", Labels{"store": store}); c == 0 {
+			t.Fatalf("pages written to %q store = 0, want the write-back attributed to it", store)
+		}
+	}
+	// No blobs were stored and nothing was deleted, so the dynamic and free-list stores see no writes:
+	// the breakdown does not invent I/O for a store that did none.
+	if c := snap.Counter("gr_pages_written_total", Labels{"store": "freelist"}); c != 0 {
+		t.Fatalf("free-list pages written = %d, want 0 without any deletes", c)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen on the same media: the engine loads its stores into memory at open, faulting their pages in
+	// from the file, so the per-store read breakdown fills from the store load, the dominant read I/O.
+	db2 := openOn(t, fsys, "pagestores.gr")
+	defer func() { _ = db2.Close() }()
+	if n := nodeCount(t, db2); n != 50 {
+		t.Fatalf("reopened node count = %d, want 50", n)
+	}
+	snap2 := db2.Metrics()
+	for _, store := range []string{"node", "propcol", "catalog"} {
+		if c := snap2.Counter("gr_pages_read_total", Labels{"store": store}); c == 0 {
+			t.Fatalf("pages read from %q store after reopen = 0, want the store-load reads attributed to it", store)
+		}
+	}
+}
+
 func TestMetricsCommits(t *testing.T) {
 	db := openMem(t, "mxcommits.gr")
 	defer db.Close()

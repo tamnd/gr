@@ -1,0 +1,10 @@
+title       = "gr"
+baseURL     = "https://gr.tamnd.com/"
+description = "gr is an embedded, single-file, labeled-property-graph database for Go that speaks Cypher. Pure Go, zero cgo, one .gr file, SQLite feel for graphs."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/gr"

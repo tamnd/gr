@@ -1,84 +1,188 @@
 # gr
 
 `gr` is an embedded, single-file, labeled-property-graph database for Go that speaks Cypher.
-It is pure Go with no cgo, it stores a whole graph in one self-describing `.gr` file with optional `-wal` and `-shm` sidecars, and it gives the SQLite "open a file, get a database" feel for graph data.
-
-A query is a function call, not a network round trip.
-There is no server to run, no port to open, and no cluster to keep healthy until and unless you choose to add one with `gr serve`.
-
-## Status
-
-`gr` is under construction, built milestone by milestone against [spec 2060](../../../notes/Spec/2060).
-This is **M0**: the foundation pour.
-
-What works today:
-
-- Open and close a `.gr` file through `gr.Open` and `db.Close`, creating it with a fresh, validated header if it does not exist.
-- The on-disk file format: a checksummed file header, fixed-size pages with per-page headers and checksums, the section directory, and the primitive value codec.
-- A pager and buffer pool with pin and unpin, clock eviction that never evicts a pinned page, and per-page checksum validation.
-- A write-ahead log in the SQLite-WAL lineage: full-page-image frames with a chained checksum, atomic group commit, and crash recovery that honors the durable-prefix property.
-- A virtual filesystem seam with a real OS backend and an in-memory, fault-injecting backend that can crash the database at any write or fsync boundary and can tear writes.
-- Deterministic clock and PRNG hooks so crash tests replay identically.
-- The storage-engine SPI declared as a Go interface, backed by an in-memory stub, so the query stack can be built against it in later milestones.
-
-What does not work yet: any graph storage, any Cypher, any query.
-Those arrive in M1 and beyond.
-
-The headline M0 gate is the substrate crash campaign: the fault-injecting filesystem crashes the database at every write and fsync boundary of a transactional page workload, and after every injected crash the reopened file recovers to exactly one committed prefix, never a torn or partial state.
-See `gr_test.go`.
-
-## Usage
+Pure Go, no cgo, one `.gr` file.
+The SQLite feel, but for graphs.
 
 ```go
-package main
+db, err := gr.Open("friends.gr", gr.Options{})
+if err != nil {
+    log.Fatal(err)
+}
+defer db.Close()
 
-import (
-	"log"
+ctx := context.Background()
 
-	"github.com/tamnd/gr"
-)
+db.Exec(ctx, `
+    CREATE (:Person {name:"Alice", age:30})-[:KNOWS {since:2022}]->(:Person {name:"Bob", age:25})
+`, nil)
 
-func main() {
-	db, err := gr.Open("graph.gr", gr.Options{})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
-	// Queries arrive in M2.
+res, _ := db.Query(ctx, `
+    MATCH (a:Person)-[:KNOWS]->(b:Person)
+    RETURN a.name AS from, b.name AS to
+`, nil)
+defer res.Close()
+for res.Next() {
+    rec := res.Record()
+    fmt.Printf("%v -> %v\n", rec.Get("from"), rec.Get("to"))
 }
 ```
 
-The command-line tool can report its version and open or create a file:
+No daemon. No connection string. One file.
 
+## Features
+
+- **openCypher** — MATCH, CREATE, MERGE, SET, DELETE, REMOVE, variable-length paths, shortestPath, aggregation, indexes, constraints.
+- **Pure Go** — no cgo. Cross-compiles to every target Go supports. One static binary.
+- **Single file** — the graph lives in one `.gr` file. Back it up, move it, email it.
+- **WAL durability** — write-ahead journaling, per-page checksums, crash recovery. A file the process crashes into opens clean.
+- **CLI** — `gr shell`, `gr run`, `gr import`, `gr backup`, `gr info`, `gr check`. Everything you need from the terminal.
+- **Bolt server** — `gr serve` exposes the graph over Bolt v4.4/v5.0. Connect from Go, Python, JavaScript, Java, .NET, or Rust using any Neo4j driver.
+- **Stable** — 148 exported names, 51 configuration knobs, and the file format are all frozen at 1.0 and guarded by CI digest tests.
+
+## Installation
+
+**Go:**
+
+```bash
+go get github.com/tamnd/gr@latest          # library
+go install github.com/tamnd/gr/cmd/gr@latest  # CLI
 ```
-go run ./cmd/gr version
-go run ./cmd/gr open graph.gr
+
+**Homebrew (macOS/Linux):**
+
+```bash
+brew install tamnd/tap/gr
 ```
 
-## Layout
+**Scoop (Windows):**
 
-| Package | Role |
-|---------|------|
-| `gr` (root) | The library entry point: `Open`, `Close`, the database handle |
-| `value` | The labeled-property-graph value type system |
-| `format` | The on-disk file format: header, pages, section directory, codecs |
-| `vfs` | The virtual filesystem seam: OS backend and fault-injecting in-memory backend |
-| `wal` | The write-ahead log and crash recovery |
-| `pager` | The pager and buffer pool over the format and the WAL |
-| `engine` | The storage-engine SPI and its M0 in-memory stub |
-| `determ` | Deterministic clock and PRNG hooks for reproducible tests |
-| `cmd/gr` | The command-line entry point |
-
-## Building
-
+```powershell
+scoop bucket add tamnd https://github.com/tamnd/scoop-bucket
+scoop install gr
 ```
-go build ./...
+
+**Linux packages (apt/dnf):**
+
+```bash
+# Debian/Ubuntu
+curl -fsSL https://tamnd.github.io/linux-repo/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/tamnd.gpg
+echo "deb [signed-by=/usr/share/keyrings/tamnd.gpg] https://tamnd.github.io/linux-repo stable main" \
+  | sudo tee /etc/apt/sources.list.d/tamnd.list
+sudo apt update && sudo apt install gr
+
+# Fedora/RHEL
+sudo dnf config-manager --add-repo https://tamnd.github.io/linux-repo/tamnd.repo
+sudo dnf install gr
+```
+
+**Container:**
+
+```bash
+docker run --rm -v "$PWD:/data" ghcr.io/tamnd/gr shell /data/graph.gr
+```
+
+**Release archives:** download `.tar.gz`, `.zip`, `.deb`, `.rpm`, or `.apk` from the [releases page](https://github.com/tamnd/gr/releases).
+
+## Usage
+
+### Library
+
+```go
+import "github.com/tamnd/gr"
+
+db, err := gr.Open("social.gr", gr.Options{})
+if err != nil {
+    log.Fatal(err)
+}
+defer db.Close()
+
+ctx := context.Background()
+
+// Create an index.
+db.Exec(ctx, `CREATE INDEX FOR (p:Person) ON (p.name)`, nil)
+
+// Write.
+db.Exec(ctx, `
+    CREATE (:Person {name:$name, age:$age})
+`, map[string]any{"name": "Alice", "age": 30})
+
+// Read.
+res, _ := db.Query(ctx, `
+    MATCH (p:Person) WHERE p.age > $min RETURN p.name, p.age ORDER BY p.age
+`, map[string]any{"min": 20})
+defer res.Close()
+for res.Next() {
+    rec := res.Record()
+    fmt.Printf("%v (age %v)\n", rec.Get("p.name"), rec.Get("p.age"))
+}
+
+// Explicit transaction.
+tx, _ := db.BeginTx(ctx, gr.TxOptions{})
+tx.Exec(ctx, `MERGE (p:Person {name:"Bob"}) ON CREATE SET p.age = 25`, nil)
+tx.Commit()
+
+// Managed write with automatic conflict retry.
+db.ExecuteWrite(ctx, func(tx gr.ManagedTx) (any, error) {
+    return tx.Exec(ctx, `MATCH (p:Person {name:"Alice"}) SET p.loginCount = p.loginCount + 1`, nil)
+})
+```
+
+### CLI
+
+```bash
+# Interactive shell.
+gr shell social.gr
+
+# One-shot query.
+gr run social.gr "MATCH (n:Person) RETURN n.name, n.age ORDER BY n.name"
+
+# JSON output.
+gr run --format json social.gr "MATCH (n:Person) RETURN n.name"
+
+# Bulk load from CSV.
+gr import social.gr --nodes Person=people.csv --rels KNOWS=knows.csv
+
+# File stats.
+gr info social.gr
+
+# Hot backup.
+gr backup social.gr backup.gr
+```
+
+### Bolt server
+
+```bash
+gr serve social.gr
+```
+
+Connect with any Neo4j driver:
+
+```python
+from neo4j import GraphDatabase
+driver = GraphDatabase.driver("bolt://localhost:7687", auth=None)
+with driver.session() as s:
+    result = s.run("MATCH (p:Person) RETURN p.name")
+    for r in result:
+        print(r["p.name"])
+```
+
+## Building from source
+
+```bash
+git clone https://github.com/tamnd/gr
+cd gr
+go build -o gr ./cmd/gr
+
+# Full test suite including API stability, config-freeze, and conformance gates.
 go test ./...
-go test -race ./...
+CGO_ENABLED=1 go test -race ./...
 ```
 
-`gr` builds with `CGO_ENABLED=0` everywhere.
+## Documentation
+
+Full docs at **[gr.tamnd.com](https://gr.tamnd.com)**.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).

@@ -201,6 +201,8 @@ func (e *DiskEngine) HasNodeIndex(label, prop Token) bool {
 func (e *DiskEngine) CreateIndex(name, label, prop string, ifNotExists bool) (bool, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.p.BeginWrite()
+	defer e.p.EndWrite()
 	if name == "" {
 		name = autoIndexName(label, prop)
 	}
@@ -236,6 +238,8 @@ func (e *DiskEngine) CreateIndex(name, label, prop string, ifNotExists bool) (bo
 func (e *DiskEngine) DropIndex(name string, ifExists bool) (bool, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.p.BeginWrite()
+	defer e.p.EndWrite()
 	if _, ok := e.cat.IndexByName(name); !ok {
 		if ifExists {
 			return false, nil

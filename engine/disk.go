@@ -413,6 +413,8 @@ func (e *DiskEngine) commitPager() (mvcc.Seq, error) {
 func (e *DiskEngine) Intern(kind catalog.Kind, name string) (Token, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.p.BeginWrite()
+	defer e.p.EndWrite()
 	t, _, err := e.cat.Intern(kind, name)
 	if err != nil {
 		return 0, err
@@ -659,6 +661,10 @@ func (e *DiskEngine) RelCount() uint64 {
 func (e *DiskEngine) Begin(write bool) (Tx, error) {
 	if write {
 		e.mu.Lock()
+		// A write transaction holds the exclusive lock, so no reader runs beside it;
+		// tell the pager to pin the frames it reads so a mid-transaction AllocPage
+		// cannot evict a page this writer still means to mutate (doc 12 §10).
+		e.p.BeginWrite()
 	}
 	snap, read := e.oracle.Begin()
 	return &diskTx{e: e, write: write, snap: snap, readSeq: read}, nil
@@ -671,6 +677,8 @@ func (e *DiskEngine) Begin(write bool) (Tx, error) {
 func (e *DiskEngine) Checkpoint() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.p.BeginWrite()
+	defer e.p.EndWrite()
 	// Capture the pager's cumulative write-back count before the fold, so the difference after the
 	// checkpoint's commits is exactly the pages this checkpoint wrote back to the file (doc 20 §5.4).
 	pagesBefore := e.p.PagesWritten()
@@ -932,6 +940,17 @@ func (t *diskTx) relLive(pos uint64) bool {
 	return t.e.rels.Exists(pos)
 }
 
+// relLiveVia is relLive with a page-retaining cursor for the base-store flag read,
+// so a neighbor walk that checks liveness for a run of position-sorted edges reads
+// each rel page once instead of once per edge (doc 12 §10). The overlay check is
+// unchanged: a snapshot's recent delete or insert still wins over the base flag.
+func (t *diskTx) relLiveVia(pos uint64, c *store.Cursor) bool {
+	if pre, ok := t.e.ov.Resolve(mvcc.Key{Kind: mvcc.RelExist, Pos: pos}, t.readSeq); ok {
+		return pre.Present
+	}
+	return t.e.rels.ExistsVia(pos, c)
+}
+
 // snapLabels returns the node's label set as of the snapshot.
 func (t *diskTx) snapLabels(pos uint64) ([]uint32, error) {
 	if pre, ok := t.e.ov.Resolve(mvcc.Key{Kind: mvcc.NodeLabels, Pos: pos}, t.readSeq); ok {
@@ -1133,6 +1152,12 @@ func (t *diskTx) RelPropertyKeys(id RelID) ([]Token, error) {
 	return out, nil
 }
 
+// ScanCardinality returns an upper bound on how many nodes ScanLabel will yield,
+// so a caller that materializes the whole scan can size its slice in one allocation
+// instead of growing it by repeated doubling. It is the node record high-water mark:
+// exact for an all-nodes scan, an over-estimate when a label or deletions narrow it.
+func (t *diskTx) ScanCardinality() int { return int(t.e.nodes.Count()) }
+
 func (t *diskTx) ScanLabel(label Token, fn func(NodeID) error) error {
 	defer t.rguard()()
 	for pos := range uint64(t.e.nodes.Count()) {
@@ -1165,7 +1190,12 @@ func (t *diskTx) Expand(id NodeID, relType Token, dir Direction, fn func(Neighbo
 	if err != nil {
 		return err
 	}
-	visible := func(edge uint64) bool { return t.relLive(edge) }
+	// One cursor for the whole walk: each (type, direction) run is sorted by edge
+	// position, so the liveness checks read each rel-store page once and release it
+	// when the walk ends (doc 12 §10).
+	var rc store.Cursor
+	defer t.e.rels.ReleaseCursor(&rc)
+	visible := func(edge uint64) bool { return t.relLiveVia(edge, &rc) }
 	dirs := dirSlice(dir)
 	types := t.typeSlice(relType)
 	for _, ty := range types {
@@ -1206,7 +1236,12 @@ func (t *diskTx) NeighborsByPos(id NodeID, relType Token, dir Direction, buf []P
 	if err != nil {
 		return nil, err
 	}
-	visible := func(edge uint64) bool { return t.relLive(edge) }
+	// One cursor for the whole walk: each (type, direction) run is sorted by edge
+	// position, so the liveness checks read each rel-store page once and release it
+	// when the walk ends (doc 12 §10).
+	var rc store.Cursor
+	defer t.e.rels.ReleaseCursor(&rc)
+	visible := func(edge uint64) bool { return t.relLiveVia(edge, &rc) }
 	dirs := dirSlice(dir)
 	types := t.typeSlice(relType)
 	out := buf[:0]
@@ -1596,6 +1631,7 @@ func (t *diskTx) Commit() error {
 		return nil
 	}
 	defer t.e.mu.Unlock()
+	defer t.e.p.EndWrite()
 	seq, err := t.e.commitPager()
 	if err != nil {
 		return err
@@ -1637,6 +1673,7 @@ func (t *diskTx) Abort() error {
 		return nil
 	}
 	defer t.e.mu.Unlock()
+	defer t.e.p.EndWrite()
 	// Nothing was published to the overlay, so the abort only rewinds the pager
 	// and rebuilds the in-memory store state (id-map maps, record counts, the
 	// adjacency delta) from the rolled-back, last-committed prefix.

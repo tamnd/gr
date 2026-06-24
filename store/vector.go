@@ -62,6 +62,53 @@ func (v *Vector) locate(i int) (format.PageID, int) {
 	return v.pages[i/v.epp], (i % v.epp) * v.stride
 }
 
+// Cursor caches the frame from the last ElemVia so a sequential scan over a vector
+// reads consecutive elements on one page without faulting it through the pager on
+// every access. A node's adjacency run is sorted by edge position, so its liveness
+// checks land on a handful of rel-store pages in order; a cursor turns a run of
+// same-page reads into one pager lookup (doc 12 §10). It holds the frame and, on a
+// write path, its pin; on a read-only snapshot ReadPage pins nothing and the cached
+// bytes stay valid because eviction never recycles a buffer. Its zero value is a
+// fresh cursor; the owner calls Vector.Release when the scan ends.
+type Cursor struct {
+	page  format.PageID
+	f     *pager.Frame
+	valid bool
+}
+
+// ElemVia returns a slice aliasing element i's bytes inside the cursor's cached
+// page, faulting the page through the pager only when i crosses onto a different
+// page. The slice is valid until the next ElemVia on the same cursor or a Release;
+// a caller that needs to retain bytes must copy them out. It is the zero-copy read
+// for a scan that inspects only a few bytes of each element, like a liveness flag.
+func (v *Vector) ElemVia(i int, c *Cursor) ([]byte, error) {
+	if i < 0 || i >= v.count {
+		return nil, fmt.Errorf("gr/store: index %d out of range [0,%d)", i, v.count)
+	}
+	id, off := v.locate(i)
+	if !c.valid || c.page != id {
+		if c.valid {
+			v.p.Unpin(c.f) // no-op on a read snapshot, releases the write-path pin otherwise
+		}
+		f, err := v.p.ReadPage(id)
+		if err != nil {
+			return nil, err
+		}
+		c.page, c.f, c.valid = id, f, true
+	}
+	return dataRegion(c.f)[off : off+v.stride], nil
+}
+
+// Release drops the cursor's held page, unpinning it (a no-op on a read snapshot)
+// so the write path does not leak a pin. The cursor is reusable afterward.
+func (v *Vector) Release(c *Cursor) {
+	if c.valid {
+		v.p.Unpin(c.f)
+		c.valid = false
+		c.f = nil
+	}
+}
+
 // Get copies element i into dst (which must be at least stride bytes).
 func (v *Vector) Get(i int, dst []byte) error {
 	if i < 0 || i >= v.count {

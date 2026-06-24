@@ -296,13 +296,28 @@ func (a *Adj) ExpandWith(src uint64, relType uint32, d Dir, visible func(edge ui
 	// sorted, visibility-filtered runs yields the sorted result without an
 	// O(n log n) sort over the whole list (doc 04 §12, "no sort step").
 	if len(delta) == 0 {
-		out := make([]Neighbor, 0, len(run))
-		for _, nb := range run {
-			if visible(nb.Edge) {
-				out = append(out, nb)
+		// Common case: no delta. The base run is stored sorted and visibility only
+		// drops elements, so if every edge is visible the run is already the exact
+		// answer. Walk it once and, only if an edge is invisible, fall back to a
+		// filtered copy from that point. With no deletions (the steady state) this
+		// returns the shared CSR run with zero allocation, so a hot scan that expands
+		// millions of nodes makes no per-node garbage and does not feed the collector.
+		// The returned slice aliases CSR memory; callers read it and never append to
+		// it (a write transaction holds the engine's exclusive lock, so no reader runs
+		// beside a checkpoint that could repack the run).
+		for k, nb := range run {
+			if !visible(nb.Edge) {
+				out := make([]Neighbor, 0, len(run))
+				out = append(out, run[:k]...)
+				for _, nb := range run[k+1:] {
+					if visible(nb.Edge) {
+						out = append(out, nb)
+					}
+				}
+				return out, nil
 			}
 		}
-		return out, nil
+		return run, nil
 	}
 
 	out := make([]Neighbor, 0, len(run)+len(delta))
@@ -833,9 +848,9 @@ func BuildAdj(p *pager.Pager, secs *store.Sections) (*Adj, error) {
 	}
 	return &Adj{
 		p: p, secs: secs, rels: nil, dir: dir,
-		delta:   map[uint32]map[uint64][]Neighbor{},
-		cache:   map[uint32]*base{},
-		degTail: map[uint32]map[uint64]int64{},
+		delta:    map[uint32]map[uint64][]Neighbor{},
+		cache:    map[uint32]*base{},
+		degTail:  map[uint32]map[uint64]int64{},
 		degStats: map[uint32]DegreeSummary{},
 	}, nil
 }

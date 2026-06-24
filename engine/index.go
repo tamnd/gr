@@ -274,7 +274,8 @@ func (e *DiskEngine) DropIndex(name string, ifExists bool) (bool, error) {
 // snapshot state (live, carries the label, value equals v), so over-listed
 // candidates are dropped and the yielded set is exactly the snapshot-correct one.
 func (t *diskTx) IndexSeek(label, key Token, v value.Value, fn func(NodeID) error) (bool, error) {
-	defer t.rguard()()
+	t.rlock()
+	defer t.runlock()
 	catLabel, catProp := toCat(label), toCat(key)
 	bucket, ok := t.e.idx.defs[indexDefKey{label: catLabel, prop: catProp}]
 	if !ok {

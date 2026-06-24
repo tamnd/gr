@@ -72,6 +72,25 @@ type Adjacency interface {
 	NeighborsByPos(id NodeID, relType Token, dir Direction, buf []PosNeighbor) ([]PosNeighbor, error)
 }
 
+// AdjacencyReader is an optional Tx capability for callers that make many
+// NeighborsByPos calls in a tight loop (the triangle count's per-edge neighbor
+// fetch). NewNeighborReader returns a stateful reader that binds its liveness
+// cursor and visibility predicate once, so each call allocates neither, unlike the
+// per-call Adjacency path that rebuilds both. A reader is single-goroutine: a
+// parallel operator gives each worker its own and Closes it when the worker ends.
+type AdjacencyReader interface {
+	NewNeighborReader() NeighborReader
+}
+
+// NeighborReader is one worker's reusable neighbor reader (see AdjacencyReader).
+// NeighborsByPos has the same contract as Adjacency.NeighborsByPos; Close releases
+// any page the reader's cursor still holds and must be called when the worker is
+// done.
+type NeighborReader interface {
+	NeighborsByPos(id NodeID, relType Token, dir Direction, buf []PosNeighbor) ([]PosNeighbor, error)
+	Close()
+}
+
 // Predicate is a pushed-down property test for predicate scans (doc 04 §6.6).
 // A nil Predicate matches everything.
 type Predicate func(value.Value) bool

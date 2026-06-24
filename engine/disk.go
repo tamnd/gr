@@ -897,15 +897,26 @@ type pendingPre struct {
 	pre mvcc.Pre
 }
 
-// rguard takes the engine read lock for a read transaction's physical base
-// access and returns the matching unlock; under a write transaction the
-// exclusive lock is already held, so it is a no-op.
-func (t *diskTx) rguard() func() {
-	if t.write {
-		return func() {}
+// rlock takes the engine read lock for a read transaction's physical base
+// access; under a write transaction the exclusive lock is already held for the
+// transaction's life, so it is a no-op. Pair it with a deferred runlock.
+//
+// This is split into two methods rather than the old rguard that returned the
+// unlock as a closure, because returning t.e.mu.RUnlock as a method value heap
+// allocates that closure on every guarded call, and a neighbor walk makes one
+// guarded call per edge: ~100k allocations a query that fed the GC tail. A
+// deferred runlock is an open-coded method call with no allocation.
+func (t *diskTx) rlock() {
+	if !t.write {
+		t.e.mu.RLock()
 	}
-	t.e.mu.RLock()
-	return t.e.mu.RUnlock
+}
+
+// runlock releases what rlock took; a no-op under a write transaction.
+func (t *diskTx) runlock() {
+	if !t.write {
+		t.e.mu.RUnlock()
+	}
 }
 
 // --- token and id helpers ---
@@ -999,7 +1010,8 @@ func (t *diskTx) relPos(id RelID) (uint64, error) {
 // --- reads ---
 
 func (t *diskTx) NodeExists(id NodeID) (bool, error) {
-	defer t.rguard()()
+	t.rlock()
+	defer t.runlock()
 	pos, ok := t.e.ids.Pos(uint64(id))
 	if !ok {
 		return false, nil
@@ -1008,7 +1020,8 @@ func (t *diskTx) NodeExists(id NodeID) (bool, error) {
 }
 
 func (t *diskTx) RelExists(id RelID) (bool, error) {
-	defer t.rguard()()
+	t.rlock()
+	defer t.runlock()
 	pos, ok := t.e.ids.Pos(uint64(id))
 	if !ok {
 		return false, nil
@@ -1017,7 +1030,8 @@ func (t *diskTx) RelExists(id RelID) (bool, error) {
 }
 
 func (t *diskTx) NodeLabels(id NodeID) ([]Token, error) {
-	defer t.rguard()()
+	t.rlock()
+	defer t.runlock()
 	pos, err := t.nodePos(id)
 	if err != nil {
 		return nil, err
@@ -1034,7 +1048,8 @@ func (t *diskTx) NodeLabels(id NodeID) ([]Token, error) {
 }
 
 func (t *diskTx) HasLabel(id NodeID, label Token) (bool, error) {
-	defer t.rguard()()
+	t.rlock()
+	defer t.runlock()
 	pos, err := t.nodePos(id)
 	if err != nil {
 		return false, err
@@ -1047,7 +1062,8 @@ func (t *diskTx) HasLabel(id NodeID, label Token) (bool, error) {
 }
 
 func (t *diskTx) NodeProperty(id NodeID, key Token) (value.Value, error) {
-	defer t.rguard()()
+	t.rlock()
+	defer t.runlock()
 	pos, err := t.nodePos(id)
 	if err != nil {
 		return value.Null, err
@@ -1060,7 +1076,8 @@ func (t *diskTx) NodeProperty(id NodeID, key Token) (value.Value, error) {
 }
 
 func (t *diskTx) RelProperty(id RelID, key Token) (value.Value, error) {
-	defer t.rguard()()
+	t.rlock()
+	defer t.runlock()
 	pos, err := t.relPos(id)
 	if err != nil {
 		return value.Null, err
@@ -1073,7 +1090,8 @@ func (t *diskTx) RelProperty(id RelID, key Token) (value.Value, error) {
 }
 
 func (t *diskTx) RelType(id RelID) (Token, error) {
-	defer t.rguard()()
+	t.rlock()
+	defer t.runlock()
 	pos, err := t.relPos(id)
 	if err != nil {
 		return 0, err
@@ -1086,7 +1104,8 @@ func (t *diskTx) RelType(id RelID) (Token, error) {
 }
 
 func (t *diskTx) RelEndpoints(id RelID) (NodeID, NodeID, error) {
-	defer t.rguard()()
+	t.rlock()
+	defer t.runlock()
 	pos, err := t.relPos(id)
 	if err != nil {
 		return 0, 0, err
@@ -1115,7 +1134,8 @@ func (t *diskTx) RelEndpoints(id RelID) (NodeID, NodeID, error) {
 // so can be on no node), which keeps this proportional to the schema, not the
 // catalog.
 func (t *diskTx) NodePropertyKeys(id NodeID) ([]Token, error) {
-	defer t.rguard()()
+	t.rlock()
+	defer t.runlock()
 	pos, err := t.nodePos(id)
 	if err != nil {
 		return nil, err
@@ -1134,7 +1154,8 @@ func (t *diskTx) NodePropertyKeys(id NodeID) ([]Token, error) {
 }
 
 func (t *diskTx) RelPropertyKeys(id RelID) ([]Token, error) {
-	defer t.rguard()()
+	t.rlock()
+	defer t.runlock()
 	pos, err := t.relPos(id)
 	if err != nil {
 		return nil, err
@@ -1159,7 +1180,8 @@ func (t *diskTx) RelPropertyKeys(id RelID) ([]Token, error) {
 func (t *diskTx) ScanCardinality() int { return int(t.e.nodes.Count()) }
 
 func (t *diskTx) ScanLabel(label Token, fn func(NodeID) error) error {
-	defer t.rguard()()
+	t.rlock()
+	defer t.runlock()
 	for pos := range uint64(t.e.nodes.Count()) {
 		if !t.nodeLive(pos) {
 			continue
@@ -1185,7 +1207,8 @@ func (t *diskTx) ScanLabel(label Token, fn func(NodeID) error) error {
 }
 
 func (t *diskTx) Expand(id NodeID, relType Token, dir Direction, fn func(Neighbor) error) error {
-	defer t.rguard()()
+	t.rlock()
+	defer t.runlock()
 	pos, err := t.nodePos(id)
 	if err != nil {
 		return err
@@ -1196,8 +1219,10 @@ func (t *diskTx) Expand(id NodeID, relType Token, dir Direction, fn func(Neighbo
 	var rc store.Cursor
 	defer t.e.rels.ReleaseCursor(&rc)
 	visible := func(edge uint64) bool { return t.relLiveVia(edge, &rc) }
-	dirs := dirSlice(dir)
-	types := t.typeSlice(relType)
+	var dbuf [2]adj.Dir
+	dirs := appendDirs(dbuf[:0], dir)
+	var tbuf [1]uint32
+	types := t.appendTypes(tbuf[:0], relType)
 	for _, ty := range types {
 		for _, d := range dirs {
 			nbrs, err := t.e.adj.ExpandWith(pos, ty, d, visible)
@@ -1231,19 +1256,31 @@ func (t *diskTx) Expand(id NodeID, relType Token, dir Direction, fn func(Neighbo
 // dense position is the neighbor's adjacency node id before id translation, which
 // is the same key adjacency lists are packed on, so two lists are mergeable on it.
 func (t *diskTx) NeighborsByPos(id NodeID, relType Token, dir Direction, buf []PosNeighbor) ([]PosNeighbor, error) {
-	defer t.rguard()()
-	pos, err := t.nodePos(id)
-	if err != nil {
-		return nil, err
-	}
+	t.rlock()
+	defer t.runlock()
 	// One cursor for the whole walk: each (type, direction) run is sorted by edge
 	// position, so the liveness checks read each rel-store page once and release it
 	// when the walk ends (doc 12 §10).
 	var rc store.Cursor
 	defer t.e.rels.ReleaseCursor(&rc)
 	visible := func(edge uint64) bool { return t.relLiveVia(edge, &rc) }
-	dirs := dirSlice(dir)
-	types := t.typeSlice(relType)
+	return t.neighborsByPosVia(id, relType, dir, buf, visible)
+}
+
+// neighborsByPosVia is the shared body of NeighborsByPos: it walks the visible
+// neighbor runs of a node using a caller-supplied liveness predicate, so a hot
+// loop can bind the predicate (and its cursor) once across many nodes instead of
+// rebuilding a closure per call. The caller holds the read guard and owns the
+// cursor's lifetime.
+func (t *diskTx) neighborsByPosVia(id NodeID, relType Token, dir Direction, buf []PosNeighbor, visible func(edge uint64) bool) ([]PosNeighbor, error) {
+	pos, err := t.nodePos(id)
+	if err != nil {
+		return nil, err
+	}
+	var dbuf [2]adj.Dir
+	dirs := appendDirs(dbuf[:0], dir)
+	var tbuf [1]uint32
+	types := t.appendTypes(tbuf[:0], relType)
 	out := buf[:0]
 	multi := len(dirs) > 1 || len(types) > 1
 	for _, ty := range types {
@@ -1271,30 +1308,61 @@ func (t *diskTx) NeighborsByPos(id NodeID, relType Token, dir Direction, buf []P
 	return out, nil
 }
 
-// dirSlice maps an SPI direction to the adjacency directions to walk.
-func dirSlice(dir Direction) []adj.Dir {
+// posReader is a reusable, single-goroutine neighbor reader: it binds one liveness
+// cursor and one visibility predicate for its whole lifetime, so the triangle
+// count's hot per-edge NeighborsByPos calls allocate neither a closure nor a
+// cursor per call. Each morsel worker holds its own; it is not safe to share
+// across goroutines. Close releases the held rel-store page.
+type posReader struct {
+	t       *diskTx
+	rc      store.Cursor
+	visible func(edge uint64) bool
+}
+
+// NewNeighborReader implements engine.AdjacencyReader.
+func (t *diskTx) NewNeighborReader() NeighborReader {
+	r := &posReader{t: t}
+	r.visible = func(edge uint64) bool { return t.relLiveVia(edge, &r.rc) }
+	return r
+}
+
+func (r *posReader) NeighborsByPos(id NodeID, relType Token, dir Direction, buf []PosNeighbor) ([]PosNeighbor, error) {
+	r.t.rlock()
+	defer r.t.runlock()
+	return r.t.neighborsByPosVia(id, relType, dir, buf, r.visible)
+}
+
+func (r *posReader) Close() {
+	r.t.e.rels.ReleaseCursor(&r.rc)
+}
+
+// appendDirs appends the adjacency directions to walk for an SPI direction. The
+// caller passes a small stack-backed buffer so a per-edge walk allocates no
+// direction slice: a single-direction walk stays in the two-element array.
+func appendDirs(buf []adj.Dir, dir Direction) []adj.Dir {
 	switch dir {
 	case Outgoing:
-		return []adj.Dir{adj.Out}
+		return append(buf, adj.Out)
 	case Incoming:
-		return []adj.Dir{adj.In}
+		return append(buf, adj.In)
 	default:
-		return []adj.Dir{adj.Out, adj.In}
+		return append(buf, adj.Out, adj.In)
 	}
 }
 
-// typeSlice returns the catalog type tokens to expand: the one requested, or all
-// known types when relType is the zero wildcard.
-func (t *diskTx) typeSlice(relType Token) []uint32 {
+// appendTypes appends the catalog type tokens to expand: the one requested, or all
+// known types when relType is the zero wildcard. A concrete type appends one token
+// into the caller's stack buffer and allocates nothing; only the rare wildcard
+// (every type) grows past the buffer and heap-allocates.
+func (t *diskTx) appendTypes(buf []uint32, relType Token) []uint32 {
 	if relType != 0 {
-		return []uint32{toCat(relType)}
+		return append(buf, toCat(relType))
 	}
 	n := t.e.cat.Count(catalog.KindRelType)
-	out := make([]uint32, n)
-	for i := range out {
-		out[i] = uint32(i)
+	for i := range n {
+		buf = append(buf, uint32(i))
 	}
-	return out
+	return buf
 }
 
 // Degree returns a node's relationship count along a type and direction from the
@@ -1303,14 +1371,17 @@ func (t *diskTx) typeSlice(relType Token) []uint32 {
 // statistic: it reflects the latest committed state and the writer's own writes,
 // not a reader's snapshot. A zero relType sums all types; Both sums both directions.
 func (t *diskTx) Degree(id NodeID, relType Token, dir Direction) (int64, error) {
-	defer t.rguard()()
+	t.rlock()
+	defer t.runlock()
 	pos, err := t.nodePos(id)
 	if err != nil {
 		return 0, err
 	}
 	var c int64
-	for _, ty := range t.typeSlice(relType) {
-		for _, d := range dirSlice(dir) {
+	var dbuf [2]adj.Dir
+	var tbuf [1]uint32
+	for _, ty := range t.appendTypes(tbuf[:0], relType) {
+		for _, d := range appendDirs(dbuf[:0], dir) {
 			n, err := t.e.adj.Degree(pos, ty, d)
 			if err != nil {
 				return 0, err

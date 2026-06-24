@@ -316,6 +316,8 @@ func Columns(root plan.Op) []string {
 		return []string{x.Col}
 	case *plan.ProductCount:
 		return []string{x.Col}
+	case *plan.IntersectCount:
+		return []string{x.Col}
 	case *plan.Sort:
 		return Columns(x.Input)
 	case *plan.Skip:
@@ -526,6 +528,15 @@ func (c *compiler) compileRelInner(o plan.Op, peers []string) (operator, []strin
 			return nil, nil, err
 		}
 		return &productCountOp{spec: x, input: input}, nil, nil
+	case *plan.IntersectCount:
+		// The fused triangle count folds in only over an input that binds no
+		// relationship (the rewrite's guard), so there are no peers to thread and the
+		// input compiles in a fresh pattern scope.
+		input, err := c.compile(x.Input)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &intersectCountOp{spec: x, input: input}, nil, nil
 	case *plan.Unwind:
 		var input operator
 		if x.Input != nil {

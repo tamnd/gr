@@ -371,6 +371,37 @@ type ProductLeg struct {
 	Dir   ast.Direction
 }
 
+// IntersectCount is the factorized form of a grouping-free count(*) over a
+// triangle that the WCOJ rewrite closed with an Intersect (doc 11 §5, §7; doc 12
+// §5.2). The Intersect plan still materializes one row per mid edge to feed the
+// intersection and one row per apex it finds; over a dense graph that mid fan-out
+// is the dominant cost. IntersectCount fuses the mid expand, the intersection, and
+// the count into one operator: for each anchor it reads the hub's apex candidates
+// once, drives the mid expand itself to enumerate the middle node, and merge-counts
+// the per-middle apex matches without ever building a mid row or an apex row.
+//
+// Input is the anchor rows (binding Hub); Hub the anchor variable; Mid the middle
+// node the mid expand reaches; MidRel/MidTypes/MidDir the mid expand's relationship
+// variable, type set, and direction. HubLeg reaches the apex from the anchor and
+// MidLeg from the middle node, each carrying the relationship variable, type set,
+// and direction the Intersect leg held. Labels are the apex's required labels and
+// Col the output count column. It stands in only when the mid expand is plain (no
+// variable length, no expand-into, no target-label) and its input binds no
+// relationship, so the only edge-uniqueness to enforce is among the triangle's own
+// three edges, which the operator checks directly.
+type IntersectCount struct {
+	Input    Op
+	Hub      string
+	Mid      string
+	MidRel   string
+	MidTypes []bind.NameRef
+	MidDir   ast.Direction
+	HubLeg   IntersectLeg
+	MidLeg   IntersectLeg
+	Labels   []bind.NameRef
+	Col      string
+}
+
 // Join combines two row streams. On lists the shared variable names the rows
 // must agree on; an empty On is a cartesian product.
 type Join struct {
@@ -444,8 +475,9 @@ func (*BindPath) op()      {}
 func (*ShortestPath) op()  {}
 func (*Project) op()       {}
 func (*Aggregate) op()     {}
-func (*ExpandCount) op()   {}
-func (*ProductCount) op()  {}
+func (*ExpandCount) op()    {}
+func (*ProductCount) op()   {}
+func (*IntersectCount) op() {}
 func (*Join) op()          {}
 func (*Optional) op()      {}
 func (*Unwind) op()        {}
@@ -530,6 +562,8 @@ func outputVars(o Op) map[string]bool {
 	case *ExpandCount:
 		return map[string]bool{x.Col: true}
 	case *ProductCount:
+		return map[string]bool{x.Col: true}
+	case *IntersectCount:
 		return map[string]bool{x.Col: true}
 	case *Join:
 		s := outputVars(x.Left)
@@ -646,6 +680,8 @@ func nodeLabel(o Op) string {
 		return "ExpandCount " + x.Col + " = count " + expandCountLabel(x)
 	case *ProductCount:
 		return "ProductCount " + x.Col + " = count " + productCountLabel(x)
+	case *IntersectCount:
+		return "IntersectCount " + x.Col + " = count " + intersectCountLabel(x)
 	case *Join:
 		return "Join on[" + strings.Join(x.On, ",") + "]"
 	case *Optional:
@@ -707,6 +743,8 @@ func nodeChildren(o Op) []Op {
 	case *ExpandCount:
 		return []Op{x.Input}
 	case *ProductCount:
+		return []Op{x.Input}
+	case *IntersectCount:
 		return []Op{x.Input}
 	case *Join:
 		return []Op{x.Left, x.Right}
@@ -833,6 +871,23 @@ func legLabel(l IntersectLeg) string {
 		left = "<-"
 	}
 	return l.From + " " + left + "[" + l.Rel + typeSuffix(l.Types) + "]" + right
+}
+
+// intersectCountLabel renders an IntersectCount the way intersectLabel renders the
+// Intersect it fuses, with the mid expand it now drives shown ahead of the two apex
+// legs, "c:#label <= a -[rm:#t]-> b & (a -[r1:#t]-> & b -[r2:#t]->)", so a fused
+// triangle count reads as the pattern it counts without naming the rows it never
+// builds.
+func intersectCountLabel(x *IntersectCount) string {
+	left, right := "-", "-"
+	switch x.MidDir {
+	case ast.DirOut:
+		right = "->"
+	case ast.DirIn:
+		left = "<-"
+	}
+	mid := x.Hub + " " + left + "[" + x.MidRel + typeSuffix(x.MidTypes) + "]" + right + " " + x.Mid
+	return mid + " & (" + legLabel(x.HubLeg) + " & " + legLabel(x.MidLeg) + ")" + labelSuffix(x.Labels)
 }
 
 // shortestLabel renders a ShortestPath operator's pattern: the search kind, the

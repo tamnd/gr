@@ -27,14 +27,76 @@ func FactorizeCount(o Op) Op {
 	if !ok {
 		return o
 	}
-	ec := factorizeAgg(agg)
-	if ec == nil {
-		return o
+	if ec := factorizeAgg(agg); ec != nil {
+		if pc := factorizeProduct(ec); pc != nil {
+			return pc
+		}
+		return ec
 	}
-	if pc := factorizeProduct(ec); pc != nil {
-		return pc
+	if ic := factorizeIntersect(agg); ic != nil {
+		return ic
 	}
-	return ec
+	return o
+}
+
+// factorizeIntersect turns a grouping-free count(*) over a WCOJ Intersect into an
+// IntersectCount, the fused triangle count (doc 11 §5, §7). The Intersect plan feeds
+// the intersection from a materialized mid expand and emits one row per apex it
+// finds; the count then tallies those rows. The fused form drives the mid expand
+// itself and merge-counts the apex matches per middle node, so it builds neither the
+// mid rows nor the apex rows. It matches a single count(*) (no groups, not distinct)
+// directly over an Intersect whose own input is one plain mid expand, with the two
+// legs leaving the mid expand's two endpoints, and returns nil otherwise so the
+// Intersect plan stands.
+func factorizeIntersect(agg *Aggregate) *IntersectCount {
+	if len(agg.GroupKeys) != 0 || len(agg.Aggs) != 1 || agg.Distinct {
+		return nil
+	}
+	col := agg.Aggs[0]
+	if !isCountStar(col.Expr) {
+		return nil
+	}
+	in, ok := agg.Input.(*Intersect)
+	if !ok {
+		return nil
+	}
+	// The intersection must close over a single plain mid expand whose endpoints are
+	// exactly the two legs' bound nodes, so the fused count can drive that expand
+	// itself instead of consuming its materialized rows.
+	mid, ok := in.Input.(*Expand)
+	if !ok || mid.VarLen != nil || mid.ToBound || len(mid.ToLabels) != 0 {
+		return nil
+	}
+	// One leg leaves the mid expand's source (the anchor hub), the other its target
+	// (the freshly expanded middle node); any other pairing means the legs do not
+	// pair with the expand and the fusion does not apply.
+	var hub, midLeg IntersectLeg
+	switch {
+	case in.Legs[0].From == mid.From && in.Legs[1].From == mid.To:
+		hub, midLeg = in.Legs[0], in.Legs[1]
+	case in.Legs[1].From == mid.From && in.Legs[0].From == mid.To:
+		hub, midLeg = in.Legs[1], in.Legs[0]
+	default:
+		return nil
+	}
+	// The mid expand's input must bind no relationship: the fused count enforces
+	// uniqueness only among the triangle's own three edges, so an earlier-bound
+	// relationship it would also have to stay distinct from is out of scope.
+	if bindsRelVar(mid.Input) {
+		return nil
+	}
+	return &IntersectCount{
+		Input:    mid.Input,
+		Hub:      mid.From,
+		Mid:      mid.To,
+		MidRel:   mid.Rel,
+		MidTypes: mid.Types,
+		MidDir:   mid.Dir,
+		HubLeg:   hub,
+		MidLeg:   midLeg,
+		Labels:   in.Labels,
+		Col:      col.Name,
+	}
 }
 
 // factorizeProduct turns an ExpandCount whose input is one or more further plain
@@ -103,7 +165,7 @@ func disjointFromAll(types []bind.NameRef, seen [][]bind.NameRef) bool {
 // scan and its filters, the common shape).
 func bindsRelVar(o Op) bool {
 	switch o.(type) {
-	case *Expand, *Intersect, *ShortestPath, *ExpandCount, *ProductCount:
+	case *Expand, *Intersect, *ShortestPath, *ExpandCount, *ProductCount, *IntersectCount:
 		return true
 	}
 	for _, c := range nodeChildren(o) {

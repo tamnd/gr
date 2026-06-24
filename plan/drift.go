@@ -61,6 +61,11 @@ func collectStats(o Op, st Statistics, snap *StatsSnapshot) {
 		for _, l := range x.Legs {
 			recordTypes(l.Types, st, snap)
 		}
+	case *IntersectCount:
+		recordTypes(x.MidTypes, st, snap)
+		recordTypes(x.HubLeg.Types, st, snap)
+		recordTypes(x.MidLeg.Types, st, snap)
+		recordLabels(x.Labels, st, snap)
 	case *Intersect:
 		recordTypes(x.Legs[0].Types, st, snap)
 		recordTypes(x.Legs[1].Types, st, snap)

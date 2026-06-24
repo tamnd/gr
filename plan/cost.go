@@ -142,6 +142,9 @@ func EstimateRows(o Op, st Statistics) float64 {
 	case *ProductCount:
 		// Like any grouping-free count, the factorized product collapses to one row.
 		return 1
+	case *IntersectCount:
+		// The fused triangle count collapses its whole input to a single tally row.
+		return 1
 	case *Join:
 		return joinRows(x, st)
 	case *Optional:

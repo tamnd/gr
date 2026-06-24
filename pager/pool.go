@@ -28,15 +28,19 @@ func verifyPage(buf []byte) bool {
 // is special: it carries the file Header rather than the generic page header and
 // checksum, so it is not checksum-validated here.
 func (p *Pager) ReadPage(id format.PageID) (*Frame, error) {
-	p.mu.Lock()
-	if f, ok := p.pool[id]; ok {
-		f.pin++
-		f.ref = true
-		p.hits++
-		p.mu.Unlock()
+	pinning := p.writers.Load() > 0
+	// Lock-free hit: load the immutable page table and index it. No lock and no
+	// shared-line write, so concurrent readers scale (doc 12 §10). A pin is taken
+	// only while a writer is active, when ReadPage runs single-threaded under the
+	// engine's exclusive lock and the atomics are uncontended.
+	if f, ok := (*p.lookup.Load())[id]; ok {
+		if pinning {
+			f.pin.Add(1)
+			f.ref.Store(true)
+		}
+		p.hits.Add(uint64(id))
 		return f, nil
 	}
-	p.mu.Unlock()
 
 	// Fault the page in from disk without holding the lock, so a slow read does
 	// not serialize every other reader. ReadAt is safe for concurrent use (it is
@@ -69,15 +73,21 @@ func (p *Pager) ReadPage(id format.PageID) (*Frame, error) {
 	// Another reader may have faulted the same page in while this one read it from
 	// disk; if so, pin the resident frame and drop the duplicate buffer so the pool
 	// never holds two frames for one page.
-	if f, ok := p.pool[id]; ok {
-		f.pin++
-		f.ref = true
-		p.hits++
+	if f, ok := (*p.lookup.Load())[id]; ok {
+		if pinning {
+			f.pin.Add(1)
+			f.ref.Store(true)
+		}
+		p.hits.Add(uint64(id))
 		return f, nil
 	}
-	f := &Frame{id: id, Data: buf, pin: 1, ref: true}
+	f := &Frame{id: id, Data: buf}
+	if pinning {
+		f.pin.Store(1)
+		f.ref.Store(true)
+	}
 	p.admit(f)
-	p.misses++
+	p.misses.Add(1)
 	return f, nil
 }
 
@@ -100,7 +110,9 @@ func (p *Pager) AllocPage(t format.PageType) (*Frame, error) {
 	p.headerDirty = true
 	buf := make([]byte, p.pageSize)
 	format.WriteHeader(buf, format.PageHeader{Type: t})
-	f := &Frame{id: id, Data: buf, pin: 1, dirty: true, ref: true}
+	f := &Frame{id: id, Data: buf, dirty: true}
+	f.pin.Store(1)
+	f.ref.Store(true)
 	p.mu.Lock()
 	p.admit(f)
 	p.mu.Unlock()
@@ -111,47 +123,91 @@ func (p *Pager) AllocPage(t format.PageType) (*Frame, error) {
 // next Commit.
 func (p *Pager) MarkDirty(f *Frame) { f.dirty = true }
 
+// BeginWrite marks that a write transaction is starting, so ReadPage pins the
+// frames it hands out: a writer may read a clean page and mutate the cached frame
+// later, and a pin keeps a mid-transaction AllocPage from evicting it and losing
+// the write. The engine calls it under the exclusive lock, so it never races a
+// reader. EndWrite reverses it. They nest as a count so a checkpoint's inner
+// commit cannot clear the flag out from under an outer write section.
+func (p *Pager) BeginWrite() { p.writers.Add(1) }
+
+// EndWrite marks that a write transaction has finished. See BeginWrite.
+func (p *Pager) EndWrite() { p.writers.Add(-1) }
+
 // Unpin releases one pin on a frame, making it eligible for eviction once clean.
+// It touches no shared pool structure, only the frame's own atomic pin count, so
+// it takes no lock: a morsel reader releases its pin without contending with the
+// other readers. evict reads the same atomic under the exclusive lock, so it never
+// sees a frame as unpinned mid-decrement. The compare-and-swap floors the count at
+// zero so a stray double-unpin cannot drive it negative.
 func (p *Pager) Unpin(f *Frame) {
-	p.mu.Lock()
-	if f.pin > 0 {
-		f.pin--
+	for {
+		v := f.pin.Load()
+		if v <= 0 {
+			return
+		}
+		if f.pin.CompareAndSwap(v, v-1) {
+			return
+		}
 	}
-	p.mu.Unlock()
 }
 
-// admit inserts a frame into the pool and the clock ring, evicting first if the
-// pool is over capacity. The caller must hold p.mu.
+// admit inserts a frame into the page table and the clock ring, evicting first if
+// the table is at capacity. The caller must hold p.mu.
+//
+// A write transaction holds the engine's exclusive lock, so no reader is indexing
+// the table beside it; admit mutates the live map in place, which keeps a bulk load
+// O(1) per page. On a read miss, where concurrent readers may be indexing the
+// table, admit copies the map, mutates the copy, and atomically swaps the pointer
+// (copy-on-write), so a reader keeps reading its stable snapshot. The in-place
+// branch runs only while writers > 0, when the only other map reader is PoolStats,
+// which takes p.mu; so the lock-free read hit, which runs only while writers == 0,
+// never races an in-place mutation.
 func (p *Pager) admit(f *Frame) {
-	if len(p.pool) >= p.maxPool {
-		p.evict()
+	m := *p.lookup.Load()
+	if p.writers.Load() > 0 {
+		if len(m) >= p.maxPool {
+			p.evict(m)
+		}
+		m[f.id] = f
+		p.clock = append(p.clock, f)
+		return
 	}
-	p.pool[f.id] = f
+	nm := make(pageTable, len(m)+1)
+	for k, v := range m {
+		nm[k] = v
+	}
+	if len(nm) >= p.maxPool {
+		p.evict(nm)
+	}
+	nm[f.id] = f
 	p.clock = append(p.clock, f)
+	p.lookup.Store(&nm)
 }
 
-// evict runs the clock algorithm to drop one clean, unpinned frame. A pinned
-// frame is never evicted (the headline buffer-pool invariant, doc 05 §3); a
-// dirty frame is also skipped because it has uncommitted contents — at most one
-// transaction's worth of dirty pages can pile up, so the pool simply grows past
-// its soft cap rather than lose data. If nothing is evictable the pool grows.
-// The caller must hold p.mu.
-func (p *Pager) evict() {
+// evict runs the clock algorithm to drop one clean, unpinned frame from m (the
+// live table on the write path, the working copy on a read miss). A pinned frame is
+// never evicted (the headline buffer-pool invariant, doc 05 §3); a dirty frame is
+// also skipped because it has uncommitted contents — at most one transaction's
+// worth of dirty pages can pile up, so the pool simply grows past its soft cap
+// rather than lose data. If nothing is evictable the pool grows. The caller must
+// hold p.mu.
+func (p *Pager) evict(m pageTable) {
 	if len(p.clock) == 0 {
 		return
 	}
 	for scan := 0; scan < 2*len(p.clock); scan++ {
 		f := p.clock[p.hand]
 		p.hand = (p.hand + 1) % len(p.clock)
-		if f.pin > 0 || f.dirty {
+		if f.pin.Load() > 0 || f.dirty {
 			continue
 		}
-		if f.ref {
-			f.ref = false
+		if f.ref.Load() {
+			f.ref.Store(false)
 			continue
 		}
 		// Evict f.
-		delete(p.pool, f.id)
+		delete(m, f.id)
 		p.clock = removeFrame(p.clock, f)
 		if len(p.clock) > 0 {
 			p.hand %= len(p.clock)
@@ -180,13 +236,17 @@ type PoolStats struct {
 // engine lock, so the metrics snapshot path reads it without risk of the deadlock an engine-lock
 // read would invite behind a long-held write transaction.
 func (p *Pager) PoolStats() PoolStats {
+	// Take p.mu for the resident count: a write transaction mutates the live table in
+	// place under p.mu, and len on a map racing an in-place insert is undefined. The
+	// hit and miss counters are atomic and read without the lock.
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	resident := len(*p.lookup.Load())
+	p.mu.Unlock()
 	return PoolStats{
-		Hits:     p.hits,
-		Misses:   p.misses,
-		Resident: len(p.pool),
-		Bytes:    len(p.pool) * int(p.pageSize),
+		Hits:     p.hits.Sum(),
+		Misses:   p.misses.Load(),
+		Resident: resident,
+		Bytes:    resident * int(p.pageSize),
 		Budget:   p.maxPool * int(p.pageSize),
 	}
 }
@@ -210,9 +270,11 @@ func (p *Pager) Commit() error {
 	if p.readOnly {
 		return ErrReadOnly
 	}
-	// Gather dirty data pages in id order for deterministic WAL layout.
-	dirty := make([]*Frame, 0, len(p.pool))
-	for _, f := range p.pool {
+	// Gather dirty data pages in id order for deterministic WAL layout. Commit runs
+	// under the engine's exclusive lock, so the table is stable while it ranges.
+	m := *p.lookup.Load()
+	dirty := make([]*Frame, 0, len(m))
+	for _, f := range m {
 		if f.dirty {
 			dirty = append(dirty, f)
 		}
@@ -284,7 +346,7 @@ func (p *Pager) Commit() error {
 	}
 
 	// Refresh the cached page-0 frame, if resident, and clear dirty flags.
-	if f, ok := p.pool[0]; ok {
+	if f, ok := m[0]; ok {
 		copy(f.Data, page0)
 		f.dirty = false
 	}
@@ -306,12 +368,15 @@ func (p *Pager) Rollback() error {
 	if p.readOnly {
 		return nil
 	}
-	for id, f := range p.pool {
+	p.mu.Lock()
+	m := *p.lookup.Load()
+	for id, f := range m {
 		if f.dirty {
-			delete(p.pool, id)
+			delete(m, id)
 			p.clock = removeFrame(p.clock, f)
 		}
 	}
+	p.mu.Unlock()
 	p.hand = 0
 	p.headerDirty = false
 	return p.loadHeader()
@@ -334,8 +399,8 @@ func (p *Pager) Close() error {
 		return nil
 	}
 	p.closed = true
-	for _, f := range p.pool {
-		if f.pin > 0 {
+	for _, f := range *p.lookup.Load() {
+		if f.pin.Load() > 0 {
 			return ErrPinned
 		}
 	}

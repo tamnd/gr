@@ -1264,7 +1264,7 @@ func (t *diskTx) NeighborsByPos(id NodeID, relType Token, dir Direction, buf []P
 	var rc store.Cursor
 	defer t.e.rels.ReleaseCursor(&rc)
 	visible := func(edge uint64) bool { return t.relLiveVia(edge, &rc) }
-	return t.neighborsByPosVia(id, relType, dir, buf, visible)
+	return t.neighborsByPosVia(id, relType, dir, buf, visible, nil)
 }
 
 // neighborsByPosVia is the shared body of NeighborsByPos: it walks the visible
@@ -1272,7 +1272,7 @@ func (t *diskTx) NeighborsByPos(id NodeID, relType Token, dir Direction, buf []P
 // loop can bind the predicate (and its cursor) once across many nodes instead of
 // rebuilding a closure per call. The caller holds the read guard and owns the
 // cursor's lifetime.
-func (t *diskTx) neighborsByPosVia(id NodeID, relType Token, dir Direction, buf []PosNeighbor, visible func(edge uint64) bool) ([]PosNeighbor, error) {
+func (t *diskTx) neighborsByPosVia(id NodeID, relType Token, dir Direction, buf []PosNeighbor, visible func(edge uint64) bool, mergeScratch *[]PosNeighbor) ([]PosNeighbor, error) {
 	pos, err := t.nodePos(id)
 	if err != nil {
 		return nil, err
@@ -1282,12 +1282,21 @@ func (t *diskTx) neighborsByPosVia(id NodeID, relType Token, dir Direction, buf 
 	var tbuf [1]uint32
 	types := t.appendTypes(tbuf[:0], relType)
 	out := buf[:0]
-	multi := len(dirs) > 1 || len(types) > 1
+	// Each (type, direction) run ExpandWith returns is already sorted by dense
+	// position. A single run is sorted as-is. The undirected single-type case is
+	// exactly two sorted runs, which merge in linear time on the dense position
+	// when a scratch buffer is supplied; the wider wildcard case (more than two
+	// runs, e.g. both directions across several types) falls back to one sort.
+	runs := 0
+	bound := 0
 	for _, ty := range types {
 		for _, d := range dirs {
 			nbrs, err := t.e.adj.ExpandWith(pos, ty, d, visible)
 			if err != nil {
 				return nil, err
+			}
+			if runs == 1 {
+				bound = len(out)
 			}
 			for _, nb := range nbrs {
 				neid, ok := t.e.ids.Eid(idmap.KindNode, nb.Node)
@@ -1300,12 +1309,58 @@ func (t *diskTx) neighborsByPosVia(id NodeID, relType Token, dir Direction, buf 
 				}
 				out = append(out, PosNeighbor{Pos: nb.Node, Rel: RelID(reid), Node: NodeID(neid), Type: toTok(ty)})
 			}
+			runs++
 		}
 	}
-	if multi {
+	switch {
+	case runs <= 1:
+		// One run (or none): already sorted by position, nothing to do.
+	case runs == 2 && mergeScratch != nil:
+		out = mergeTwoByPos(out, bound, mergeScratch)
+	default:
 		slices.SortFunc(out, func(a, b PosNeighbor) int { return cmp.Compare(a.Pos, b.Pos) })
 	}
 	return out, nil
+}
+
+// mergeTwoByPos merges the two position-sorted runs out[:bound] and out[bound:]
+// into a single position-sorted slice in place. The first run is copied into the
+// caller's reusable scratch so the merged result can be written back over out from
+// the front; because the write cursor never overtakes the unread tail of the second
+// run (which stays in place), no second copy of that run is needed. The scratch
+// grows to the larger run's size once and is reused, so the merge allocates nothing
+// on the steady-state hot path. When either run is empty the concatenation is
+// already sorted and out is returned untouched.
+func mergeTwoByPos(out []PosNeighbor, bound int, scratch *[]PosNeighbor) []PosNeighbor {
+	a := out[:bound]
+	b := out[bound:]
+	if len(a) == 0 || len(b) == 0 {
+		return out
+	}
+	s := append((*scratch)[:0], a...)
+	*scratch = s
+	i, j, w := 0, 0, 0
+	for i < len(s) && j < len(b) {
+		if s[i].Pos <= b[j].Pos {
+			out[w] = s[i]
+			i++
+		} else {
+			out[w] = b[j]
+			j++
+		}
+		w++
+	}
+	for i < len(s) {
+		out[w] = s[i]
+		i++
+		w++
+	}
+	for j < len(b) {
+		out[w] = b[j]
+		j++
+		w++
+	}
+	return out[:w]
 }
 
 // posReader is a reusable, single-goroutine neighbor reader: it binds one liveness
@@ -1317,6 +1372,9 @@ type posReader struct {
 	t       *diskTx
 	rc      store.Cursor
 	visible func(edge uint64) bool
+	// mbuf holds one directional run while the two undirected runs are merged in
+	// place, so the merge stays allocation-free across the hot per-edge loop.
+	mbuf []PosNeighbor
 }
 
 // NewNeighborReader implements engine.AdjacencyReader.
@@ -1329,7 +1387,7 @@ func (t *diskTx) NewNeighborReader() NeighborReader {
 func (r *posReader) NeighborsByPos(id NodeID, relType Token, dir Direction, buf []PosNeighbor) ([]PosNeighbor, error) {
 	r.t.rlock()
 	defer r.t.runlock()
-	return r.t.neighborsByPosVia(id, relType, dir, buf, r.visible)
+	return r.t.neighborsByPosVia(id, relType, dir, buf, r.visible, &r.mbuf)
 }
 
 func (r *posReader) Close() {

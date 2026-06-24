@@ -251,6 +251,7 @@ type intersectCountOp struct {
 	midLabelsKnown bool // every middle-node label is known: an unknown one matches nothing
 
 	adjx engine.Adjacency
+	adjr engine.AdjacencyReader
 }
 
 // icScratch is one counting goroutine's reusable merge-intersection buffers: the hub
@@ -259,8 +260,9 @@ type intersectCountOp struct {
 // refilled (engine.Adjacency contract). Each worker on the parallel path holds its
 // own, so the shared op carries no mutable scan state and the workers never race.
 type icScratch struct {
-	hub []engine.PosNeighbor
-	mid []engine.PosNeighbor
+	hub    []engine.PosNeighbor
+	mid    []engine.PosNeighbor
+	reader engine.NeighborReader // reusable per-worker neighbor reader, nil if the engine has none
 }
 
 func (o *intersectCountOp) open(ctx *Ctx) error {
@@ -278,6 +280,7 @@ func (o *intersectCountOp) open(ctx *Ctx) error {
 		}
 	}
 	o.adjx, _ = ctx.Tx.(engine.Adjacency)
+	o.adjr, _ = ctx.Tx.(engine.AdjacencyReader)
 	return o.input.open(ctx)
 }
 
@@ -317,6 +320,7 @@ func (o *intersectCountOp) next() (eval.Row, bool, error) {
 // closes with one set of reused merge buffers.
 func (o *intersectCountOp) runSerial() (int64, error) {
 	var s icScratch
+	defer o.bindReader(&s)()
 	if leaf, ok := o.input.(*nodeScanOp); ok {
 		// The whole input is a bare node scan, so feed the count off its ids directly.
 		return o.countScanDirect(&s, leaf)
@@ -441,6 +445,7 @@ func (o *intersectCountOp) countWorker(ids []engine.NodeID, src *morselSource) (
 	// worker pulls rows through the intervening operators as before.
 	bareScan := op == operator(leaf)
 	var s icScratch
+	defer o.bindReader(&s)()
 	var total int64
 	for {
 		lo, hi, ok := src.take()
@@ -499,12 +504,34 @@ func (o *intersectCountOp) countRow(s *icScratch, in eval.Row) (int64, error) {
 	return o.countHash(s, engine.NodeID(a))
 }
 
+// bindReader gives a worker its reusable neighbor reader when the engine exposes
+// one, returning a release func the caller defers. The reader holds one liveness
+// cursor and one visibility closure for the worker's whole run, so the hot per-edge
+// NeighborsByPos calls in countMerge allocate neither per call. When the engine has
+// no reader the buffer-only Adjacency path stands in and release is a no-op.
+func (o *intersectCountOp) bindReader(s *icScratch) func() {
+	if o.adjr == nil {
+		return func() {}
+	}
+	s.reader = o.adjr.NewNeighborReader()
+	return s.reader.Close
+}
+
+// neighbors fetches a node's position-sorted neighbors through the worker's reusable
+// reader when one is bound, falling back to the per-call Adjacency path otherwise.
+func (o *intersectCountOp) neighbors(s *icScratch, id engine.NodeID, relTok engine.Token, dir engine.Direction, buf []engine.PosNeighbor) ([]engine.PosNeighbor, error) {
+	if s.reader != nil {
+		return s.reader.NeighborsByPos(id, relTok, dir, buf)
+	}
+	return o.adjx.NeighborsByPos(id, relTok, dir, buf)
+}
+
 // countMerge reads the anchor's hub candidates once, drives the mid expand to
 // enumerate the middle node, and for each middle node merge-intersects its mid-leg
 // neighbors with the hub candidates on dense position. It never materializes an apex
 // row: each apex match is tallied in place.
 func (o *intersectCountOp) countMerge(s *icScratch, a engine.NodeID) (int64, error) {
-	hub, err := o.adjx.NeighborsByPos(a, o.hub.relTok, o.hub.dir, s.hub)
+	hub, err := o.neighbors(s, a, o.hub.relTok, o.hub.dir, s.hub)
 	if err != nil {
 		return 0, err
 	}
@@ -522,7 +549,7 @@ func (o *intersectCountOp) countMerge(s *icScratch, a engine.NodeID) (int64, err
 		if ok, e := o.hasMidLabels(nb.Node); e != nil || !ok {
 			return e
 		}
-		mid, e := o.adjx.NeighborsByPos(nb.Node, o.mid.relTok, o.mid.dir, s.mid)
+		mid, e := o.neighbors(s, nb.Node, o.mid.relTok, o.mid.dir, s.mid)
 		if e != nil {
 			return e
 		}

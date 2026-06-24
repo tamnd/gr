@@ -317,6 +317,10 @@ func (o *intersectCountOp) next() (eval.Row, bool, error) {
 // closes with one set of reused merge buffers.
 func (o *intersectCountOp) runSerial() (int64, error) {
 	var s icScratch
+	if leaf, ok := o.input.(*nodeScanOp); ok {
+		// The whole input is a bare node scan, so feed the count off its ids directly.
+		return o.countScanDirect(&s, leaf)
+	}
 	var total int64
 	for {
 		in, ok, err := o.input.next()
@@ -332,6 +336,32 @@ func (o *intersectCountOp) runSerial() (int64, error) {
 		}
 		total += n
 	}
+}
+
+// countScanDirect counts the triangles closed at every anchor a bare node scan
+// emits, reading the anchor ids straight from the scan and applying its residual
+// label filter in place. It never allocates the single-entry anchor row map the
+// pull path builds per node, so on a million-anchor scan it removes a million short
+// lived maps, the dominant query-path allocation and the source of the GC tail on
+// triangle counting (doc 12 §10). It matches the pull path exactly: same ids, same
+// label filter, same per-anchor merge count.
+func (o *intersectCountOp) countScanDirect(s *icScratch, leaf *nodeScanOp) (int64, error) {
+	var total int64
+	for _, id := range leaf.scanIDs() {
+		ok, err := leaf.hasAll(id)
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			continue
+		}
+		n, err := o.countMerge(s, engine.NodeID(id))
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
 }
 
 // parallelScan returns the NodeScan to parallelize the count over, or nil to run
@@ -406,6 +436,10 @@ func (o *intersectCountOp) countWorker(ids []engine.NodeID, src *morselSource) (
 	}
 	leaf.windowed = true
 	leaf.winIDs = ids
+	// When the pipeline is just the scan, each morsel feeds the count off the window's
+	// ids directly with no per-anchor row map (the bare-scan fast path); otherwise the
+	// worker pulls rows through the intervening operators as before.
+	bareScan := op == operator(leaf)
 	var s icScratch
 	var total int64
 	for {
@@ -416,6 +450,18 @@ func (o *intersectCountOp) countWorker(ids []engine.NodeID, src *morselSource) (
 		leaf.winLo, leaf.winHi = lo, hi
 		if err := op.open(o.ctx); err != nil {
 			return 0, err
+		}
+		if bareScan {
+			n, err := o.countScanDirect(&s, leaf)
+			if err != nil {
+				_ = op.close()
+				return 0, err
+			}
+			total += n
+			if err := op.close(); err != nil {
+				return 0, err
+			}
+			continue
 		}
 		for {
 			in, ok, err := op.next()

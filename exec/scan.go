@@ -143,6 +143,20 @@ func (o *nodeScanOp) nextWindow() (eval.Row, bool, error) {
 	return nil, false, nil
 }
 
+// scanIDs returns the node ids this scan walks before the residual label filter:
+// its full buffer on the serial path, or its assigned [winLo,winHi) morsel window
+// on the windowed path. The fused count operator iterates these directly, applying
+// hasAll itself, so a bare-scan count never builds a row map per anchor (doc 12 §10).
+func (o *nodeScanOp) scanIDs() []engine.NodeID {
+	if o.none {
+		return nil
+	}
+	if o.windowed {
+		return o.winIDs[o.winLo:o.winHi]
+	}
+	return o.buf
+}
+
 func (o *nodeScanOp) hasAll(id engine.NodeID) (bool, error) {
 	for _, t := range o.rest {
 		has, err := o.ctx.Tx.HasLabel(id, t)

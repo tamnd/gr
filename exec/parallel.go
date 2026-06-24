@@ -162,6 +162,13 @@ func parallelWorkers(n int) int {
 // unlabeled), the same set nodeScanOp buffers on its serial path before the
 // residual labels are checked per row. An unknown label anywhere in the set means
 // the scan matches nothing, so it returns an empty slice.
+// scanCardinalityHint is an optional engine.Tx capability: an upper bound on a
+// label scan's row count, used only to presize the morsel id buffer. An engine that
+// does not implement it just grows the slice as before.
+type scanCardinalityHint interface {
+	ScanCardinality() int
+}
+
 func primaryScan(tx engine.Tx, ns *plan.NodeScan) ([]engine.NodeID, error) {
 	scanTok := engine.Token(0)
 	for i, l := range ns.Labels {
@@ -173,6 +180,12 @@ func primaryScan(tx engine.Tx, ns *plan.NodeScan) ([]engine.NodeID, error) {
 		}
 	}
 	var ids []engine.NodeID
+	if h, ok := tx.(scanCardinalityHint); ok {
+		// Presize from the scan's upper-bound cardinality so the morsel id slice is
+		// one allocation, not a dozen doublings of garbage per parallel query (the
+		// per-iteration heap growth that drove GC pauses into the fast-query tail).
+		ids = make([]engine.NodeID, 0, h.ScanCardinality())
+	}
 	err := tx.ScanLabel(scanTok, func(id engine.NodeID) error {
 		ids = append(ids, id)
 		return nil

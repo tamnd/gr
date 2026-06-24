@@ -141,6 +141,10 @@ func (o *aggregateOp) drainGroups(op operator) (map[string]*group, []string, err
 	for i, c := range o.spec.GroupKeys {
 		keyExprs[i] = c.Expr
 	}
+	// One env per drain pass (per worker on the parallel path), its Row field reset
+	// per input row, rather than a fresh heap env per row. drainGroups touches only
+	// this local and freshly allocated state, so this stays concurrency-safe.
+	env := o.ctx.env(nil)
 	for {
 		in, ok, err := op.next()
 		if err != nil {
@@ -149,7 +153,7 @@ func (o *aggregateOp) drainGroups(op operator) (map[string]*group, []string, err
 		if !ok {
 			break
 		}
-		env := o.ctx.env(in)
+		env.Row = in
 		keyVals := make([]value.Value, len(keyExprs))
 		for i, e := range keyExprs {
 			v, err := eval.Eval(e, env)

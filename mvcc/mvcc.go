@@ -29,6 +29,7 @@ package mvcc
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tamnd/gr/value"
@@ -208,6 +209,14 @@ type entry struct {
 type Overlay struct {
 	mu     sync.RWMutex
 	chains map[Key][]entry // each chain ascending by seq
+	// keys mirrors len(chains) so a read can skip the lock entirely when the
+	// overlay holds nothing. The common case is a database with no live old
+	// snapshots: the base is the whole truth and every Resolve returns "read the
+	// base". Under the single-writer model a reader never overlaps a writer, so
+	// when keys is zero the chains map is provably empty and untouched, and the
+	// per-edge Resolve in a hot scan (millions of calls) avoids the RWMutex
+	// reader-counter that otherwise serializes parallel workers on one cache line.
+	keys atomic.Int64
 }
 
 // NewOverlay returns an empty overlay.
@@ -222,6 +231,7 @@ func (ov *Overlay) Record(seq Seq, key Key, pre Pre) {
 	ov.mu.Lock()
 	defer ov.mu.Unlock()
 	ov.chains[key] = append(ov.chains[key], entry{seq: seq, pre: pre})
+	ov.keys.Store(int64(len(ov.chains)))
 }
 
 // Resolve returns the value of a datum as of read sequence r: the pre-image of
@@ -229,6 +239,9 @@ func (ov *Overlay) Record(seq Seq, key Key, pre Pre) {
 // replaced the value the snapshot should see). ok is false when no retained
 // write supersedes the base for this snapshot, meaning the caller reads the base.
 func (ov *Overlay) Resolve(key Key, r Seq) (Pre, bool) {
+	if ov.keys.Load() == 0 {
+		return Pre{}, false
+	}
 	ov.mu.RLock()
 	defer ov.mu.RUnlock()
 	for _, e := range ov.chains[key] {
@@ -248,6 +261,9 @@ func (ov *Overlay) Resolve(key Key, r Seq) (Pre, bool) {
 // lookup must reconsider beyond the base index (doc 07 §9). The returned positions
 // are deduplicated; the caller filters them against the actual snapshot value.
 func (ov *Overlay) NodeCandidates(propKey uint32, r Seq) []uint64 {
+	if ov.keys.Load() == 0 {
+		return nil
+	}
 	ov.mu.RLock()
 	defer ov.mu.RUnlock()
 	var out []uint64
@@ -309,6 +325,7 @@ func (ov *Overlay) GC(watermark Seq) GCStats {
 			ov.chains[k] = kept
 		}
 	}
+	ov.keys.Store(int64(len(ov.chains)))
 	return st
 }
 

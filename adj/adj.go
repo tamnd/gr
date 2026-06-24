@@ -86,9 +86,8 @@ const dirStride = 40
 // compressed blobs once and caches the result here, so a run lookup indexes plain
 // slices rather than re-reading pages (doc 15 §15.9).
 type base struct {
-	off []uint64 // offsets, length nodeCount+1
-	nbr []uint64 // neighbor node positions
-	edg []uint64 // edge (relationship) positions
+	off []uint64   // offsets, length nodeCount+1
+	nb  []Neighbor // (node position, edge position) pairs, one CSR run per source
 }
 
 // Adj is the adjacency index over a relationship store.
@@ -403,12 +402,14 @@ func (a *Adj) baseRun(s uint32, src uint64) ([]Neighbor, error) {
 	if b == nil || src+1 >= offLen {
 		return nil, nil
 	}
+	// The base is stored as one AoS run built once at decode time, so a source's run
+	// is a sub-slice of it: returning the view allocates nothing per call. ExpandWith
+	// returns this slice straight through in the no-delta steady state, so the hot
+	// per-edge expand never materializes a neighbor list. The slice aliases cached
+	// memory; callers read it and never append (a checkpoint that repacks the run
+	// holds the engine's exclusive lock, so no reader runs beside it).
 	lo, hi := b.off[src], b.off[src+1]
-	out := make([]Neighbor, 0, hi-lo)
-	for k := lo; k < hi; k++ {
-		out = append(out, Neighbor{Node: b.nbr[k], Edge: b.edg[k]})
-	}
-	return out, nil
+	return b.nb[lo:hi], nil
 }
 
 // openBase decodes and caches a slot's base arrays from its directory cell. It
@@ -455,7 +456,14 @@ func (a *Adj) openBase(s uint32) (*base, uint64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	b := &base{off: off, nbr: nbr, edg: edg}
+	// Build the AoS run once here, at decode time and under no lock, so every later
+	// run lookup for this slot returns a zero-copy sub-slice instead of rebuilding a
+	// neighbor list per call. The two source arrays are dropped after this.
+	nb := make([]Neighbor, len(nbr))
+	for i := range nb {
+		nb[i] = Neighbor{Node: nbr[i], Edge: edg[i]}
+	}
+	b := &base{off: off, nb: nb}
 
 	a.cacheMu.Lock()
 	defer a.cacheMu.Unlock()

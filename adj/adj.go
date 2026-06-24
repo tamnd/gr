@@ -281,23 +281,59 @@ func (a *Adj) Expand(src uint64, relType uint32, d Dir) ([]Neighbor, error) {
 // deletes — a deleted or not-yet-visible edge is simply one the predicate drops.
 func (a *Adj) ExpandWith(src uint64, relType uint32, d Dir, visible func(edge uint64) bool) ([]Neighbor, error) {
 	s := slot(relType, d)
-	var out []Neighbor
 
 	run, err := a.baseRun(s, src)
 	if err != nil {
 		return nil, err
 	}
-	for _, nb := range run {
-		if visible(nb.Edge) {
-			out = append(out, nb)
+	delta := a.delta[s][src]
+
+	// Both the base run and the delta are stored sorted by (node, edge): the base
+	// is packed sorted at checkpoint and the delta is kept sorted by addDelta's
+	// binary-search insert. Filtering by visibility only drops elements and so
+	// preserves order. So when there is no delta the surviving base is already
+	// sorted and needs no sort, and when there is one a single merge of the two
+	// sorted, visibility-filtered runs yields the sorted result without an
+	// O(n log n) sort over the whole list (doc 04 §12, "no sort step").
+	if len(delta) == 0 {
+		out := make([]Neighbor, 0, len(run))
+		for _, nb := range run {
+			if visible(nb.Edge) {
+				out = append(out, nb)
+			}
+		}
+		return out, nil
+	}
+
+	out := make([]Neighbor, 0, len(run)+len(delta))
+	i, j := 0, 0
+	for i < len(run) && j < len(delta) {
+		if !visible(run[i].Edge) {
+			i++
+			continue
+		}
+		if !visible(delta[j].Edge) {
+			j++
+			continue
+		}
+		if cmpNeighbor(run[i], delta[j]) <= 0 {
+			out = append(out, run[i])
+			i++
+		} else {
+			out = append(out, delta[j])
+			j++
 		}
 	}
-	for _, nb := range a.delta[s][src] {
-		if visible(nb.Edge) {
-			out = append(out, nb)
+	for ; i < len(run); i++ {
+		if visible(run[i].Edge) {
+			out = append(out, run[i])
 		}
 	}
-	slices.SortFunc(out, cmpNeighbor)
+	for ; j < len(delta); j++ {
+		if visible(delta[j].Edge) {
+			out = append(out, delta[j])
+		}
+	}
 	return out, nil
 }
 

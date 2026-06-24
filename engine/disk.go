@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"cmp"
 	"errors"
 	"io"
 	"slices"
@@ -1189,6 +1190,50 @@ func (t *diskTx) Expand(id NodeID, relType Token, dir Direction, fn func(Neighbo
 		}
 	}
 	return nil
+}
+
+// NeighborsByPos implements engine.Adjacency: it returns the snapshot-visible
+// neighbors of a node along a type and direction as a slice sorted by dense
+// position, reusing the supplied buffer. adj.ExpandWith already returns each base
+// and delta run sorted by dense position, so when a single (type, direction) run
+// is requested the result is sorted with no extra work; the multi-run wildcard
+// case (zero type or both directions) merges into one slice and sorts once. The
+// dense position is the neighbor's adjacency node id before id translation, which
+// is the same key adjacency lists are packed on, so two lists are mergeable on it.
+func (t *diskTx) NeighborsByPos(id NodeID, relType Token, dir Direction, buf []PosNeighbor) ([]PosNeighbor, error) {
+	defer t.rguard()()
+	pos, err := t.nodePos(id)
+	if err != nil {
+		return nil, err
+	}
+	visible := func(edge uint64) bool { return t.relLive(edge) }
+	dirs := dirSlice(dir)
+	types := t.typeSlice(relType)
+	out := buf[:0]
+	multi := len(dirs) > 1 || len(types) > 1
+	for _, ty := range types {
+		for _, d := range dirs {
+			nbrs, err := t.e.adj.ExpandWith(pos, ty, d, visible)
+			if err != nil {
+				return nil, err
+			}
+			for _, nb := range nbrs {
+				neid, ok := t.e.ids.Eid(idmap.KindNode, nb.Node)
+				if !ok {
+					continue
+				}
+				reid, ok := t.e.ids.Eid(idmap.KindRel, nb.Edge)
+				if !ok {
+					continue
+				}
+				out = append(out, PosNeighbor{Pos: nb.Node, Rel: RelID(reid), Node: NodeID(neid), Type: toTok(ty)})
+			}
+		}
+	}
+	if multi {
+		slices.SortFunc(out, func(a, b PosNeighbor) int { return cmp.Compare(a.Pos, b.Pos) })
+	}
+	return out, nil
 }
 
 // dirSlice maps an SPI direction to the adjacency directions to walk.

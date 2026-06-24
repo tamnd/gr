@@ -49,6 +49,29 @@ type Neighbor struct {
 	Type Token
 }
 
+// PosNeighbor is one edge for the merge-intersection path (the worst-case-optimal
+// triangle join): like Neighbor but it also carries Pos, the reached node's dense
+// internal position. Pos is the stable global key two adjacency lists are sorted
+// on, so two nodes' neighbor lists can be merge-intersected on Pos without a
+// re-sort. Node and Rel are the external element ids used when a match is emitted.
+type PosNeighbor struct {
+	Pos  uint64
+	Rel  RelID
+	Node NodeID
+	Type Token
+}
+
+// Adjacency is an optional Tx capability: it returns a node's snapshot-visible
+// neighbors as a slice sorted ascending by dense position (PosNeighbor.Pos), the
+// shape the intersection operator merges two of. The caller passes a scratch slice
+// to fill (its capacity is reused, contents overwritten); the returned slice
+// aliases that scratch and is valid until the next call that reuses it, so a
+// caller intersecting two lists passes two distinct buffers. A Tx that does not
+// implement Adjacency falls back to the callback Expand path.
+type Adjacency interface {
+	NeighborsByPos(id NodeID, relType Token, dir Direction, buf []PosNeighbor) ([]PosNeighbor, error)
+}
+
 // Predicate is a pushed-down property test for predicate scans (doc 04 §6.6).
 // A nil Predicate matches everything.
 type Predicate func(value.Value) bool

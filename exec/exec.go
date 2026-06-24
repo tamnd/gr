@@ -536,7 +536,7 @@ func (c *compiler) compileRelInner(o plan.Op, peers []string) (operator, []strin
 		if err != nil {
 			return nil, nil, err
 		}
-		return &intersectCountOp{spec: x, input: input}, nil, nil
+		return &intersectCountOp{spec: x, input: input, inputPlan: x.Input}, nil, nil
 	case *plan.Unwind:
 		var input operator
 		if x.Input != nil {

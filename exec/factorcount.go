@@ -1,6 +1,9 @@
 package exec
 
 import (
+	"runtime"
+	"sync"
+
 	"github.com/tamnd/gr/engine"
 	"github.com/tamnd/gr/eval"
 	"github.com/tamnd/gr/plan"
@@ -230,9 +233,10 @@ func (o *productCountOp) close() error { return o.input.close() }
 //
 // Like a grouping-free aggregate it always emits exactly one row, zero included.
 type intersectCountOp struct {
-	spec  *plan.IntersectCount
-	input operator
-	ctx   *Ctx
+	spec      *plan.IntersectCount
+	input     operator
+	inputPlan plan.Op // the logical input, recompiled per worker on the parallel path
+	ctx       *Ctx
 
 	done bool
 
@@ -246,12 +250,17 @@ type intersectCountOp struct {
 
 	midLabelsKnown bool // every middle-node label is known: an unknown one matches nothing
 
-	// merge-intersection scratch: the hub candidates (read once per anchor) and the
-	// mid-leg neighbors (read once per middle node), each a distinct buffer so the
-	// hub list stays valid while the mid list is refilled (engine.Adjacency contract).
-	adjx   engine.Adjacency
-	bufHub []engine.PosNeighbor
-	bufMid []engine.PosNeighbor
+	adjx engine.Adjacency
+}
+
+// icScratch is one counting goroutine's reusable merge-intersection buffers: the hub
+// candidates (read once per anchor) and the mid-leg neighbors (read once per middle
+// node), each a distinct buffer so the hub list stays valid while the mid list is
+// refilled (engine.Adjacency contract). Each worker on the parallel path holds its
+// own, so the shared op carries no mutable scan state and the workers never race.
+type icScratch struct {
+	hub []engine.PosNeighbor
+	mid []engine.PosNeighbor
 }
 
 func (o *intersectCountOp) open(ctx *Ctx) error {
@@ -278,21 +287,21 @@ func (o *intersectCountOp) next() (eval.Row, bool, error) {
 	}
 	o.done = true
 	var total int64
-	if !o.midNoType && !o.hub.noType && !o.mid.noType && o.midLabelsKnown {
-		for {
-			in, ok, err := o.input.next()
-			if err != nil {
-				return nil, false, err
-			}
-			if !ok {
-				break
-			}
-			n, err := o.countRow(in)
-			if err != nil {
-				return nil, false, err
-			}
-			total += n
+	var err error
+	switch {
+	case o.midNoType || o.hub.noType || o.mid.noType || !o.midLabelsKnown:
+		// A type set that resolves to nothing or an unknown middle-node label matches
+		// no edge or node, so the count is zero with no scan.
+		total = 0
+	default:
+		if ns := o.parallelScan(); ns != nil {
+			total, err = o.runParallel(ns)
+		} else {
+			total, err = o.runSerial()
 		}
+	}
+	if err != nil {
+		return nil, false, err
 	}
 	// One tally row stands in for total flat rows, so the factorization ratio is total:
 	// the Intersect+Aggregate would have built total apex rows to count, this built one
@@ -304,30 +313,156 @@ func (o *intersectCountOp) next() (eval.Row, bool, error) {
 	return eval.Row{o.spec.Col: value.Int(total)}, true, nil
 }
 
+// runSerial drains the anchor rows on this goroutine, summing the triangles each
+// closes with one set of reused merge buffers.
+func (o *intersectCountOp) runSerial() (int64, error) {
+	var s icScratch
+	var total int64
+	for {
+		in, ok, err := o.input.next()
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			return total, nil
+		}
+		n, err := o.countRow(&s, in)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+}
+
+// parallelScan returns the NodeScan to parallelize the count over, or nil to run
+// serially. The count is a pure sum reduction over the anchor rows, so it is eligible
+// exactly when the aggregate it replaced would have been: a read-only, row-independent
+// chain rooted at a node scan, on a machine with more than one core. Triangle counting
+// is the canonical many-core workload, so this is where the fused operator earns the
+// cores Kuzu uses (doc 12 §10).
+func (o *intersectCountOp) parallelScan() *plan.NodeScan {
+	if o.ctx.Effects != nil || o.inputPlan == nil {
+		return nil
+	}
+	if runtime.GOMAXPROCS(0) < 2 {
+		return nil
+	}
+	return parallelLeaf(o.inputPlan)
+}
+
+// runParallel scans the anchor nodes once, fans the morsels across workers that each
+// sum the triangles their morsels close, and adds the partials. It falls back to the
+// serial path when the scan is too small to be worth splitting. The sum is associative
+// and commutative, so the parallel total is identical to the serial one.
+func (o *intersectCountOp) runParallel(ns *plan.NodeScan) (int64, error) {
+	ids, err := primaryScan(o.ctx.Tx, ns)
+	if err != nil {
+		return 0, err
+	}
+	w := parallelWorkers(len(ids))
+	if w < 2 {
+		return o.runSerial()
+	}
+	// The morsel workers walk this already-scanned id slice rather than scanning again,
+	// so the anchor scan work is counted once here (doc 20 §3.1) instead of per worker.
+	o.ctx.countScan(int64(len(ids)))
+	src := &morselSource{ids: ids, chunk: morselChunk}
+	partials := make([]int64, w)
+	errs := make([]error, w)
+	var wg sync.WaitGroup
+	for k := range w {
+		wg.Add(1)
+		go func(k int) {
+			defer wg.Done()
+			partials[k], errs[k] = o.countWorker(ids, src)
+		}(k)
+	}
+	wg.Wait()
+	for _, e := range errs {
+		if e != nil {
+			return 0, e
+		}
+	}
+	var total int64
+	for _, n := range partials {
+		total += n
+	}
+	return total, nil
+}
+
+// countWorker runs one worker: a fresh, private copy of the anchor pipeline pointed at
+// the shared morsel cursor, summing the triangles closed by every anchor in the morsels
+// it pulls. The copy, its scan window, and its merge buffers are unshared, and every
+// read goes through the concurrency-safe read path, so workers run without coordination
+// beyond the atomic morsel handoff.
+func (o *intersectCountOp) countWorker(ids []engine.NodeID, src *morselSource) (int64, error) {
+	op, err := compile(o.inputPlan)
+	if err != nil {
+		return 0, err
+	}
+	leaf := scanLeaf(op)
+	if leaf == nil {
+		return 0, errNoScanLeaf
+	}
+	leaf.windowed = true
+	leaf.winIDs = ids
+	var s icScratch
+	var total int64
+	for {
+		lo, hi, ok := src.take()
+		if !ok {
+			return total, nil
+		}
+		leaf.winLo, leaf.winHi = lo, hi
+		if err := op.open(o.ctx); err != nil {
+			return 0, err
+		}
+		for {
+			in, ok, err := op.next()
+			if err != nil {
+				_ = op.close()
+				return 0, err
+			}
+			if !ok {
+				break
+			}
+			n, err := o.countRow(&s, in)
+			if err != nil {
+				_ = op.close()
+				return 0, err
+			}
+			total += n
+		}
+		if err := op.close(); err != nil {
+			return 0, err
+		}
+	}
+}
+
 // countRow counts the triangles closed at one anchor row, a null or absent anchor
 // contributing nothing. It takes the merge-intersection path when the engine exposes
 // position-sorted adjacency, falling back to a hash probe otherwise.
-func (o *intersectCountOp) countRow(in eval.Row) (int64, error) {
+func (o *intersectCountOp) countRow(s *icScratch, in eval.Row) (int64, error) {
 	a, ok := in[o.spec.Hub].AsNode()
 	if !ok {
 		return 0, nil
 	}
 	if o.adjx != nil {
-		return o.countMerge(engine.NodeID(a))
+		return o.countMerge(s, engine.NodeID(a))
 	}
-	return o.countHash(engine.NodeID(a))
+	return o.countHash(s, engine.NodeID(a))
 }
 
 // countMerge reads the anchor's hub candidates once, drives the mid expand to
 // enumerate the middle node, and for each middle node merge-intersects its mid-leg
 // neighbors with the hub candidates on dense position. It never materializes an apex
 // row: each apex match is tallied in place.
-func (o *intersectCountOp) countMerge(a engine.NodeID) (int64, error) {
-	hub, err := o.adjx.NeighborsByPos(a, o.hub.relTok, o.hub.dir, o.bufHub)
+func (o *intersectCountOp) countMerge(s *icScratch, a engine.NodeID) (int64, error) {
+	hub, err := o.adjx.NeighborsByPos(a, o.hub.relTok, o.hub.dir, s.hub)
 	if err != nil {
 		return 0, err
 	}
-	o.bufHub = hub
+	s.hub = hub
 	if len(hub) == 0 {
 		return 0, nil
 	}
@@ -341,11 +476,11 @@ func (o *intersectCountOp) countMerge(a engine.NodeID) (int64, error) {
 		if ok, e := o.hasMidLabels(nb.Node); e != nil || !ok {
 			return e
 		}
-		mid, e := o.adjx.NeighborsByPos(nb.Node, o.mid.relTok, o.mid.dir, o.bufMid)
+		mid, e := o.adjx.NeighborsByPos(nb.Node, o.mid.relTok, o.mid.dir, s.mid)
 		if e != nil {
 			return e
 		}
-		o.bufMid = mid
+		s.mid = mid
 		if len(mid) == 0 {
 			return nil
 		}
@@ -417,7 +552,7 @@ func (o *intersectCountOp) mergeCount(hub, mid []engine.PosNeighbor, rel1 engine
 // keys the anchor's hub candidates by apex node, then drives the mid expand and, per
 // middle node, probes the hub map with its mid-leg neighbors. The set of triangles it
 // tallies is the same the merge path tallies; only the access path differs.
-func (o *intersectCountOp) countHash(a engine.NodeID) (int64, error) {
+func (o *intersectCountOp) countHash(_ *icScratch, a engine.NodeID) (int64, error) {
 	hub := map[engine.NodeID][]engine.RelID{}
 	err := o.ctx.Tx.Expand(a, o.hub.relTok, o.hub.dir, func(nb engine.Neighbor) error {
 		o.ctx.countScan(1)

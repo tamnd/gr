@@ -64,7 +64,7 @@ func factorizeIntersect(agg *Aggregate) *IntersectCount {
 	// exactly the two legs' bound nodes, so the fused count can drive that expand
 	// itself instead of consuming its materialized rows.
 	mid, ok := in.Input.(*Expand)
-	if !ok || mid.VarLen != nil || mid.ToBound || len(mid.ToLabels) != 0 {
+	if !ok || mid.VarLen != nil || mid.ToBound {
 		return nil
 	}
 	// One leg leaves the mid expand's source (the anchor hub), the other its target
@@ -86,16 +86,17 @@ func factorizeIntersect(agg *Aggregate) *IntersectCount {
 		return nil
 	}
 	return &IntersectCount{
-		Input:    mid.Input,
-		Hub:      mid.From,
-		Mid:      mid.To,
-		MidRel:   mid.Rel,
-		MidTypes: mid.Types,
-		MidDir:   mid.Dir,
-		HubLeg:   hub,
-		MidLeg:   midLeg,
-		Labels:   in.Labels,
-		Col:      col.Name,
+		Input:     mid.Input,
+		Hub:       mid.From,
+		Mid:       mid.To,
+		MidRel:    mid.Rel,
+		MidTypes:  mid.Types,
+		MidDir:    mid.Dir,
+		MidLabels: mid.ToLabels,
+		HubLeg:    hub,
+		MidLeg:    midLeg,
+		Labels:    in.Labels,
+		Col:       col.Name,
 	}
 }
 

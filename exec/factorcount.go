@@ -244,6 +244,8 @@ type intersectCountOp struct {
 	hub resolvedLeg // the leg reaching the apex from the anchor
 	mid resolvedLeg // the leg reaching the apex from the middle node
 
+	midLabelsKnown bool // every middle-node label is known: an unknown one matches nothing
+
 	// merge-intersection scratch: the hub candidates (read once per anchor) and the
 	// mid-leg neighbors (read once per middle node), each a distinct buffer so the
 	// hub list stays valid while the mid list is refilled (engine.Adjacency contract).
@@ -260,6 +262,12 @@ func (o *intersectCountOp) open(ctx *Ctx) error {
 	mtok, mallow, mnone := resolveTypes(o.spec.MidLeg.Types)
 	o.mid = resolvedLeg{relTok: mtok, allow: mallow, noType: mnone, dir: toEngineDir(o.spec.MidLeg.Dir)}
 	o.midDir = toEngineDir(o.spec.MidDir)
+	o.midLabelsKnown = true
+	for _, l := range o.spec.MidLabels {
+		if !l.Known {
+			o.midLabelsKnown = false
+		}
+	}
 	o.adjx, _ = ctx.Tx.(engine.Adjacency)
 	return o.input.open(ctx)
 }
@@ -270,7 +278,7 @@ func (o *intersectCountOp) next() (eval.Row, bool, error) {
 	}
 	o.done = true
 	var total int64
-	if !o.midNoType && !o.hub.noType && !o.mid.noType {
+	if !o.midNoType && !o.hub.noType && !o.mid.noType && o.midLabelsKnown {
 		for {
 			in, ok, err := o.input.next()
 			if err != nil {
@@ -329,6 +337,9 @@ func (o *intersectCountOp) countMerge(a engine.NodeID) (int64, error) {
 		o.ctx.countScan(1)
 		if o.midAllow != nil && !o.midAllow[nb.Type] {
 			return nil
+		}
+		if ok, e := o.hasMidLabels(nb.Node); e != nil || !ok {
+			return e
 		}
 		mid, e := o.adjx.NeighborsByPos(nb.Node, o.mid.relTok, o.mid.dir, o.bufMid)
 		if e != nil {
@@ -428,6 +439,9 @@ func (o *intersectCountOp) countHash(a engine.NodeID) (int64, error) {
 		if o.midAllow != nil && !o.midAllow[nb.Type] {
 			return nil
 		}
+		if ok, e := o.hasMidLabels(nb.Node); e != nil || !ok {
+			return e
+		}
 		rel1 := nb.Rel
 		return o.ctx.Tx.Expand(nb.Node, o.mid.relTok, o.mid.dir, func(mb engine.Neighbor) error {
 			o.ctx.countScan(1)
@@ -462,6 +476,19 @@ func (o *intersectCountOp) hasLabels(id engine.NodeID) (bool, error) {
 		if !l.Known {
 			return false, nil
 		}
+		has, err := o.ctx.Tx.HasLabel(id, l.Token)
+		if err != nil || !has {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// hasMidLabels reports whether the middle node carries every label the mid expand's
+// target required. next() has already shown every middle-node label is known (an
+// unknown one collapses the whole count to zero), so this only tests presence.
+func (o *intersectCountOp) hasMidLabels(id engine.NodeID) (bool, error) {
+	for _, l := range o.spec.MidLabels {
 		has, err := o.ctx.Tx.HasLabel(id, l.Token)
 		if err != nil || !has {
 			return false, err

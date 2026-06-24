@@ -385,21 +385,23 @@ type ProductLeg struct {
 // variable, type set, and direction. HubLeg reaches the apex from the anchor and
 // MidLeg from the middle node, each carrying the relationship variable, type set,
 // and direction the Intersect leg held. Labels are the apex's required labels and
-// Col the output count column. It stands in only when the mid expand is plain (no
-// variable length, no expand-into, no target-label) and its input binds no
-// relationship, so the only edge-uniqueness to enforce is among the triangle's own
-// three edges, which the operator checks directly.
+// Col the output count column. MidLabels are the labels the middle node must carry
+// (the mid expand's target labels), enforced on each middle node the operator reaches.
+// It stands in only when the mid expand is plain (no variable length, no expand-into)
+// and its input binds no relationship, so the only edge-uniqueness to enforce is among
+// the triangle's own three edges, which the operator checks directly.
 type IntersectCount struct {
-	Input    Op
-	Hub      string
-	Mid      string
-	MidRel   string
-	MidTypes []bind.NameRef
-	MidDir   ast.Direction
-	HubLeg   IntersectLeg
-	MidLeg   IntersectLeg
-	Labels   []bind.NameRef
-	Col      string
+	Input     Op
+	Hub       string
+	Mid       string
+	MidRel    string
+	MidTypes  []bind.NameRef
+	MidDir    ast.Direction
+	MidLabels []bind.NameRef // labels the middle node must carry (the mid expand's target labels)
+	HubLeg    IntersectLeg
+	MidLeg    IntersectLeg
+	Labels    []bind.NameRef
+	Col       string
 }
 
 // Join combines two row streams. On lists the shared variable names the rows

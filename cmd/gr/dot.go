@@ -26,7 +26,7 @@ func (s *shell) runDot(line string) {
 	case ".quit", ".exit":
 		s.quitNow = true
 	case ".version":
-		fmt.Fprintln(s.errw, "gr", version)
+		fmt.Fprintln(s.errw, versionString())
 	case ".mode":
 		s.dotMode(args)
 	case ".headers", ".header":

@@ -4,6 +4,12 @@
 *.test
 *.out
 
+# Docs site build output and the local Cloudflare deploy cache
+/docs/public/
+/docs/public-cf/
+/docs/public-pages/
+/docs/.wrangler/
+
 # Database files produced by examples or local runs
 *.gr
 *.gr-wal

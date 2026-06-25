@@ -78,7 +78,7 @@ const (
 // cell whose value does not fit that plane, or a composite type, forces the union
 // plane so the result is always correct regardless of the declared type.
 func Encode(valueType value.Type, cells []Cell) ([]byte, error) {
-	if len(cells) > math.MaxUint32 {
+	if uint64(len(cells)) > math.MaxUint32 {
 		return nil, ErrBadSegment
 	}
 	present := make([]value.Value, 0, len(cells))

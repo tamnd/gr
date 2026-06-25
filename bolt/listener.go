@@ -194,7 +194,7 @@ func (l *Listener) Close() error {
 // Shutdown stops accepting and waits for live connections to finish, force
 // closing any that remain when ctx expires (doc 18 §8.7).
 func (l *Listener) Shutdown(ctx context.Context) error {
-	l.Close()
+	_ = l.Close()
 	done := make(chan struct{})
 	go func() {
 		l.wg.Wait()

@@ -11,14 +11,14 @@ package loader
 // primary-label signature maps to a LabelGroup whose dense-id counter is
 // maintained here and in the IDMapBuilder.
 type CatalogBuilder struct {
-	labels    map[string]int   // label string → label token
-	labelOrd  []string         // insertion-order list (for determinism)
-	relTypes  map[string]int   // rel-type string → type token
+	labels     map[string]int // label string → label token
+	labelOrd   []string       // insertion-order list (for determinism)
+	relTypes   map[string]int // rel-type string → type token
 	relTypeOrd []string
-	propKeys  map[string]int   // property-key string → key token
+	propKeys   map[string]int // property-key string → key token
 	propKeyOrd []string
 
-	groups        []groupDesc       // groups[LabelGroup] = description
+	groups         []groupDesc        // groups[LabelGroup] = description
 	groupByPrimary map[int]LabelGroup // primary label token → group id
 }
 
@@ -29,8 +29,8 @@ type LabelGroup int
 
 // groupDesc holds the per-group metadata accumulated during pass 1.
 type groupDesc struct {
-	primaryToken int     // the primary label's token
-	count        uint64  // nodes assigned so far (the dense-id high-water mark)
+	primaryToken int    // the primary label's token
+	count        uint64 // nodes assigned so far (the dense-id high-water mark)
 }
 
 // newCatalogBuilder returns an empty CatalogBuilder ready to intern tokens.

@@ -117,7 +117,7 @@ func runLoadCmd(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	path := pos[0]
 
-	var src io.Reader = stdin
+	var src = stdin
 	if file != "" {
 		f, err := os.Open(file)
 		if err != nil {

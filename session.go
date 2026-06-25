@@ -204,7 +204,7 @@ func (s *Session) execute(ctx context.Context, mode AccessMode, fn func(tx *Tx) 
 		if err != nil {
 			return nil, err
 		}
-		defer tx.Rollback()
+		defer func() { _ = tx.Rollback() }()
 		return fn(tx)
 	}
 
@@ -214,7 +214,7 @@ func (s *Session) execute(ctx context.Context, mode AccessMode, fn func(tx *Tx) 
 		if err != nil {
 			return err
 		}
-		defer tx.Rollback()
+		defer func() { _ = tx.Rollback() }()
 		v, err := fn(tx)
 		if err != nil {
 			return err

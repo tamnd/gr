@@ -140,7 +140,7 @@ func (opt exportOptions) newDelimited(w io.Writer) *delimited {
 // count and a noun for the summary (doc 17 §6.11, §7.3). The read runs under one
 // snapshot so the export is internally consistent.
 func runExport(db *gr.DB, opt exportOptions, stdout io.Writer) (int, string, error) {
-	var w io.Writer = stdout
+	var w = stdout
 	var out *os.File
 	if opt.to != "-" {
 		f, err := os.Create(opt.to)

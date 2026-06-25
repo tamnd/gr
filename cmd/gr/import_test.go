@@ -238,15 +238,15 @@ func TestImportArgs(t *testing.T) {
 	pq := writeCSV(t, dir, "data.parquet", "x")
 
 	cases := [][]string{
-		{"import", db, csv},                                                       // no --as
-		{"import", db, "--as", "Person"},                                         // no file
-		{"import", db, csv, "--as", "Person", "--merge"},                         // --merge without --id-col
-		{"import", db, pq, "--as", "Movie"},                                      // parquet not supported
-		{"import", db, csv, "--as", "Person", "--bogus"},                         // unknown flag
-		{"import", db, csv, "--as-rel", "KNOWS"},                                 // rel without --from/--to
-		{"import", db, csv, "--from", "P:a", "--to", "P:b"},                      // endpoints without --as-rel
+		{"import", db, csv},                                                                   // no --as
+		{"import", db, "--as", "Person"},                                                      // no file
+		{"import", db, csv, "--as", "Person", "--merge"},                                      // --merge without --id-col
+		{"import", db, pq, "--as", "Movie"},                                                   // parquet not supported
+		{"import", db, csv, "--as", "Person", "--bogus"},                                      // unknown flag
+		{"import", db, csv, "--as-rel", "KNOWS"},                                              // rel without --from/--to
+		{"import", db, csv, "--from", "P:a", "--to", "P:b"},                                   // endpoints without --as-rel
 		{"import", db, csv, "--as", "P", "--as-rel", "KNOWS", "--from", "P:a", "--to", "P:b"}, // both node and rel
-		{"import", db, csv, "--as-rel", "KNOWS", "--from", "bad", "--to", "P:b"}, // --from missing LABEL:COL
+		{"import", db, csv, "--as-rel", "KNOWS", "--from", "bad", "--to", "P:b"},              // --from missing LABEL:COL
 	}
 	for i, args := range cases {
 		if _, _, code := runCLI(t, args, ""); code != exitUsage {

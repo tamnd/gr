@@ -69,11 +69,11 @@ type Finding struct {
 
 // CheckStats counts what the checker examined (doc 23 §8.2).
 type CheckStats struct {
-	PagesScanned  uint64
-	NodesVisited  uint64
-	EdgesVisited  uint64
+	PagesScanned   uint64
+	NodesVisited   uint64
+	EdgesVisited   uint64
 	IndexesChecked int
-	Duration      time.Duration
+	Duration       time.Duration
 }
 
 // CheckReport is the checker's output (doc 23 §8.2). An empty Findings slice means the

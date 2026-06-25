@@ -246,7 +246,7 @@ func TestDiskConcurrentNodeProperty(t *testing.T) {
 	e := openDisk(t, fsys, "concprop.gr")
 	defer e.Close()
 
-	const nkeys = 5    // k0..k3 fold into the base, k4 stays in the delta
+	const nkeys = 5 // k0..k3 fold into the base, k4 stays in the delta
 	const nnodes = 32
 	keys := make([]Token, nkeys)
 	for j := range keys {

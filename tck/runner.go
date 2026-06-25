@@ -23,9 +23,9 @@ const (
 
 // Outcome is the result of running one scenario.
 type Outcome struct {
-	Kind    OutcomeKind
-	Reason  string // for skip: the skip reason; for fail: the failure message
-	At      string // step or location where the failure occurred
+	Kind   OutcomeKind
+	Reason string // for skip: the skip reason; for fail: the failure message
+	At     string // step or location where the failure occurred
 }
 
 func (o Outcome) String() string {

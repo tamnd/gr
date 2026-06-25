@@ -14,7 +14,20 @@ import (
 	"github.com/tamnd/gr/vfs"
 )
 
-const version = "0.1.0"
+// Build metadata, stamped via -ldflags at release time. goreleaser targets
+// main.{version,commit,date}; an unstamped build (go build, go install) reports
+// the dev defaults.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+// versionString renders the one-line version banner shared by --version and the
+// .version shell command.
+func versionString() string {
+	return fmt.Sprintf("gr %s (commit %s, built %s)", version, commit, date)
+}
 
 // memPath is the synthetic path a transient in-memory database is opened under (doc
 // 17 §2.4). It is never written to a real filesystem; the in-memory VFS backs it.
@@ -63,7 +76,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return exitOK
 	}
 	if cfg.showVersion {
-		fmt.Fprintln(stdout, "gr", version)
+		fmt.Fprintln(stdout, versionString())
 		return exitOK
 	}
 

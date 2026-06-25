@@ -11,11 +11,11 @@ import (
 // recordingSpan is a test Span that captures the attributes and outcome set on it, so a
 // wiring test can assert what the query path put on the root gr.query span.
 type recordingSpan struct {
-	mu      sync.Mutex
-	name    string
-	strs    map[string]string
-	ints    map[string]int64
-	bools   map[string]bool
+	mu     sync.Mutex
+	name   string
+	strs   map[string]string
+	ints   map[string]int64
+	bools  map[string]bool
 	status string
 	ok     bool
 	ended  bool

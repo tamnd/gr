@@ -440,4 +440,3 @@ func wantAbsent(t *testing.T, e *DiskEngine, key uint32, pos uint64) {
 		t.Fatalf("seg get key %d pos %d: ok=%v err=%v, want absent", key, pos, ok, err)
 	}
 }
-

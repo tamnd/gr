@@ -797,9 +797,9 @@ func BuildAdj(p *pager.Pager, secs *store.Sections) (*Adj, error) {
 	}
 	return &Adj{
 		p: p, secs: secs, rels: nil, dir: dir,
-		delta:   map[uint32]map[uint64][]Neighbor{},
-		cache:   map[uint32]*base{},
-		degTail: map[uint32]map[uint64]int64{},
+		delta:    map[uint32]map[uint64][]Neighbor{},
+		cache:    map[uint32]*base{},
+		degTail:  map[uint32]map[uint64]int64{},
 		degStats: map[uint32]DegreeSummary{},
 	}, nil
 }

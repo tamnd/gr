@@ -178,8 +178,10 @@ func Decode(blob []byte) ([]Record, error) {
 	return out, nil
 }
 
-func appendBytes8(b, v []byte) []byte  { return append(append(b, byte(len(v))), v...) }
-func appendBytes16(b, v []byte) []byte { return append(binary.BigEndian.AppendUint16(b, uint16(len(v))), v...) }
+func appendBytes8(b, v []byte) []byte { return append(append(b, byte(len(v))), v...) }
+func appendBytes16(b, v []byte) []byte {
+	return append(binary.BigEndian.AppendUint16(b, uint16(len(v))), v...)
+}
 
 // reader is a bounds-checked cursor over a blob: any read past the end sets err and
 // returns zero, so Decode checks err once at the end rather than after every field.

@@ -66,17 +66,17 @@ func FuzzBoltMessage(f *testing.F) {
 // FuzzPackStream verifies that pack.Unmarshal never panics on arbitrary bytes.
 func FuzzPackStream(f *testing.F) {
 	seeds := [][]byte{
-		{0xC3},             // True
-		{0xC2},             // False
-		{0xC0},             // Null
-		{0x01},             // Tiny int 1
-		{0xFF},             // Tiny int -1
-		{0xC8, 0x7F},       // Int8 127
-		{0xC9, 0x00, 0x01}, // Int16 1
-		{0x81, 'a'},        // TinyString "a"
-		{0x91, 0x01},       // TinyList [1]
+		{0xC3},                  // True
+		{0xC2},                  // False
+		{0xC0},                  // Null
+		{0x01},                  // Tiny int 1
+		{0xFF},                  // Tiny int -1
+		{0xC8, 0x7F},            // Int8 127
+		{0xC9, 0x00, 0x01},      // Int16 1
+		{0x81, 'a'},             // TinyString "a"
+		{0x91, 0x01},            // TinyList [1]
 		{0xA1, 0x81, 'k', 0x01}, // TinyMap {"k":1}
-		{0xB1, 0x01, 0x01}, // TinyStruct tag=0x01 field=1
+		{0xB1, 0x01, 0x01},      // TinyStruct tag=0x01 field=1
 		{},
 		{0xFF, 0xFF, 0xFF, 0xFF},
 	}

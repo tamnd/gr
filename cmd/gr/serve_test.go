@@ -410,7 +410,9 @@ func TestServeBolt(t *testing.T) {
 // TestServeBoltAddr confirms --bolt-addr overrides the Bolt listen address.
 func TestServeBoltAddr(t *testing.T) {
 	var ln *bolt.Listener
-	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
+		return nil
+	}
 	var out, errw bytes.Buffer
 	code := runServe([]string{"--bolt", "--bolt-addr", "127.0.0.1:9100"}, &out, &errw, listen, captureBolt(&ln))
 	if code != exitOK {
@@ -451,7 +453,9 @@ func TestServeBoltAuth(t *testing.T) {
 func TestServeBoltTLS(t *testing.T) {
 	certPath, keyPath := writeTestCert(t)
 	var ln *bolt.Listener
-	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
+		return nil
+	}
 	var out, errw bytes.Buffer
 	args := []string{"--bolt", "--bolt-tls", "required", "--tls-cert", certPath, "--tls-key", keyPath}
 	code := runServe(args, &out, &errw, listen, captureBolt(&ln))
@@ -480,7 +484,9 @@ func TestServeBoltTLS(t *testing.T) {
 func TestServeBoltTLSOptional(t *testing.T) {
 	certPath, keyPath := writeTestCert(t)
 	var ln *bolt.Listener
-	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
+		return nil
+	}
 	var out, errw bytes.Buffer
 	args := []string{"--bolt", "--bolt-tls", "optional", "--tls-cert", certPath, "--tls-key", keyPath}
 	code := runServe(args, &out, &errw, listen, captureBolt(&ln))
@@ -497,7 +503,9 @@ func TestServeBoltTLSOptional(t *testing.T) {
 
 // TestServeBoltTLSMissingCert rejects an encrypted posture with no certificate material.
 func TestServeBoltTLSMissingCert(t *testing.T) {
-	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
+		return nil
+	}
 	var out, errw bytes.Buffer
 	code := runServe([]string{"--bolt", "--bolt-tls", "required"}, &out, &errw, listen, captureBolt(new(*bolt.Listener)))
 	if code != exitUsage {
@@ -510,7 +518,9 @@ func TestServeBoltTLSMissingCert(t *testing.T) {
 
 // TestServeBoltTLSInvalidMode rejects an unknown posture.
 func TestServeBoltTLSInvalidMode(t *testing.T) {
-	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error { return nil }
+	listen := func(addr string, handler http.Handler, _ *tls.Config, _ func(net.Conn, http.ConnState)) error {
+		return nil
+	}
 	var out, errw bytes.Buffer
 	code := runServe([]string{"--bolt", "--bolt-tls", "maybe"}, &out, &errw, listen, captureBolt(new(*bolt.Listener)))
 	if code != exitUsage {

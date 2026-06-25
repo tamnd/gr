@@ -42,9 +42,9 @@ type NodeSource struct {
 
 // RelSource describes one relationship-set (doc 19 §5.3).
 type RelSource struct {
-	Type       string    // prefix relationship type (from --relationships=Type=...)
-	StartSpace string    // id space for :START_ID
-	EndSpace   string    // id space for :END_ID
+	Type       string // prefix relationship type (from --relationships=Type=...)
+	StartSpace string // id space for :START_ID
+	EndSpace   string // id space for :END_ID
 	Files      []string
 	Header     string
 	readers    []io.Reader

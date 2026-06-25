@@ -23,9 +23,11 @@ type NodeSource struct {
 	// IDSpace is the id space for the :ID column (from --nodes syntax or the
 	// header). Empty means the global space.
 	IDSpace string
-	// IDProperty, if non-empty, stores the input :ID as an indexed property of
-	// this name on each node (doc 19 §7.2), so post-load queries can look nodes
-	// up by input id.
+	// IDProperty, if non-empty, stores the input :ID as a queryable property of
+	// this name on each node (doc 19 §7.2), so post-load queries can read the
+	// input id back and match on it. The :ID is otherwise consumed into gr's
+	// internal element id and is not visible to a query. Declare an index on the
+	// property separately (CREATE INDEX) when a point lookup on it must be fast.
 	IDProperty string
 	// Files is the list of CSV (or Parquet) files for this set. The first file
 	// may be a header-only file (no data rows) when Header is empty; if Header

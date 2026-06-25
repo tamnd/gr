@@ -96,13 +96,14 @@ signs:
       - "--yes"
 
 sboms:
-  - artifacts: archive
+  - id: archive
+    artifacts: archive
+    documents:
+      - "${artifact}.sbom.cyclonedx.json"
     args:
       - "$artifact"
-      - "--file"
-      - "$sbom"
       - "--output"
-      - "cyclonedx-json"
+      - "cyclonedx-json=$document"
 
 release:
   github:

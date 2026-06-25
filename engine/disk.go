@@ -660,7 +660,13 @@ func (e *DiskEngine) Begin(write bool) (Tx, error) {
 		e.mu.Lock()
 	}
 	snap, read := e.oracle.Begin()
-	return &diskTx{e: e, write: write, snap: snap, readSeq: read}, nil
+	t := &diskTx{e: e, write: write, snap: snap, readSeq: read}
+	if !write {
+		// Bind the read-unlock closure once so rguard hands it back without
+		// allocating a fresh method value on every read SPI call (see diskTx.runlock).
+		t.runlock = e.mu.RUnlock
+	}
+	return t, nil
 }
 
 // Checkpoint folds the adjacency delta into the base CSR, makes everything
@@ -880,7 +886,20 @@ type diskTx struct {
 	snap    uint64
 	readSeq mvcc.Seq
 	pending []pendingPre
+
+	// runlock is this transaction's read-unlock closure, bound once at Begin so a
+	// read SPI call's rguard does not allocate a fresh RUnlock method value per
+	// call. A read query re-enters rguard once per element it touches, so a
+	// per-call allocation here was one heap object per scanned node or edge; a
+	// per-transaction closure makes it one per transaction. It is nil for a write
+	// transaction, which already holds the exclusive lock and needs no read guard.
+	runlock func()
 }
+
+// noUnlock is the read guard's no-op release for a write transaction, which holds
+// the exclusive lock for its whole life. It is a package-level value so taking it
+// never allocates.
+var noUnlock = func() {}
 
 // pendingPre is a captured pre-image awaiting publication at commit.
 type pendingPre struct {
@@ -893,10 +912,10 @@ type pendingPre struct {
 // exclusive lock is already held, so it is a no-op.
 func (t *diskTx) rguard() func() {
 	if t.write {
-		return func() {}
+		return noUnlock
 	}
 	t.e.mu.RLock()
-	return t.e.mu.RUnlock
+	return t.runlock
 }
 
 // --- token and id helpers ---

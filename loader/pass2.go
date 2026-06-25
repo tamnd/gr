@@ -40,7 +40,7 @@ func (l *Loader) pass2Source(srcIdx int, src NodeSource, fb *fileBuilder, arrDel
 	// buffered rows and the cached header instead of re-opening.
 	if len(src.readers) > 0 {
 		hdr := l.hdrBuf[srcIdx]
-		propCols := l.propColDescs(hdr)
+		propCols := l.propColDescs(hdr, src)
 		return l.pass2Buffered(srcIdx, hdr, src, propCols, fb, arrDelim)
 	}
 
@@ -54,7 +54,7 @@ func (l *Loader) pass2Source(srcIdx int, src NodeSource, fb *fileBuilder, arrDel
 		}
 	}()
 
-	propCols := l.propColDescs(hdr)
+	propCols := l.propColDescs(hdr, src)
 	for _, nf := range files {
 		if err := l.pass2File(nf.csv, nf.name, hdr, src, propCols, fb, arrDelim); err != nil {
 			return err
@@ -168,7 +168,10 @@ func (l *Loader) pass2File(
 
 // propColDescs builds the list of property column descriptors for a header.
 // Only columns with Role == RoleProperty and a non-empty name are included.
-func (l *Loader) propColDescs(hdr *NodeHeader) []propColDesc {
+// When src.IDProperty is set, the :ID column is appended as one more string
+// property under that name, so the input id survives the load as a queryable
+// value rather than being consumed into the internal element id alone.
+func (l *Loader) propColDescs(hdr *NodeHeader, src NodeSource) []propColDesc {
 	var out []propColDesc
 	for i, cd := range hdr.Cols {
 		if cd.Role != RoleProperty || cd.Name == "" {
@@ -185,6 +188,15 @@ func (l *Loader) propColDescs(hdr *NodeHeader) []propColDesc {
 			vtype:    vt,
 			pt:       cd.PropType,
 			isList:   cd.IsList,
+		})
+	}
+	if src.IDProperty != "" && hdr.IDCol >= 0 {
+		out = append(out, propColDesc{
+			colIdx:   hdr.IDCol,
+			keyToken: l.catalog.PropKeyToken(src.IDProperty),
+			vtype:    propTypeToValueType(PropString),
+			pt:       PropString,
+			isList:   false,
 		})
 	}
 	return out

@@ -171,6 +171,42 @@ func TestPass2SingleGroupProps(t *testing.T) {
 	checkInt(2, 42)
 }
 
+func TestPass2IDProperty(t *testing.T) {
+	// The :ID column is consumed into the internal element id. With IDProperty
+	// set, the loader also keeps the input id as a string property so a post-load
+	// query can find the node by its input id.
+	nodeCSV := ":ID(p),name:string,:LABEL\np1,Ada,Person\np2,Bob,Person\n"
+
+	l := New(Options{
+		Nodes: []NodeSource{
+			{readers: []io.Reader{strings.NewReader(nodeCSV)}, IDProperty: "id"},
+		},
+	})
+	if err := l.Pass1ScanNodes(); err != nil {
+		t.Fatalf("pass1: %v", err)
+	}
+	fb, err := l.Pass2BuildNodeColumns(memFS(), "test.gr")
+	if err != nil {
+		t.Fatalf("pass2: %v", err)
+	}
+	defer fb.Close()
+
+	s := fb.nodeStore
+	idTok := uint32(l.catalog.PropKeyToken("id"))
+	want := []string{"p1", "p2"}
+	for pos, w := range want {
+		v, ok, err := s.Get(idTok, uint64(pos))
+		if err != nil || !ok {
+			t.Errorf("pos %d id: err=%v ok=%v", pos, err, ok)
+			continue
+		}
+		got, _ := v.AsString()
+		if got != w {
+			t.Errorf("pos %d id: got %q, want %q", pos, got, w)
+		}
+	}
+}
+
 func TestPass2TwoGroups(t *testing.T) {
 	// Person and Movie in separate sources.
 	personCSV := ":ID(p),name:string,:LABEL\np1,Alice,Person\np2,Bob,Person\n"

@@ -163,6 +163,12 @@ func (l *Loader) pass1Source(srcIdx int, src NodeSource) error {
 			l.catalog.PropKeyToken(cd.Name)
 		}
 	}
+	// When the source asks to keep the input :ID as a property, register that key
+	// too so pass 2 can write the id token under it and a post-load query can look
+	// the node up by its input id (doc 19 §7.2).
+	if src.IDProperty != "" {
+		l.catalog.PropKeyToken(src.IDProperty)
+	}
 	if src.Label != "" {
 		l.catalog.LabelToken(src.Label)
 	}

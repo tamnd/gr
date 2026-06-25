@@ -53,6 +53,15 @@ var scalarFuncs = map[string]scalarFunc{
 	"properties":    fnProperties,
 	"nodes":         fnNodes,
 	"relationships": fnRelationships,
+	// Native graph-algorithm surface (algo.go). Each reads the whole snapshot
+	// through the Env and returns a list of {id, <metric>} maps a query consumes
+	// with UNWIND. They are gr extensions, not openCypher functions.
+	"algo_bfs":      fnAlgoBFS,
+	"algo_sssp":     fnAlgoSSSP,
+	"algo_wcc":      fnAlgoWCC,
+	"algo_cdlp":     fnAlgoCDLP,
+	"algo_lcc":      fnAlgoLCC,
+	"algo_pagerank": fnAlgoPageRank,
 }
 
 // strFn lifts a string-to-string function into a scalar function with null

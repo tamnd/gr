@@ -51,20 +51,6 @@ func classifyError(err error) ErrorCategory {
 	return CatUnknown
 }
 
-// stepExpectsError reports whether the step text describes a "an error should
-// be raised" step in the TCK.
-func stepExpectsError(text string) bool {
-	return text == "a SyntaxError should be raised at compile time: InvalidArgumentType" ||
-		containsAny(text, []string{
-			"should be raised at",
-			"should fail with",
-			"an error should",
-			"a SyntaxError",
-			"a SemanticError",
-			"a TypeError",
-		})
-}
-
 // parseExpectedCategory extracts the expected TCK error category from a
 // "Then" step text like "a SyntaxError should be raised at compile time: ...".
 func parseExpectedCategory(text string) ErrorCategory {
@@ -92,17 +78,4 @@ func parseExpectedCategory(text string) ErrorCategory {
 
 func containsPrefix(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
-}
-
-func containsAny(s string, subs []string) bool {
-	for _, sub := range subs {
-		if len(s) >= len(sub) {
-			for i := 0; i <= len(s)-len(sub); i++ {
-				if s[i:i+len(sub)] == sub {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }

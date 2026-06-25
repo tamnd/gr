@@ -123,7 +123,7 @@ func TestEntityInterface(t *testing.T) {
 	r, _ := res.Record().GetRelationship("r")
 	_ = res.Close()
 
-	var entities []Entity = []Entity{n, r}
+	entities := []Entity{n, r}
 	for _, e := range entities {
 		if e.ElementId() == "" {
 			t.Errorf("entity %T has empty element id", e)

@@ -350,7 +350,7 @@ func (o *optionalOp) next() (eval.Row, bool, error) {
 				o.matched = true
 				return mergeRows(o.cur, row), true, nil
 			}
-			o.inner.close()
+			_ = o.inner.close()
 			o.innerOpen = false
 			if !o.matched {
 				return o.padNulls(o.cur), true, nil
@@ -385,7 +385,7 @@ func (o *optionalOp) padNulls(outer eval.Row) eval.Row {
 
 func (o *optionalOp) close() error {
 	if o.innerOpen {
-		o.inner.close()
+		_ = o.inner.close()
 		o.innerOpen = false
 	}
 	return o.input.close()

@@ -140,7 +140,7 @@ func (db *DB) ViewContext(ctx context.Context, fn func(tx *Tx) error) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	return fn(tx)
 }
 
@@ -171,7 +171,7 @@ func (db *DB) UpdateContext(ctx context.Context, fn func(tx *Tx) error) error {
 		if err != nil {
 			return err
 		}
-		defer tx.Rollback()
+		defer func() { _ = tx.Rollback() }()
 		if err := fn(tx); err != nil {
 			return err
 		}

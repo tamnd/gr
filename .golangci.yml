@@ -1,0 +1,44 @@
+version: "2"
+
+# gr keeps the standard linter set: errcheck, govet, ineffassign, staticcheck,
+# unused. The gate is meant to catch real correctness and dead-code problems,
+# so we turn off staticcheck's optional "quickfix" (QF*) style refactors and
+# the conventional write-helper errchecks rather than rewriting clean code to
+# satisfy a nag.
+linters:
+  default: standard
+  settings:
+    staticcheck:
+      checks:
+        - all
+        - -QF1001 # apply De Morgan's law
+        - -QF1002 # tagged switch
+        - -QF1003 # tagged switch on comparisons
+        - -QF1005 # expand call to math.Pow
+        - -QF1007 # merge conditional assignment into declaration
+        - -QF1008 # omit embedded field from selector
+        # gr's public graph objects mirror the Neo4j driver surface, which
+        # spells the accessor elementId / ElementId. ST1003 wants ElementID;
+        # we keep the ecosystem name so Cypher users see the API they expect.
+        - -ST1003 # Id vs ID in identifier
+    errcheck:
+      # Writes to an in-memory buffer or an already-failed report path, and
+      # closing a network connection: a failure there has nothing to recover to.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (net.Conn).Close
+        - (net.Listener).Close
+  exclusions:
+    rules:
+      # Test helpers routinely ignore Close/Commit/Abort returns and keep a few
+      # fixtures around that a given build tag does not reach.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - unused
+
+formatters:
+  enable:
+    - gofmt

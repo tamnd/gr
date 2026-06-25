@@ -233,7 +233,7 @@ func (o *mergeOp) mergeRow(outer eval.Row) error {
 	for {
 		row, ok, err := o.match.next()
 		if err != nil {
-			o.match.close()
+			_ = o.match.close()
 			return err
 		}
 		if !ok {
@@ -242,12 +242,12 @@ func (o *mergeOp) mergeRow(outer eval.Row) error {
 		matched = true
 		merged := mergeRows(outer, row)
 		if err := applySetItems(o.ctx, o.spec.OnMatch, merged); err != nil {
-			o.match.close()
+			_ = o.match.close()
 			return err
 		}
 		o.out = append(o.out, merged)
 	}
-	o.match.close()
+	_ = o.match.close()
 	if matched {
 		return nil
 	}
@@ -349,7 +349,7 @@ func (o *foreachOp) runRow(outer eval.Row) error {
 	for {
 		_, ok, err := o.body.next()
 		if err != nil {
-			o.body.close()
+			_ = o.body.close()
 			return err
 		}
 		if !ok {

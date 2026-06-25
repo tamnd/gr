@@ -47,6 +47,15 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: go build ./...
+      - name: build (32-bit targets)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          CGO_ENABLED: "0"
+        # The release ships 386 and arm builds, where int is 32 bits. Build them
+        # here so a 32-bit-only overflow fails a PR instead of the release.
+        run: |
+          GOARCH=386 go build ./...
+          GOARCH=arm go build ./...
       - name: test
         run: go test -race -count=1 -coverprofile=coverage.out ./...
       - name: coverage summary

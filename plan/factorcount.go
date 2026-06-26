@@ -27,14 +27,128 @@ func FactorizeCount(o Op) Op {
 	if !ok {
 		return o
 	}
-	ec := factorizeAgg(agg)
-	if ec == nil {
-		return o
+	if ec := factorizeAgg(agg); ec != nil {
+		if pc := factorizeProduct(ec); pc != nil {
+			return pc
+		}
+		return ec
 	}
-	if pc := factorizeProduct(ec); pc != nil {
-		return pc
+	if ic := factorizeIntersect(agg); ic != nil {
+		return ic
 	}
-	return ec
+	return o
+}
+
+// factorizeIntersect returns the IntersectCount an Aggregate rewrites to, or nil when
+// the aggregate does not match: a single grouping-free, non-distinct count(*) over an
+// Intersect, the closing of a WCOJ triangle (doc 11 §7; doc 12 §5.2), possibly under a
+// chain of Filters carrying a post-closing constraint on the apex. Those guards make
+// the count of closings the intersection finds exactly the row count the
+// Intersect+Aggregate would have produced, so the tally stands in for the materialized
+// closings. The Intersect already carries the apex labels and the two legs the count
+// must respect, so the rewrite copies them across unchanged, and any peeled apex filter
+// rides along as the apex predicate the count evaluates once per closing apex.
+func factorizeIntersect(agg *Aggregate) *IntersectCount {
+	if len(agg.GroupKeys) != 0 || len(agg.Aggs) != 1 || agg.Distinct {
+		return nil
+	}
+	col := agg.Aggs[0]
+	if !isCountStar(col.Expr) {
+		return nil
+	}
+	// A Filter can sit between the count and the Intersect: the post-closing
+	// constraint on the apex, the undirected triangle's `id(b) < id(c)` ordering that
+	// counts each triangle once. Peel the whole chain (the optimizer may leave more
+	// than one) and carry the conjunction as the apex predicate, evaluated per apex
+	// the legs share instead of by building a row to filter.
+	cur := agg.Input
+	var apex ast.Expr
+	for {
+		f, ok := cur.(*Filter)
+		if !ok {
+			break
+		}
+		apex = andPred(apex, f.Pred)
+		cur = f.Input
+	}
+	in, ok := cur.(*Intersect)
+	if !ok {
+		return nil
+	}
+	// Absorbing the apex predicate into the per-apex count is sound only when its
+	// truth is constant across that apex's edge pairs, so it must not read either
+	// leg's relationship variable, whose value differs per closing edge. A predicate
+	// that does is left as a Filter over the materialized Intersect (no factorization).
+	if apex != nil && readsLegRel(apex, in) {
+		return nil
+	}
+	return &IntersectCount{
+		Input:    in.Input,
+		Var:      in.Var,
+		Labels:   in.Labels,
+		Legs:     in.Legs,
+		Col:      col.Name,
+		ApexPred: apex,
+	}
+}
+
+// andPred conjoins two predicates, returning the second when the first is nil so a
+// chain of filters folds into one AND tree.
+func andPred(a, b ast.Expr) ast.Expr {
+	if a == nil {
+		return b
+	}
+	return &ast.Binary{Op: ast.OpAnd, L: a, R: b}
+}
+
+// readsLegRel reports whether a predicate references either of an Intersect's leg
+// relationship variables, the variables whose value varies per closing edge and so
+// would make a per-apex gate unsound.
+func readsLegRel(e ast.Expr, in *Intersect) bool {
+	vars := freeVars(e)
+	return vars[in.Legs[0].Rel] || vars[in.Legs[1].Rel]
+}
+
+// FuseTriangleAnchor recognizes the IntersectCount shape the fused triangle count
+// drives directly through the engine SPI, returning the anchor scan, the anchor
+// expand, and the predicate of any Filter that sat between the count's input and that
+// expand (the undirected triangle's `id(a) < id(b)` ordering on the anchor edge), or
+// nil for all three when the shape does not match.
+//
+// The shape is a plain single-hop Expand a->b (no variable length, no expand-into)
+// over a NodeScan of a, possibly under a chain of Filters, whose two closing legs
+// leave exactly the anchor's two variables. The anchor predicate is evaluated per
+// anchor edge with only the two endpoint nodes bound, so it must not read the anchor
+// relationship variable, whose value the fused operator never builds; a predicate
+// that does keeps the general path, where the Filter rides along in the input pipeline.
+func FuseTriangleAnchor(x *IntersectCount) (*NodeScan, *Expand, ast.Expr) {
+	cur := x.Input
+	var anchor ast.Expr
+	for {
+		f, ok := cur.(*Filter)
+		if !ok {
+			break
+		}
+		anchor = andPred(anchor, f.Pred)
+		cur = f.Input
+	}
+	ex, ok := cur.(*Expand)
+	if !ok || ex.VarLen != nil || ex.ToBound {
+		return nil, nil, nil
+	}
+	ns, ok := ex.Input.(*NodeScan)
+	if !ok || ns.Var != ex.From {
+		return nil, nil, nil
+	}
+	a, b := ex.From, ex.To
+	l0, l1 := x.Legs[0].From, x.Legs[1].From
+	if !((l0 == a && l1 == b) || (l0 == b && l1 == a)) {
+		return nil, nil, nil
+	}
+	if anchor != nil && freeVars(anchor)[ex.Rel] {
+		return nil, nil, nil
+	}
+	return ns, ex, anchor
 }
 
 // factorizeProduct turns an ExpandCount whose input is one or more further plain

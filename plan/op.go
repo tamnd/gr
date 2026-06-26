@@ -371,6 +371,44 @@ type ProductLeg struct {
 	Dir   ast.Direction
 }
 
+// IntersectCount is the factorized count of a triangle's closing intersection: the
+// count(*) analog of an Intersect the way ExpandCount is the count(*) analog of an
+// Expand (doc 11 §7; doc 12 §5.2). The naive plan for `MATCH (a)-[:R]->(b)-[:R]->(c)
+// -[:R]->(a) RETURN count(*)` runs the WCOJ Intersect to build one row per closed
+// triangle, then counts those rows; this counts the closings without building a
+// single row. Per input row it intersects the two legs' neighbor sets and tallies,
+// for each apex the legs share, the product of the two legs' per-apex edge degrees,
+// which is exactly the rows the Intersect would have emitted for that input row.
+//
+// The two legs leave different bound endpoints (the rewrite that produces an
+// Intersect guarantees Legs[0].From and Legs[1].From are distinct variables), so on
+// any row whose two source nodes differ the legs' edges are necessarily distinct
+// relationships and no relationship-uniqueness couples a leg-0 edge to a leg-1 edge;
+// the per-apex product is then the exact closing count. The rare row whose two
+// sources bind the same node (a self-loop reaching the pattern) is counted edge by
+// edge so an edge is never paired with itself, preserving the Intersect's meaning.
+//
+// Input is the rows binding the two endpoints, Var the apex the closings reach and
+// Labels the labels that apex must carry, Legs the two edges into the apex, and Col
+// the output column the count binds.
+//
+// ApexPred carries the predicate of any Filter that sat between the count and the
+// Intersect, the post-closing constraint on the apex (the undirected triangle's
+// `id(b) < id(c)` ordering, doc 12 §5.2). It is evaluated once per apex the two legs
+// share, gating that apex's whole closing count, which is sound only because the
+// predicate is a function of the bound nodes and the apex, never of the per-leg edges
+// (the rewrite refuses to absorb a Filter that reads a leg's relationship variable, so
+// its truth is constant across the apex's edge pairs). It is nil when no Filter sat
+// there, the plain count.
+type IntersectCount struct {
+	Input    Op
+	Var      string
+	Labels   []bind.NameRef
+	Legs     [2]IntersectLeg
+	Col      string
+	ApexPred ast.Expr
+}
+
 // Join combines two row streams. On lists the shared variable names the rows
 // must agree on; an empty On is a cartesian product.
 type Join struct {
@@ -427,32 +465,33 @@ type Union struct {
 	All         bool
 }
 
-func (*Unit) op()          {}
-func (*Create) op()        {}
-func (*Merge) op()         {}
-func (*Foreach) op()       {}
-func (*Set) op()           {}
-func (*Remove) op()        {}
-func (*Delete) op()        {}
-func (*Argument) op()      {}
-func (*NodeScan) op()      {}
-func (*NodeIndexSeek) op() {}
-func (*Expand) op()        {}
-func (*Intersect) op()     {}
-func (*Filter) op()        {}
-func (*BindPath) op()      {}
-func (*ShortestPath) op()  {}
-func (*Project) op()       {}
-func (*Aggregate) op()     {}
-func (*ExpandCount) op()   {}
-func (*ProductCount) op()  {}
-func (*Join) op()          {}
-func (*Optional) op()      {}
-func (*Unwind) op()        {}
-func (*Sort) op()          {}
-func (*Skip) op()          {}
-func (*Limit) op()         {}
-func (*Union) op()         {}
+func (*Unit) op()           {}
+func (*Create) op()         {}
+func (*Merge) op()          {}
+func (*Foreach) op()        {}
+func (*Set) op()            {}
+func (*Remove) op()         {}
+func (*Delete) op()         {}
+func (*Argument) op()       {}
+func (*NodeScan) op()       {}
+func (*NodeIndexSeek) op()  {}
+func (*Expand) op()         {}
+func (*Intersect) op()      {}
+func (*Filter) op()         {}
+func (*BindPath) op()       {}
+func (*ShortestPath) op()   {}
+func (*Project) op()        {}
+func (*Aggregate) op()      {}
+func (*ExpandCount) op()    {}
+func (*ProductCount) op()   {}
+func (*IntersectCount) op() {}
+func (*Join) op()           {}
+func (*Optional) op()       {}
+func (*Unwind) op()         {}
+func (*Sort) op()           {}
+func (*Skip) op()           {}
+func (*Limit) op()          {}
+func (*Union) op()          {}
 
 // outputVars returns the set of variable names an operator's rows carry. It is
 // the basis for predicate pushdown (a filter can move below an operator only if
@@ -646,6 +685,8 @@ func nodeLabel(o Op) string {
 		return "ExpandCount " + x.Col + " = count " + expandCountLabel(x)
 	case *ProductCount:
 		return "ProductCount " + x.Col + " = count " + productCountLabel(x)
+	case *IntersectCount:
+		return "IntersectCount " + x.Col + " = count " + intersectCountLabel(x)
 	case *Join:
 		return "Join on[" + strings.Join(x.On, ",") + "]"
 	case *Optional:
@@ -707,6 +748,8 @@ func nodeChildren(o Op) []Op {
 	case *ExpandCount:
 		return []Op{x.Input}
 	case *ProductCount:
+		return []Op{x.Input}
+	case *IntersectCount:
 		return []Op{x.Input}
 	case *Join:
 		return []Op{x.Left, x.Right}
@@ -822,6 +865,18 @@ func typeSuffixTrim(types []bind.NameRef) string {
 // each leg shows the direction from the bound endpoint toward the apex.
 func intersectLabel(x *Intersect) string {
 	return x.Var + labelSuffix(x.Labels) + " <= " + legLabel(x.Legs[0]) + " & " + legLabel(x.Legs[1])
+}
+
+// intersectCountLabel renders an IntersectCount the way intersectLabel renders the
+// Intersect it replaced, minus the apex variable it never binds: the apex labels and
+// the two legs that reach it, so a factorized triangle count reads as the
+// intersection it counts without naming a closing row it never builds.
+func intersectCountLabel(x *IntersectCount) string {
+	s := labelSuffix(x.Labels) + " <= " + legLabel(x.Legs[0]) + " & " + legLabel(x.Legs[1])
+	if x.ApexPred != nil {
+		s += " where " + ast.Print(x.ApexPred)
+	}
+	return s
 }
 
 func legLabel(l IntersectLeg) string {

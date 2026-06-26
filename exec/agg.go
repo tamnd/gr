@@ -41,6 +41,18 @@ var aggNames = map[string]bool{
 }
 
 func (o *aggregateOp) open(ctx *Ctx) error {
+	if err := o.prepare(ctx); err != nil {
+		return err
+	}
+	return o.input.open(ctx)
+}
+
+// prepare wires the aggregate's run-time state: it rewrites each output column,
+// hoisting every maximal aggregate call into a synthetic binding (filling o.calls),
+// and rejects the statistical aggregates that are recognized but not yet computed.
+// It is the part of open that does not touch the input operator, so the fused
+// scan-aggregate path (scanAggregateOp) can reuse it without an input to open.
+func (o *aggregateOp) prepare(ctx *Ctx) error {
 	o.ctx, o.out, o.pos, o.done = ctx, nil, 0, false
 	o.calls = nil
 	idx := map[*ast.FunctionCall]string{}
@@ -54,7 +66,7 @@ func (o *aggregateOp) open(ctx *Ctx) error {
 			return fmt.Errorf("exec: aggregate %s is not yet supported", call.Name)
 		}
 	}
-	return o.input.open(ctx)
+	return nil
 }
 
 // group is one group's running state: a representative input row (so non-aggregate

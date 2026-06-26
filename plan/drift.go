@@ -65,6 +65,10 @@ func collectStats(o Op, st Statistics, snap *StatsSnapshot) {
 		recordTypes(x.Legs[0].Types, st, snap)
 		recordTypes(x.Legs[1].Types, st, snap)
 		recordLabels(x.Labels, st, snap)
+	case *IntersectCount:
+		recordTypes(x.Legs[0].Types, st, snap)
+		recordTypes(x.Legs[1].Types, st, snap)
+		recordLabels(x.Labels, st, snap)
 	case *ShortestPath:
 		recordTypes(x.Types, st, snap)
 	}

@@ -27,14 +27,44 @@ func FactorizeCount(o Op) Op {
 	if !ok {
 		return o
 	}
-	ec := factorizeAgg(agg)
-	if ec == nil {
-		return o
+	if ec := factorizeAgg(agg); ec != nil {
+		if pc := factorizeProduct(ec); pc != nil {
+			return pc
+		}
+		return ec
 	}
-	if pc := factorizeProduct(ec); pc != nil {
-		return pc
+	if ic := factorizeIntersect(agg); ic != nil {
+		return ic
 	}
-	return ec
+	return o
+}
+
+// factorizeIntersect returns the IntersectCount an Aggregate rewrites to, or nil when
+// the aggregate does not match: a single grouping-free, non-distinct count(*) whose
+// direct input is an Intersect, the closing of a WCOJ triangle (doc 11 §7; doc 12
+// §5.2). Those guards make the count of closings the intersection finds exactly the
+// row count the Intersect+Aggregate would have produced, so the tally stands in for
+// the materialized closings. The Intersect already carries the apex labels and the
+// two legs the count must respect, so the rewrite copies them across unchanged.
+func factorizeIntersect(agg *Aggregate) *IntersectCount {
+	if len(agg.GroupKeys) != 0 || len(agg.Aggs) != 1 || agg.Distinct {
+		return nil
+	}
+	col := agg.Aggs[0]
+	if !isCountStar(col.Expr) {
+		return nil
+	}
+	in, ok := agg.Input.(*Intersect)
+	if !ok {
+		return nil
+	}
+	return &IntersectCount{
+		Input:  in.Input,
+		Var:    in.Var,
+		Labels: in.Labels,
+		Legs:   in.Legs,
+		Col:    col.Name,
+	}
 }
 
 // factorizeProduct turns an ExpandCount whose input is one or more further plain

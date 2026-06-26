@@ -316,6 +316,8 @@ func Columns(root plan.Op) []string {
 		return []string{x.Col}
 	case *plan.ProductCount:
 		return []string{x.Col}
+	case *plan.IntersectCount:
+		return []string{x.Col}
 	case *plan.Sort:
 		return Columns(x.Input)
 	case *plan.Skip:
@@ -524,6 +526,17 @@ func (c *compiler) compileRelInner(o plan.Op, peers []string) (operator, []strin
 			return nil, nil, err
 		}
 		return &expandCountOp{spec: x, input: input, peers: inPeers}, nil, nil
+	case *plan.IntersectCount:
+		// The count stands in for an Aggregate over an Intersect, so its input is
+		// compiled in a fresh pattern scope (peers nil), exactly as the aggregate
+		// compiled the intersection's input. The rel-variable names that input binds are
+		// the peers each counted leg edge must stay distinct from, the same sibling set
+		// the replaced Intersect's legs carried.
+		input, inPeers, err := c.compileRel(x.Input, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &intersectCountOp{spec: x, input: input, peers: inPeers}, nil, nil
 	case *plan.ProductCount:
 		// The product folds in only over an input that binds no relationship (the
 		// rewrite's guard), so there are no peers to thread and the input compiles in

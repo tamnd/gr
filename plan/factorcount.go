@@ -109,19 +109,23 @@ func readsLegRel(e ast.Expr, in *Intersect) bool {
 	return vars[in.Legs[0].Rel] || vars[in.Legs[1].Rel]
 }
 
-// FuseTriangleAnchor recognizes the IntersectCount shape the fused triangle count
-// drives directly through the engine SPI, returning the anchor scan, the anchor
-// expand, and the predicate of any Filter that sat between the count's input and that
-// expand (the undirected triangle's `id(a) < id(b)` ordering on the anchor edge), or
-// nil for all three when the shape does not match.
+// FusePolygonAnchor recognizes the IntersectCount shape the fused cyclic count drives
+// directly through the engine SPI, returning the anchor scan, the anchor expand chain
+// in scan-to-apex order, and the predicate of any Filter that sat between the count's
+// input and that chain (the undirected triangle's `id(a) < id(b)` ordering), or nil for
+// the scan when the shape does not match.
 //
-// The shape is a plain single-hop Expand a->b (no variable length, no expand-into)
-// over a NodeScan of a, possibly under a chain of Filters, whose two closing legs
-// leave exactly the anchor's two variables. The anchor predicate is evaluated per
-// anchor edge with only the two endpoint nodes bound, so it must not read the anchor
-// relationship variable, whose value the fused operator never builds; a predicate
-// that does keeps the general path, where the Filter rides along in the input pipeline.
-func FuseTriangleAnchor(x *IntersectCount) (*NodeScan, *Expand, ast.Expr) {
+// The shape is a simple path of plain Expands (no variable length, no expand-into) over
+// a NodeScan, possibly under a chain of Filters, whose two closing legs leave exactly
+// the path's two ends, the scan root and the last hop's target. The triangle is the one
+// hop case (anchor a->b, legs from a and b); the directed four-cycle is the two hop case
+// (anchor a->b->c, legs from a and c closing at the apex d). The middle nodes of a longer
+// path are pure structure, neither closing leg leaves them, so the fused operator binds
+// them only to walk through. The anchor predicate is evaluated with the path nodes bound
+// but no relationship the operator never builds, so it must not read any hop's
+// relationship variable; one that does keeps the general path, the Filter riding along in
+// the input pipeline.
+func FusePolygonAnchor(x *IntersectCount) (*NodeScan, []*Expand, ast.Expr) {
 	cur := x.Input
 	var anchor ast.Expr
 	for {
@@ -132,23 +136,50 @@ func FuseTriangleAnchor(x *IntersectCount) (*NodeScan, *Expand, ast.Expr) {
 		anchor = andPred(anchor, f.Pred)
 		cur = f.Input
 	}
-	ex, ok := cur.(*Expand)
-	if !ok || ex.VarLen != nil || ex.ToBound {
+	// Walk the Expand chain from the apex end down to the scan, collecting hops in
+	// reverse, then flip them into scan-to-apex order. Each hop must be plain and chain
+	// onto the one below it (its From is the previous hop's To), so the bound path is a
+	// simple a -> b -> c -> ... walk.
+	var rev []*Expand
+	for {
+		ex, ok := cur.(*Expand)
+		if !ok || ex.VarLen != nil || ex.ToBound {
+			break
+		}
+		if n := len(rev); n > 0 && rev[n-1].From != ex.To {
+			return nil, nil, nil
+		}
+		rev = append(rev, ex)
+		cur = ex.Input
+	}
+	ns, ok := cur.(*NodeScan)
+	if !ok || len(rev) == 0 {
 		return nil, nil, nil
 	}
-	ns, ok := ex.Input.(*NodeScan)
-	if !ok || ns.Var != ex.From {
+	hops := make([]*Expand, len(rev))
+	for i, ex := range rev {
+		hops[len(rev)-1-i] = ex
+	}
+	if ns.Var != hops[0].From {
 		return nil, nil, nil
 	}
-	a, b := ex.From, ex.To
+	// The two closing legs must leave exactly the path's two ends: the scan root and the
+	// last hop's target. A leg leaving a middle node is a different join shape the fused
+	// path does not handle.
+	root, apex := hops[0].From, hops[len(hops)-1].To
 	l0, l1 := x.Legs[0].From, x.Legs[1].From
-	if !((l0 == a && l1 == b) || (l0 == b && l1 == a)) {
+	if !((l0 == root && l1 == apex) || (l0 == apex && l1 == root)) {
 		return nil, nil, nil
 	}
-	if anchor != nil && freeVars(anchor)[ex.Rel] {
-		return nil, nil, nil
+	if anchor != nil {
+		vars := freeVars(anchor)
+		for _, ex := range hops {
+			if vars[ex.Rel] {
+				return nil, nil, nil
+			}
+		}
 	}
-	return ns, ex, anchor
+	return ns, hops, anchor
 }
 
 // factorizeProduct turns an ExpandCount whose input is one or more further plain

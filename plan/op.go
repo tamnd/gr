@@ -391,12 +391,22 @@ type ProductLeg struct {
 // Input is the rows binding the two endpoints, Var the apex the closings reach and
 // Labels the labels that apex must carry, Legs the two edges into the apex, and Col
 // the output column the count binds.
+//
+// ApexPred carries the predicate of any Filter that sat between the count and the
+// Intersect, the post-closing constraint on the apex (the undirected triangle's
+// `id(b) < id(c)` ordering, doc 12 §5.2). It is evaluated once per apex the two legs
+// share, gating that apex's whole closing count, which is sound only because the
+// predicate is a function of the bound nodes and the apex, never of the per-leg edges
+// (the rewrite refuses to absorb a Filter that reads a leg's relationship variable, so
+// its truth is constant across the apex's edge pairs). It is nil when no Filter sat
+// there, the plain count.
 type IntersectCount struct {
-	Input  Op
-	Var    string
-	Labels []bind.NameRef
-	Legs   [2]IntersectLeg
-	Col    string
+	Input    Op
+	Var      string
+	Labels   []bind.NameRef
+	Legs     [2]IntersectLeg
+	Col      string
+	ApexPred ast.Expr
 }
 
 // Join combines two row streams. On lists the shared variable names the rows
@@ -862,7 +872,11 @@ func intersectLabel(x *Intersect) string {
 // the two legs that reach it, so a factorized triangle count reads as the
 // intersection it counts without naming a closing row it never builds.
 func intersectCountLabel(x *IntersectCount) string {
-	return labelSuffix(x.Labels) + " <= " + legLabel(x.Legs[0]) + " & " + legLabel(x.Legs[1])
+	s := labelSuffix(x.Labels) + " <= " + legLabel(x.Legs[0]) + " & " + legLabel(x.Legs[1])
+	if x.ApexPred != nil {
+		s += " where " + ast.Print(x.ApexPred)
+	}
+	return s
 }
 
 func legLabel(l IntersectLeg) string {

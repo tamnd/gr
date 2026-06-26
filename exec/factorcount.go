@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"github.com/tamnd/gr/ast"
 	"github.com/tamnd/gr/engine"
 	"github.com/tamnd/gr/eval"
 	"github.com/tamnd/gr/plan"
@@ -243,6 +244,8 @@ type intersectCountOp struct {
 
 	leg  [2]intersectLeg
 	seen map[engine.NodeID]int64 // reusable: apex node -> peer-unique leg-0 edge count
+
+	apex *eval.Env // reusable env for the apex predicate, nil when there is none
 }
 
 func (o *intersectCountOp) open(ctx *Ctx) error {
@@ -254,7 +257,31 @@ func (o *intersectCountOp) open(ctx *Ctx) error {
 	if o.seen == nil {
 		o.seen = map[engine.NodeID]int64{}
 	}
+	if o.spec.ApexPred != nil {
+		o.apex = ctx.env(nil)
+	}
 	return o.input.open(ctx)
+}
+
+// apexOK evaluates the apex predicate, the ordering filter that sat above the
+// Intersect (the undirected triangle's `id(b) < id(c)`), with the input row's bound
+// nodes and the apex bound to the intersection variable. It returns true when there
+// is no such predicate. The predicate is a function of the bound nodes and the apex,
+// never a leg's per-closing relationship (the rewrite refuses one that reads a leg
+// rel), so it is constant across the apex's closing edges, gating the whole per-apex
+// count. The env and its row are reused, so the test allocates nothing once warm.
+func (o *intersectCountOp) apexOK(apex engine.NodeID) (bool, error) {
+	if o.apex == nil {
+		return true, nil
+	}
+	o.cur[o.spec.Var] = value.Node(uint64(apex))
+	o.apex.Row = o.cur
+	v, err := eval.Eval(o.spec.ApexPred, o.apex)
+	if err != nil {
+		return false, err
+	}
+	b, ok := v.AsBool()
+	return ok && b, nil
 }
 
 func (o *intersectCountOp) next() (eval.Row, bool, error) {
@@ -333,6 +360,10 @@ func (o *intersectCountOp) countRow(in eval.Row) (int64, error) {
 		if err != nil || !ok {
 			return err
 		}
+		ok, err = o.apexOK(nb.Node)
+		if err != nil || !ok {
+			return err
+		}
 		n += c
 		return nil
 	})
@@ -368,6 +399,10 @@ func (o *intersectCountOp) countSameSource(src engine.NodeID) (int64, error) {
 			return nil
 		}
 		ok, err := o.hasLabels(nb.Node)
+		if err != nil || !ok {
+			return err
+		}
+		ok, err = o.apexOK(nb.Node)
 		if err != nil || !ok {
 			return err
 		}
@@ -415,28 +450,32 @@ func (o *intersectCountOp) hasLabels(id engine.NodeID) (bool, error) {
 func (o *intersectCountOp) close() error { return o.input.close() }
 
 // fusedIntersectCountOp counts WCOJ triangles without materializing a single edge
-// row. It stands in for an IntersectCount whose input is exactly an Expand a->b over
-// a NodeScan a, the anchor enumeration of a closed triangle. The general
-// intersectCountOp pulls that input through the Volcano pipeline, which builds one
-// eval.Row (a Go map) per anchor edge only to read its two endpoints back out; the
-// profile showed that per-edge map dominated the triangle's CPU and drove its GC.
-// This operator drives the anchor scan of a and the a->b expand inline through the
-// engine SPI and counts each anchor edge's closings directly, so no anchor row is
-// ever built. It is the textbook zero-materialization triangle count: scan a, expand
-// to b, intersect the two closing legs, tally.
+// row. It stands in for an IntersectCount whose input is an Expand a->b over a
+// NodeScan a, the anchor enumeration of a closed triangle, optionally under an anchor
+// filter (the undirected triangle's id(a) < id(b)). The general intersectCountOp pulls
+// that input through the Volcano pipeline, which builds one eval.Row (a Go map) per
+// anchor edge only to read its two endpoints back out; the profile showed that
+// per-edge map dominated the triangle's CPU and drove its GC. This operator drives the
+// anchor scan of a and the a->b expand inline through the engine SPI and counts each
+// anchor edge's closings directly, so no anchor row is ever built. It is the textbook
+// zero-materialization triangle count: scan a, expand to b, intersect the two closing
+// legs, tally.
 //
 // For each anchor edge (a,b) it intersects the two legs exactly as intersectCountOp
 // does, reusing one apex map across every anchor, so once warm the whole traversal
 // allocates nothing. The single anchor relationship r0 is the only edge a counted leg
 // must differ from (the input binds no other), so relationship-uniqueness is a plain
-// r != r0 test rather than a peer-set walk. Like a grouping-free aggregate it emits
-// exactly one row.
+// r != r0 test rather than a peer-set walk. When the rewrite pushed an ordering filter
+// down, the anchor predicate gates each anchor edge and the apex predicate gates each
+// closing apex, both evaluated against a reused row so the gate stays allocation-free.
+// Like a grouping-free aggregate it emits exactly one row.
 type fusedIntersectCountOp struct {
-	spec *plan.IntersectCount
-	ex   *plan.Expand   // the fused anchor expand a->b, which binds r0
-	ns   *plan.NodeScan // the fused anchor scan of a
-	ctx  *Ctx
-	done bool
+	spec   *plan.IntersectCount
+	ex     *plan.Expand   // the fused anchor expand a->b, which binds r0
+	ns     *plan.NodeScan // the fused anchor scan of a
+	anchor ast.Expr       // predicate on the anchor edge (id(a) < id(b)), or nil
+	ctx    *Ctx
+	done   bool
 
 	scanTok  engine.Token   // a's primary label, or 0 for an unlabeled scan
 	scanRest []engine.Token // a's additional labels, filtered per scanned node
@@ -451,6 +490,9 @@ type fusedIntersectCountOp struct {
 
 	leg  [2]intersectLeg
 	seen map[engine.NodeID]int64 // reusable: apex node -> peer-unique leg-0 edge count
+
+	erow eval.Row  // reusable row binding a, b, and the apex for the two predicates
+	eenv *eval.Env // reusable env over erow, nil when neither predicate is present
 }
 
 func (o *fusedIntersectCountOp) open(ctx *Ctx) error {
@@ -480,7 +522,49 @@ func (o *fusedIntersectCountOp) open(ctx *Ctx) error {
 	if o.seen == nil {
 		o.seen = map[engine.NodeID]int64{}
 	}
+	if o.anchor != nil || o.spec.ApexPred != nil {
+		o.erow = eval.Row{}
+		o.eenv = ctx.env(o.erow)
+	}
 	return nil
+}
+
+// anchorOK evaluates the anchor predicate (the undirected triangle's `id(a) < id(b)`)
+// for one anchor edge, binding a and b in the reusable row. It returns true when there
+// is no anchor predicate. The predicate reads only the two endpoint nodes (the fusion
+// guard refuses one that reads the anchor relationship), so binding the two ids is
+// enough and the row and env are reused, allocating nothing once warm.
+func (o *fusedIntersectCountOp) anchorOK(a, b engine.NodeID) (bool, error) {
+	if o.anchor == nil {
+		return true, nil
+	}
+	o.erow[o.ex.From] = value.Node(uint64(a))
+	o.erow[o.ex.To] = value.Node(uint64(b))
+	v, err := eval.Eval(o.anchor, o.eenv)
+	if err != nil {
+		return false, err
+	}
+	b2, ok := v.AsBool()
+	return ok && b2, nil
+}
+
+// apexOK evaluates the apex predicate (the undirected triangle's `id(b) < id(c)`) for
+// one closing apex, binding b and the apex in the reusable row. It returns true when
+// there is no apex predicate. The predicate is constant across the apex's closing
+// edges (it never reads a leg relationship), so it gates the whole per-apex count.
+func (o *fusedIntersectCountOp) apexOK(a, b, apex engine.NodeID) (bool, error) {
+	if o.spec.ApexPred == nil {
+		return true, nil
+	}
+	o.erow[o.ex.From] = value.Node(uint64(a))
+	o.erow[o.ex.To] = value.Node(uint64(b))
+	o.erow[o.spec.Var] = value.Node(uint64(apex))
+	v, err := eval.Eval(o.spec.ApexPred, o.eenv)
+	if err != nil {
+		return false, err
+	}
+	b2, ok := v.AsBool()
+	return ok && b2, nil
 }
 
 func (o *fusedIntersectCountOp) next() (eval.Row, bool, error) {
@@ -502,6 +586,10 @@ func (o *fusedIntersectCountOp) next() (eval.Row, bool, error) {
 					return nil
 				}
 				ok, err := o.hasToLabels(nb.Node)
+				if err != nil || !ok {
+					return err
+				}
+				ok, err = o.anchorOK(a, nb.Node)
 				if err != nil || !ok {
 					return err
 				}
@@ -563,6 +651,10 @@ func (o *fusedIntersectCountOp) countAnchor(a, b engine.NodeID, r0 engine.RelID)
 		if err != nil || !ok {
 			return err
 		}
+		ok, err = o.apexOK(a, b, nb.Node)
+		if err != nil || !ok {
+			return err
+		}
 		n += c
 		return nil
 	})
@@ -597,6 +689,10 @@ func (o *fusedIntersectCountOp) countSame(src engine.NodeID, r0 engine.RelID) (i
 			return nil
 		}
 		ok, err := o.hasLabels(nb.Node)
+		if err != nil || !ok {
+			return err
+		}
+		ok, err = o.apexOK(src, src, nb.Node)
 		if err != nil || !ok {
 			return err
 		}
@@ -658,27 +754,3 @@ func (o *fusedIntersectCountOp) scanRestOK(id engine.NodeID) (bool, error) {
 }
 
 func (o *fusedIntersectCountOp) close() error { return nil }
-
-// fuseIntersectCount returns the anchor scan and expand an IntersectCount fuses into a
-// fusedIntersectCountOp, or nil when its input is not the shape the fused triangle
-// count drives directly: a plain single-hop Expand a->b (no variable length, no
-// expand-into) over a NodeScan of a, whose two closing legs leave exactly the anchor's
-// two variables. On that shape the fused operator can enumerate every anchor edge and
-// count its closings through the engine SPI without building an anchor row; any other
-// input keeps the general intersectCountOp, which pulls its input through the pipeline.
-func fuseIntersectCount(x *plan.IntersectCount) (*plan.NodeScan, *plan.Expand) {
-	ex, ok := x.Input.(*plan.Expand)
-	if !ok || ex.VarLen != nil || ex.ToBound {
-		return nil, nil
-	}
-	ns, ok := ex.Input.(*plan.NodeScan)
-	if !ok || ns.Var != ex.From {
-		return nil, nil
-	}
-	a, b := ex.From, ex.To
-	l0, l1 := x.Legs[0].From, x.Legs[1].From
-	if (l0 == a && l1 == b) || (l0 == b && l1 == a) {
-		return ns, ex
-	}
-	return nil, nil
-}

@@ -533,13 +533,15 @@ func (c *compiler) compileRelInner(o plan.Op, peers []string) (operator, []strin
 		// the peers each counted leg edge must stay distinct from, the same sibling set
 		// the replaced Intersect's legs carried.
 		//
-		// When that input is the bare Expand a->b over NodeScan a (the triangle's
-		// anchor enumeration), the count fuses onto the scan and expand, dropping the
-		// per-anchor-edge row the general path builds only to read its endpoints back
+		// When that input is the Expand a->b over NodeScan a (the triangle's anchor
+		// enumeration), optionally under an anchor filter such as the undirected
+		// triangle's id(a) < id(b), the count fuses onto the scan and expand, dropping
+		// the per-anchor-edge row the general path builds only to read its endpoints back
 		// (see fusedIntersectCountOp). The scan and expand are not compiled as children:
-		// the fused operator drives them through the engine SPI itself.
-		if ns, ex := fuseIntersectCount(x); ns != nil {
-			return &fusedIntersectCountOp{spec: x, ex: ex, ns: ns}, nil, nil
+		// the fused operator drives them through the engine SPI itself and evaluates the
+		// anchor predicate per anchor edge in place of the peeled Filter.
+		if ns, ex, anchor := plan.FuseTriangleAnchor(x); ns != nil {
+			return &fusedIntersectCountOp{spec: x, ex: ex, ns: ns, anchor: anchor}, nil, nil
 		}
 		input, inPeers, err := c.compileRel(x.Input, nil)
 		if err != nil {

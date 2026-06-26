@@ -413,3 +413,272 @@ func (o *intersectCountOp) hasLabels(id engine.NodeID) (bool, error) {
 }
 
 func (o *intersectCountOp) close() error { return o.input.close() }
+
+// fusedIntersectCountOp counts WCOJ triangles without materializing a single edge
+// row. It stands in for an IntersectCount whose input is exactly an Expand a->b over
+// a NodeScan a, the anchor enumeration of a closed triangle. The general
+// intersectCountOp pulls that input through the Volcano pipeline, which builds one
+// eval.Row (a Go map) per anchor edge only to read its two endpoints back out; the
+// profile showed that per-edge map dominated the triangle's CPU and drove its GC.
+// This operator drives the anchor scan of a and the a->b expand inline through the
+// engine SPI and counts each anchor edge's closings directly, so no anchor row is
+// ever built. It is the textbook zero-materialization triangle count: scan a, expand
+// to b, intersect the two closing legs, tally.
+//
+// For each anchor edge (a,b) it intersects the two legs exactly as intersectCountOp
+// does, reusing one apex map across every anchor, so once warm the whole traversal
+// allocates nothing. The single anchor relationship r0 is the only edge a counted leg
+// must differ from (the input binds no other), so relationship-uniqueness is a plain
+// r != r0 test rather than a peer-set walk. Like a grouping-free aggregate it emits
+// exactly one row.
+type fusedIntersectCountOp struct {
+	spec *plan.IntersectCount
+	ex   *plan.Expand   // the fused anchor expand a->b, which binds r0
+	ns   *plan.NodeScan // the fused anchor scan of a
+	ctx  *Ctx
+	done bool
+
+	scanTok  engine.Token   // a's primary label, or 0 for an unlabeled scan
+	scanRest []engine.Token // a's additional labels, filtered per scanned node
+	scanNone bool           // an unknown label on a: the scan is empty
+
+	exTok   engine.Token          // the a->b type token, or 0 for all
+	exAllow map[engine.Token]bool // a->b post-filter type set when more than one type
+	exNone  bool                  // every named a->b type is unknown: no anchor edge
+	exDir   engine.Direction
+
+	legB int // index of the leg leaving b (the expand's To)
+
+	leg  [2]intersectLeg
+	seen map[engine.NodeID]int64 // reusable: apex node -> peer-unique leg-0 edge count
+}
+
+func (o *fusedIntersectCountOp) open(ctx *Ctx) error {
+	o.ctx, o.done = ctx, false
+	o.scanTok, o.scanRest, o.scanNone = 0, o.scanRest[:0], false
+	for i, l := range o.ns.Labels {
+		if !l.Known {
+			o.scanNone = true
+			break
+		}
+		if i == 0 {
+			o.scanTok = l.Token
+		} else {
+			o.scanRest = append(o.scanRest, l.Token)
+		}
+	}
+	o.exTok, o.exAllow, o.exNone = resolveTypes(o.ex.Types)
+	o.exDir = toEngineDir(o.ex.Dir)
+	for i := range o.spec.Legs {
+		tok, allow, none := resolveTypes(o.spec.Legs[i].Types)
+		o.leg[i] = intersectLeg{tok: tok, allow: allow, noType: none, dir: toEngineDir(o.spec.Legs[i].Dir)}
+	}
+	o.legB = 1
+	if o.spec.Legs[0].From == o.ex.To {
+		o.legB = 0
+	}
+	if o.seen == nil {
+		o.seen = map[engine.NodeID]int64{}
+	}
+	return nil
+}
+
+func (o *fusedIntersectCountOp) next() (eval.Row, bool, error) {
+	if o.done {
+		return nil, false, nil
+	}
+	o.done = true
+	var total int64
+	if !o.scanNone && !o.exNone && !o.leg[0].noType && !o.leg[1].noType {
+		err := o.ctx.Tx.ScanLabel(o.scanTok, func(a engine.NodeID) error {
+			o.ctx.countScan(1)
+			ok, err := o.scanRestOK(a)
+			if err != nil || !ok {
+				return err
+			}
+			return o.ctx.Tx.Expand(a, o.exTok, o.exDir, func(nb engine.Neighbor) error {
+				o.ctx.countScan(1)
+				if o.exAllow != nil && !o.exAllow[nb.Type] {
+					return nil
+				}
+				ok, err := o.hasToLabels(nb.Node)
+				if err != nil || !ok {
+					return err
+				}
+				n, err := o.countAnchor(a, nb.Node, nb.Rel)
+				if err != nil {
+					return err
+				}
+				total += n
+				return nil
+			})
+		})
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	o.ctx.countFactorized()
+	if total > 0 {
+		o.ctx.countFactorizationRatio(float64(total))
+	}
+	return eval.Row{o.spec.Col: value.Int(total)}, true, nil
+}
+
+// countAnchor counts the closings the anchor edge (a,b) with relationship r0
+// contributes. Each leg leaves a or b (legB says which leg leaves b), so it keys
+// leg-0's apexes into the reusable map then walks leg-1 adding the per-apex product,
+// the same intersection intersectCountOp performs, with the single anchor edge r0 as
+// the only relationship a counted leg must differ from. The rare self-loop anchor
+// (a == b) falls to an edge-aware count so an edge is never paired with itself.
+func (o *fusedIntersectCountOp) countAnchor(a, b engine.NodeID, r0 engine.RelID) (int64, error) {
+	from0, from1 := a, b
+	if o.legB == 0 {
+		from0, from1 = b, a
+	}
+	if from0 == from1 {
+		return o.countSame(from0, r0)
+	}
+	clear(o.seen)
+	err := o.ctx.Tx.Expand(from0, o.leg[0].tok, o.leg[0].dir, func(nb engine.Neighbor) error {
+		o.ctx.countScan(1)
+		if o.accept(0, nb) && nb.Rel != r0 {
+			o.seen[nb.Node]++
+		}
+		return nil
+	})
+	if err != nil || len(o.seen) == 0 {
+		return 0, err
+	}
+	var n int64
+	err = o.ctx.Tx.Expand(from1, o.leg[1].tok, o.leg[1].dir, func(nb engine.Neighbor) error {
+		o.ctx.countScan(1)
+		if !o.accept(1, nb) || nb.Rel == r0 {
+			return nil
+		}
+		c := o.seen[nb.Node]
+		if c == 0 {
+			return nil
+		}
+		ok, err := o.hasLabels(nb.Node)
+		if err != nil || !ok {
+			return err
+		}
+		n += c
+		return nil
+	})
+	return n, err
+}
+
+// countSame counts the closings of a self-loop anchor, where both legs leave the same
+// node and a single edge can satisfy both legs, so it must not be paired with itself
+// (nor with the anchor edge r0). It keeps each apex's leg-0 edge ids, then for every
+// leg-1 edge counts the distinct leg-0 edges to that apex. It allocates only on this
+// cold path, so the hot anchor stays allocation-free.
+func (o *fusedIntersectCountOp) countSame(src engine.NodeID, r0 engine.RelID) (int64, error) {
+	byApex := map[engine.NodeID][]engine.RelID{}
+	err := o.ctx.Tx.Expand(src, o.leg[0].tok, o.leg[0].dir, func(nb engine.Neighbor) error {
+		o.ctx.countScan(1)
+		if o.accept(0, nb) && nb.Rel != r0 {
+			byApex[nb.Node] = append(byApex[nb.Node], nb.Rel)
+		}
+		return nil
+	})
+	if err != nil || len(byApex) == 0 {
+		return 0, err
+	}
+	var n int64
+	err = o.ctx.Tx.Expand(src, o.leg[1].tok, o.leg[1].dir, func(nb engine.Neighbor) error {
+		o.ctx.countScan(1)
+		if !o.accept(1, nb) || nb.Rel == r0 {
+			return nil
+		}
+		rels := byApex[nb.Node]
+		if len(rels) == 0 {
+			return nil
+		}
+		ok, err := o.hasLabels(nb.Node)
+		if err != nil || !ok {
+			return err
+		}
+		for _, r := range rels {
+			if r != nb.Rel {
+				n++
+			}
+		}
+		return nil
+	})
+	return n, err
+}
+
+// accept applies a leg's multi-type post-filter, the same trim intersectOp does.
+func (o *fusedIntersectCountOp) accept(leg int, nb engine.Neighbor) bool {
+	return o.leg[leg].allow == nil || o.leg[leg].allow[nb.Type]
+}
+
+// hasLabels reports whether the apex carries every label the pattern required of it,
+// the same constraint the Intersect's emit applied before binding the apex.
+func (o *fusedIntersectCountOp) hasLabels(id engine.NodeID) (bool, error) {
+	for _, l := range o.spec.Labels {
+		if !l.Known {
+			return false, nil
+		}
+		has, err := o.ctx.Tx.HasLabel(id, l.Token)
+		if err != nil || !has {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// hasToLabels reports whether b carries every label the anchor expand required of its
+// target, the same constraint the fused Expand would have applied before binding b.
+func (o *fusedIntersectCountOp) hasToLabels(id engine.NodeID) (bool, error) {
+	for _, l := range o.ex.ToLabels {
+		if !l.Known {
+			return false, nil
+		}
+		has, err := o.ctx.Tx.HasLabel(id, l.Token)
+		if err != nil || !has {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// scanRestOK reports whether a carries the anchor scan's residual labels, the ones
+// past the primary label the scan walked, the same filter nodeScanOp applies per node.
+func (o *fusedIntersectCountOp) scanRestOK(id engine.NodeID) (bool, error) {
+	for _, t := range o.scanRest {
+		has, err := o.ctx.Tx.HasLabel(id, t)
+		if err != nil || !has {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func (o *fusedIntersectCountOp) close() error { return nil }
+
+// fuseIntersectCount returns the anchor scan and expand an IntersectCount fuses into a
+// fusedIntersectCountOp, or nil when its input is not the shape the fused triangle
+// count drives directly: a plain single-hop Expand a->b (no variable length, no
+// expand-into) over a NodeScan of a, whose two closing legs leave exactly the anchor's
+// two variables. On that shape the fused operator can enumerate every anchor edge and
+// count its closings through the engine SPI without building an anchor row; any other
+// input keeps the general intersectCountOp, which pulls its input through the pipeline.
+func fuseIntersectCount(x *plan.IntersectCount) (*plan.NodeScan, *plan.Expand) {
+	ex, ok := x.Input.(*plan.Expand)
+	if !ok || ex.VarLen != nil || ex.ToBound {
+		return nil, nil
+	}
+	ns, ok := ex.Input.(*plan.NodeScan)
+	if !ok || ns.Var != ex.From {
+		return nil, nil
+	}
+	a, b := ex.From, ex.To
+	l0, l1 := x.Legs[0].From, x.Legs[1].From
+	if (l0 == a && l1 == b) || (l0 == b && l1 == a) {
+		return ns, ex
+	}
+	return nil, nil
+}

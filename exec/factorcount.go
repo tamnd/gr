@@ -2,6 +2,7 @@ package exec
 
 import (
 	"github.com/tamnd/gr/ast"
+	"github.com/tamnd/gr/bind"
 	"github.com/tamnd/gr/engine"
 	"github.com/tamnd/gr/eval"
 	"github.com/tamnd/gr/plan"
@@ -449,50 +450,74 @@ func (o *intersectCountOp) hasLabels(id engine.NodeID) (bool, error) {
 
 func (o *intersectCountOp) close() error { return o.input.close() }
 
-// fusedIntersectCountOp counts WCOJ triangles without materializing a single edge
-// row. It stands in for an IntersectCount whose input is an Expand a->b over a
-// NodeScan a, the anchor enumeration of a closed triangle, optionally under an anchor
+// FusePolygonCount is the kill-switch for the row-free cyclic count. When true (the
+// default) an IntersectCount whose input is a plain anchor path fuses into a
+// fusedIntersectCountOp; set it false to fall back to the materialized intersectCountOp
+// without a rebuild, the escape hatch if the fused path is ever suspect on a workload.
+// It also lets a benchmark time the same query both ways to size the win.
+var FusePolygonCount = true
+
+// fusedIntersectCountOp counts the closings of a cyclic WCOJ join without materializing
+// a single edge row. It stands in for an IntersectCount whose input is a plain Expand
+// chain over a NodeScan, the anchor path of a closed cycle: a->b for the triangle,
+// a->b->c for the four-cycle, longer for bigger polygons, optionally under an anchor
 // filter (the undirected triangle's id(a) < id(b)). The general intersectCountOp pulls
 // that input through the Volcano pipeline, which builds one eval.Row (a Go map) per
-// anchor edge only to read its two endpoints back out; the profile showed that
-// per-edge map dominated the triangle's CPU and drove its GC. This operator drives the
-// anchor scan of a and the a->b expand inline through the engine SPI and counts each
-// anchor edge's closings directly, so no anchor row is ever built. It is the textbook
-// zero-materialization triangle count: scan a, expand to b, intersect the two closing
-// legs, tally.
+// anchor path only to read its endpoints back out; the profile showed that per-path map
+// dominated the triangle's CPU and drove its GC, and the four-cycle's anchor 2-path,
+// summed degree-squared over a social graph, is far larger still. This operator drives
+// the anchor scan and every hop inline through the engine SPI and counts each anchor
+// path's closings directly, so no anchor row is ever built.
 //
-// For each anchor edge (a,b) it intersects the two legs exactly as intersectCountOp
-// does, reusing one apex map across every anchor, so once warm the whole traversal
-// allocates nothing. The single anchor relationship r0 is the only edge a counted leg
-// must differ from (the input binds no other), so relationship-uniqueness is a plain
-// r != r0 test rather than a peer-set walk. When the rewrite pushed an ordering filter
-// down, the anchor predicate gates each anchor edge and the apex predicate gates each
-// closing apex, both evaluated against a reused row so the gate stays allocation-free.
-// Like a grouping-free aggregate it emits exactly one row.
+// The closing is the same two-leg intersection the triangle uses, at the single apex
+// where the two legs meet: for the four-cycle a->b->c the legs leave c and a and close
+// at d. Growing the anchor does not grow the closing; only the path the operator walks
+// to bind the two leg endpoints gets longer, and the middle nodes are pure structure no
+// leg leaves. It keys leg-0's apexes into a reusable map then walks leg-1 adding the
+// per-apex product, reusing one map across every anchor path so once warm the whole
+// traversal allocates nothing. Relationship-uniqueness is enforced inline: each hop's
+// edge must differ from the hops bound before it, and each closing leg's edge from every
+// hop on the path. When the rewrite pushed an ordering filter down, the anchor predicate
+// gates each full path and the apex predicate gates each closing apex, both against a
+// reused row so the gate stays allocation-free. Like a grouping-free aggregate it emits
+// exactly one row.
 type fusedIntersectCountOp struct {
 	spec   *plan.IntersectCount
-	ex     *plan.Expand   // the fused anchor expand a->b, which binds r0
-	ns     *plan.NodeScan // the fused anchor scan of a
-	anchor ast.Expr       // predicate on the anchor edge (id(a) < id(b)), or nil
+	ns     *plan.NodeScan // the fused anchor scan of the path root
+	hops   []*plan.Expand // the fused anchor expand chain, scan-to-apex order
+	anchor ast.Expr       // predicate on the anchor path (id(a) < id(b)), or nil
 	ctx    *Ctx
 	done   bool
 
-	scanTok  engine.Token   // a's primary label, or 0 for an unlabeled scan
-	scanRest []engine.Token // a's additional labels, filtered per scanned node
-	scanNone bool           // an unknown label on a: the scan is empty
+	scanTok  engine.Token   // the root's primary label, or 0 for an unlabeled scan
+	scanRest []engine.Token // the root's additional labels, filtered per scanned node
+	scanNone bool           // an unknown label on the root: the scan is empty
 
-	exTok   engine.Token          // the a->b type token, or 0 for all
-	exAllow map[engine.Token]bool // a->b post-filter type set when more than one type
-	exNone  bool                  // every named a->b type is unknown: no anchor edge
-	exDir   engine.Direction
+	rhops   []fusedHop // each hop's resolved type set and direction
+	hopNone bool       // some hop's every named type is unknown: no anchor path
 
-	legB int // index of the leg leaving b (the expand's To)
+	leg        [2]intersectLeg
+	leg0SrcIdx int // index into path of the node leg 0 leaves
+	leg1SrcIdx int // index into path of the node leg 1 leaves
+	seen       map[engine.NodeID]int64
 
-	leg  [2]intersectLeg
-	seen map[engine.NodeID]int64 // reusable: apex node -> peer-unique leg-0 edge count
+	pathVars []string        // the path variables, root first: [a, b, c, ...]
+	path     []engine.NodeID // reusable: the bound path node ids
+	rels     []engine.RelID  // reusable: the bound hop relationship ids
 
-	erow eval.Row  // reusable row binding a, b, and the apex for the two predicates
+	erow eval.Row  // reusable row binding the path nodes and apex for the predicates
 	eenv *eval.Env // reusable env over erow, nil when neither predicate is present
+}
+
+// fusedHop is one anchor hop's expand parameters resolved once at open: the type token
+// to expand (or zero for all), the multi-type allow set, whether the type set matches
+// nothing, the engine direction, and the target labels checked per reached node.
+type fusedHop struct {
+	tok      engine.Token
+	allow    map[engine.Token]bool
+	none     bool
+	dir      engine.Direction
+	toLabels []bind.NameRef
 }
 
 func (o *fusedIntersectCountOp) open(ctx *Ctx) error {
@@ -509,62 +534,55 @@ func (o *fusedIntersectCountOp) open(ctx *Ctx) error {
 			o.scanRest = append(o.scanRest, l.Token)
 		}
 	}
-	o.exTok, o.exAllow, o.exNone = resolveTypes(o.ex.Types)
-	o.exDir = toEngineDir(o.ex.Dir)
+	if o.rhops == nil {
+		o.rhops = make([]fusedHop, len(o.hops))
+	}
+	o.hopNone = false
+	for i, ex := range o.hops {
+		tok, allow, none := resolveTypes(ex.Types)
+		o.rhops[i] = fusedHop{tok: tok, allow: allow, none: none, dir: toEngineDir(ex.Dir), toLabels: ex.ToLabels}
+		if none {
+			o.hopNone = true
+		}
+	}
 	for i := range o.spec.Legs {
 		tok, allow, none := resolveTypes(o.spec.Legs[i].Types)
 		o.leg[i] = intersectLeg{tok: tok, allow: allow, noType: none, dir: toEngineDir(o.spec.Legs[i].Dir)}
 	}
-	o.legB = 1
-	if o.spec.Legs[0].From == o.ex.To {
-		o.legB = 0
+	if o.pathVars == nil {
+		o.pathVars = make([]string, len(o.hops)+1)
+		o.pathVars[0] = o.ns.Var
+		for i, ex := range o.hops {
+			o.pathVars[i+1] = ex.To
+		}
 	}
+	o.leg0SrcIdx = o.pathIndex(o.spec.Legs[0].From)
+	o.leg1SrcIdx = o.pathIndex(o.spec.Legs[1].From)
+	o.path = make([]engine.NodeID, len(o.hops)+1)
+	o.rels = make([]engine.RelID, len(o.hops))
 	if o.seen == nil {
 		o.seen = map[engine.NodeID]int64{}
 	}
 	if o.anchor != nil || o.spec.ApexPred != nil {
-		o.erow = eval.Row{}
+		if o.erow == nil {
+			o.erow = eval.Row{}
+		}
 		o.eenv = ctx.env(o.erow)
+	} else {
+		o.eenv = nil
 	}
 	return nil
 }
 
-// anchorOK evaluates the anchor predicate (the undirected triangle's `id(a) < id(b)`)
-// for one anchor edge, binding a and b in the reusable row. It returns true when there
-// is no anchor predicate. The predicate reads only the two endpoint nodes (the fusion
-// guard refuses one that reads the anchor relationship), so binding the two ids is
-// enough and the row and env are reused, allocating nothing once warm.
-func (o *fusedIntersectCountOp) anchorOK(a, b engine.NodeID) (bool, error) {
-	if o.anchor == nil {
-		return true, nil
+// pathIndex returns the position of a path variable, root at 0. The fusion guard already
+// proved the two leg sources are path ends, so this always finds them.
+func (o *fusedIntersectCountOp) pathIndex(v string) int {
+	for i, pv := range o.pathVars {
+		if pv == v {
+			return i
+		}
 	}
-	o.erow[o.ex.From] = value.Node(uint64(a))
-	o.erow[o.ex.To] = value.Node(uint64(b))
-	v, err := eval.Eval(o.anchor, o.eenv)
-	if err != nil {
-		return false, err
-	}
-	b2, ok := v.AsBool()
-	return ok && b2, nil
-}
-
-// apexOK evaluates the apex predicate (the undirected triangle's `id(b) < id(c)`) for
-// one closing apex, binding b and the apex in the reusable row. It returns true when
-// there is no apex predicate. The predicate is constant across the apex's closing
-// edges (it never reads a leg relationship), so it gates the whole per-apex count.
-func (o *fusedIntersectCountOp) apexOK(a, b, apex engine.NodeID) (bool, error) {
-	if o.spec.ApexPred == nil {
-		return true, nil
-	}
-	o.erow[o.ex.From] = value.Node(uint64(a))
-	o.erow[o.ex.To] = value.Node(uint64(b))
-	o.erow[o.spec.Var] = value.Node(uint64(apex))
-	v, err := eval.Eval(o.spec.ApexPred, o.eenv)
-	if err != nil {
-		return false, err
-	}
-	b2, ok := v.AsBool()
-	return ok && b2, nil
+	return -1
 }
 
 func (o *fusedIntersectCountOp) next() (eval.Row, bool, error) {
@@ -573,33 +591,19 @@ func (o *fusedIntersectCountOp) next() (eval.Row, bool, error) {
 	}
 	o.done = true
 	var total int64
-	if !o.scanNone && !o.exNone && !o.leg[0].noType && !o.leg[1].noType {
+	if !o.scanNone && !o.hopNone && !o.leg[0].noType && !o.leg[1].noType {
 		err := o.ctx.Tx.ScanLabel(o.scanTok, func(a engine.NodeID) error {
 			o.ctx.countScan(1)
 			ok, err := o.scanRestOK(a)
 			if err != nil || !ok {
 				return err
 			}
-			return o.ctx.Tx.Expand(a, o.exTok, o.exDir, func(nb engine.Neighbor) error {
-				o.ctx.countScan(1)
-				if o.exAllow != nil && !o.exAllow[nb.Type] {
-					return nil
-				}
-				ok, err := o.hasToLabels(nb.Node)
-				if err != nil || !ok {
-					return err
-				}
-				ok, err = o.anchorOK(a, nb.Node)
-				if err != nil || !ok {
-					return err
-				}
-				n, err := o.countAnchor(a, nb.Node, nb.Rel)
-				if err != nil {
-					return err
-				}
-				total += n
-				return nil
-			})
+			n, err := o.walk(0, a)
+			if err != nil {
+				return err
+			}
+			total += n
+			return nil
 		})
 		if err != nil {
 			return nil, false, err
@@ -612,24 +616,66 @@ func (o *fusedIntersectCountOp) next() (eval.Row, bool, error) {
 	return eval.Row{o.spec.Col: value.Int(total)}, true, nil
 }
 
-// countAnchor counts the closings the anchor edge (a,b) with relationship r0
-// contributes. Each leg leaves a or b (legB says which leg leaves b), so it keys
-// leg-0's apexes into the reusable map then walks leg-1 adding the per-apex product,
-// the same intersection intersectCountOp performs, with the single anchor edge r0 as
-// the only relationship a counted leg must differ from. The rare self-loop anchor
-// (a == b) falls to an edge-aware count so an edge is never paired with itself.
-func (o *fusedIntersectCountOp) countAnchor(a, b engine.NodeID, r0 engine.RelID) (int64, error) {
-	from0, from1 := a, b
-	if o.legB == 0 {
-		from0, from1 = b, a
+// walk binds the anchor path one hop at a time, then counts the closings at the end. At
+// level k the node is path[k]; at the last level the whole path is bound and the closing
+// intersection runs. Each hop excludes the relationships bound on the hops before it, so
+// the path is a relationship-distinct walk, the same uniqueness the chained Expands of
+// the general path apply.
+func (o *fusedIntersectCountOp) walk(level int, node engine.NodeID) (int64, error) {
+	o.path[level] = node
+	if level == len(o.hops) {
+		if o.eenv != nil {
+			o.bindPath()
+		}
+		if o.anchor != nil {
+			ok, err := o.anchorOK()
+			if err != nil || !ok {
+				return 0, err
+			}
+		}
+		return o.countClose()
 	}
+	h := &o.rhops[level]
+	var total int64
+	err := o.ctx.Tx.Expand(node, h.tok, h.dir, func(nb engine.Neighbor) error {
+		o.ctx.countScan(1)
+		if h.allow != nil && !h.allow[nb.Type] {
+			return nil
+		}
+		if o.relBound(level, nb.Rel) {
+			return nil
+		}
+		ok, err := o.toLabelsOK(h.toLabels, nb.Node)
+		if err != nil || !ok {
+			return err
+		}
+		o.rels[level] = nb.Rel
+		n, err := o.walk(level+1, nb.Node)
+		if err != nil {
+			return err
+		}
+		total += n
+		return nil
+	})
+	return total, err
+}
+
+// countClose counts the closings the fully bound anchor path contributes, intersecting
+// the two legs at the apex they share. The legs leave the path's two ends; when those
+// ends are the same node a single edge could satisfy both legs, so it falls to the
+// edge-aware countSame. Otherwise it keys leg-0's apexes into the reusable map then walks
+// leg-1 adding the per-apex product, each counted leg edge differing from every hop on
+// the path.
+func (o *fusedIntersectCountOp) countClose() (int64, error) {
+	from0 := o.path[o.leg0SrcIdx]
+	from1 := o.path[o.leg1SrcIdx]
 	if from0 == from1 {
-		return o.countSame(from0, r0)
+		return o.countSame(from0)
 	}
 	clear(o.seen)
 	err := o.ctx.Tx.Expand(from0, o.leg[0].tok, o.leg[0].dir, func(nb engine.Neighbor) error {
 		o.ctx.countScan(1)
-		if o.accept(0, nb) && nb.Rel != r0 {
+		if o.accept(0, nb) && !o.relOnPath(nb.Rel) {
 			o.seen[nb.Node]++
 		}
 		return nil
@@ -640,7 +686,7 @@ func (o *fusedIntersectCountOp) countAnchor(a, b engine.NodeID, r0 engine.RelID)
 	var n int64
 	err = o.ctx.Tx.Expand(from1, o.leg[1].tok, o.leg[1].dir, func(nb engine.Neighbor) error {
 		o.ctx.countScan(1)
-		if !o.accept(1, nb) || nb.Rel == r0 {
+		if !o.accept(1, nb) || o.relOnPath(nb.Rel) {
 			return nil
 		}
 		c := o.seen[nb.Node]
@@ -651,7 +697,7 @@ func (o *fusedIntersectCountOp) countAnchor(a, b engine.NodeID, r0 engine.RelID)
 		if err != nil || !ok {
 			return err
 		}
-		ok, err = o.apexOK(a, b, nb.Node)
+		ok, err = o.apexOK(nb.Node)
 		if err != nil || !ok {
 			return err
 		}
@@ -661,16 +707,16 @@ func (o *fusedIntersectCountOp) countAnchor(a, b engine.NodeID, r0 engine.RelID)
 	return n, err
 }
 
-// countSame counts the closings of a self-loop anchor, where both legs leave the same
-// node and a single edge can satisfy both legs, so it must not be paired with itself
-// (nor with the anchor edge r0). It keeps each apex's leg-0 edge ids, then for every
-// leg-1 edge counts the distinct leg-0 edges to that apex. It allocates only on this
-// cold path, so the hot anchor stays allocation-free.
-func (o *fusedIntersectCountOp) countSame(src engine.NodeID, r0 engine.RelID) (int64, error) {
+// countSame counts closings when both legs leave the same path end, where a single edge
+// can satisfy both legs and so must not be paired with itself (nor with any hop on the
+// path). It keeps each apex's leg-0 edge ids, then for every leg-1 edge counts the
+// distinct leg-0 edges to that apex. It allocates only on this cold path, so the hot
+// path stays allocation-free.
+func (o *fusedIntersectCountOp) countSame(src engine.NodeID) (int64, error) {
 	byApex := map[engine.NodeID][]engine.RelID{}
 	err := o.ctx.Tx.Expand(src, o.leg[0].tok, o.leg[0].dir, func(nb engine.Neighbor) error {
 		o.ctx.countScan(1)
-		if o.accept(0, nb) && nb.Rel != r0 {
+		if o.accept(0, nb) && !o.relOnPath(nb.Rel) {
 			byApex[nb.Node] = append(byApex[nb.Node], nb.Rel)
 		}
 		return nil
@@ -681,7 +727,7 @@ func (o *fusedIntersectCountOp) countSame(src engine.NodeID, r0 engine.RelID) (i
 	var n int64
 	err = o.ctx.Tx.Expand(src, o.leg[1].tok, o.leg[1].dir, func(nb engine.Neighbor) error {
 		o.ctx.countScan(1)
-		if !o.accept(1, nb) || nb.Rel == r0 {
+		if !o.accept(1, nb) || o.relOnPath(nb.Rel) {
 			return nil
 		}
 		rels := byApex[nb.Node]
@@ -692,7 +738,7 @@ func (o *fusedIntersectCountOp) countSame(src engine.NodeID, r0 engine.RelID) (i
 		if err != nil || !ok {
 			return err
 		}
-		ok, err = o.apexOK(src, src, nb.Node)
+		ok, err = o.apexOK(nb.Node)
 		if err != nil || !ok {
 			return err
 		}
@@ -704,6 +750,69 @@ func (o *fusedIntersectCountOp) countSame(src engine.NodeID, r0 engine.RelID) (i
 		return nil
 	})
 	return n, err
+}
+
+// relBound reports whether a relationship is already bound on a hop before the given
+// level, the per-hop uniqueness check the chained anchor Expands apply.
+func (o *fusedIntersectCountOp) relBound(upto int, rel engine.RelID) bool {
+	for i := 0; i < upto; i++ {
+		if o.rels[i] == rel {
+			return true
+		}
+	}
+	return false
+}
+
+// relOnPath reports whether a relationship is bound on any hop of the anchor path, the
+// uniqueness check each closing leg edge must pass, the same one the general path runs
+// against the peer relationship variables the anchor binds.
+func (o *fusedIntersectCountOp) relOnPath(rel engine.RelID) bool {
+	for _, r := range o.rels {
+		if r == rel {
+			return true
+		}
+	}
+	return false
+}
+
+// bindPath writes the bound path node ids into the reusable predicate row, keyed by the
+// path variables, so the anchor and apex predicates read them. Called once per fully
+// bound path, only when a predicate is present.
+func (o *fusedIntersectCountOp) bindPath() {
+	for i, v := range o.pathVars {
+		o.erow[v] = value.Node(uint64(o.path[i]))
+	}
+}
+
+// anchorOK evaluates the anchor predicate (the undirected triangle's `id(a) < id(b)`)
+// over the bound path. It returns true when there is no anchor predicate. The predicate
+// reads only the path nodes (the fusion guard refuses one that reads a hop relationship),
+// which bindPath has already bound, and the row and env are reused, allocating nothing.
+func (o *fusedIntersectCountOp) anchorOK() (bool, error) {
+	v, err := eval.Eval(o.anchor, o.eenv)
+	if err != nil {
+		return false, err
+	}
+	b, ok := v.AsBool()
+	return ok && b, nil
+}
+
+// apexOK evaluates the apex predicate (the undirected triangle's `id(b) < id(c)`) for one
+// closing apex, binding the apex in the reusable row over the already-bound path. It
+// returns true when there is no apex predicate. The predicate is constant across the
+// apex's closing edges (it never reads a leg relationship), so it gates the whole per-apex
+// count.
+func (o *fusedIntersectCountOp) apexOK(apex engine.NodeID) (bool, error) {
+	if o.spec.ApexPred == nil {
+		return true, nil
+	}
+	o.erow[o.spec.Var] = value.Node(uint64(apex))
+	v, err := eval.Eval(o.spec.ApexPred, o.eenv)
+	if err != nil {
+		return false, err
+	}
+	b, ok := v.AsBool()
+	return ok && b, nil
 }
 
 // accept applies a leg's multi-type post-filter, the same trim intersectOp does.
@@ -726,10 +835,10 @@ func (o *fusedIntersectCountOp) hasLabels(id engine.NodeID) (bool, error) {
 	return true, nil
 }
 
-// hasToLabels reports whether b carries every label the anchor expand required of its
-// target, the same constraint the fused Expand would have applied before binding b.
-func (o *fusedIntersectCountOp) hasToLabels(id engine.NodeID) (bool, error) {
-	for _, l := range o.ex.ToLabels {
+// toLabelsOK reports whether a reached node carries every label a hop required of its
+// target, the same constraint the fused Expand would have applied before binding it.
+func (o *fusedIntersectCountOp) toLabelsOK(labels []bind.NameRef, id engine.NodeID) (bool, error) {
+	for _, l := range labels {
 		if !l.Known {
 			return false, nil
 		}
@@ -741,7 +850,7 @@ func (o *fusedIntersectCountOp) hasToLabels(id engine.NodeID) (bool, error) {
 	return true, nil
 }
 
-// scanRestOK reports whether a carries the anchor scan's residual labels, the ones
+// scanRestOK reports whether the root carries the anchor scan's residual labels, the ones
 // past the primary label the scan walked, the same filter nodeScanOp applies per node.
 func (o *fusedIntersectCountOp) scanRestOK(id engine.NodeID) (bool, error) {
 	for _, t := range o.scanRest {

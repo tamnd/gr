@@ -8,6 +8,7 @@ import (
 	"runtime/pprof"
 	"testing"
 
+	"github.com/tamnd/gr/exec"
 	"github.com/tamnd/gr/vfs"
 )
 
@@ -50,6 +51,83 @@ func buildCappedPowerLaw(tb testing.TB, nodes, maxDeg int, exponent float64, see
 }
 
 const plTriangleDirected = "MATCH (a:N)-[:R]->(b:N)-[:R]->(c:N)-[:R]->(a) RETURN count(*) AS n"
+
+const plFourCycleDirected = "MATCH (a:N)-[:R]->(b:N)-[:R]->(c:N)-[:R]->(d:N)-[:R]->(a) RETURN count(*) AS n"
+
+// TestWcojFusedFourCycleCount checks the fused four-cycle count, the two-hop anchor that
+// the N-edge generalization first reaches, against a brute-force enumeration over the same
+// skewed graph the triangle test uses. The directed four-cycle counts ordered tuples
+// a->b->c->d->a whose four edges are four distinct relationships; on this simple loopless
+// graph that is the same as the four ordered pairs being distinct, which the brute force
+// checks by skipping any tuple that reuses an edge. It is the end-to-end correctness proof
+// that the longer anchor walk binds and closes the cycle the same way the planner's
+// materialized path did before the fusion took over.
+func TestWcojFusedFourCycleCount(t *testing.T) {
+	db, _ := buildCappedPowerLaw(t, 300, 120, 1.35, 7)
+	defer func() { _ = db.Close() }()
+	ctx := context.Background()
+
+	out := map[int64]map[int64]bool{}
+	res, err := db.Run(ctx, "MATCH (a:N)-[:R]->(b:N) RETURN id(a) AS a, id(b) AS b", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		row, ok, err := res.Row()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			break
+		}
+		a, _ := row[0].AsInt()
+		b, _ := row[1].AsInt()
+		if out[a] == nil {
+			out[a] = map[int64]bool{}
+		}
+		out[a][b] = true
+	}
+	_ = res.Close()
+
+	// Enumerate a->b->c->d->a. An edge is its ordered endpoint pair here, so the only way
+	// four present edges of a closed four-cycle repeat one is a==c with b==d (the path
+	// folds back on the same two edges); skip exactly that and the count matches the
+	// engine's relationship-isomorphism.
+	var want int64
+	for a := range out {
+		for b := range out[a] {
+			for c := range out[b] {
+				for d := range out[c] {
+					if !out[d][a] {
+						continue
+					}
+					if a == c && b == d {
+						continue
+					}
+					want++
+				}
+			}
+		}
+	}
+
+	res, err = db.Run(ctx, plFourCycleDirected, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, ok, err := res.Row()
+	if err != nil || !ok {
+		t.Fatalf("no count row: ok=%v err=%v", ok, err)
+	}
+	got, _ := row[0].AsInt()
+	_ = res.Close()
+	if got != want {
+		t.Fatalf("fused four-cycle count = %d, brute force = %d", got, want)
+	}
+	if want == 0 {
+		t.Fatal("graph has no four-cycles, test proves nothing")
+	}
+	t.Logf("directed four-cycles: %d", want)
+}
 
 // TestWcojFusedTriangleCount checks the fused triangle count against a brute-force
 // enumeration over a real skewed graph, so the zero-materialization anchor path
@@ -255,4 +333,55 @@ func TestWcojProfileTriangle(t *testing.T) {
 		_ = res.Close()
 	}
 	pprof.StopCPUProfile()
+}
+
+// BenchmarkWcojCycle times the directed triangle and four-cycle counts both ways, fused
+// and materialized, over one representative capped power-law graph. The fused/materialized
+// pair on the identical query and graph is the A/B that sizes the win the row-free anchor
+// walk buys, the four-cycle being the case the N-edge generalization unlocked: its anchor
+// 2-path is summed degree-squared over the graph, so the per-path row the materialized
+// path builds is the cost the fused walk drops. Run with -benchmem to see the allocation
+// gap that drives it.
+func BenchmarkWcojCycle(b *testing.B) {
+	db, edges := buildCappedPowerLaw(b, 2000, 300, 2.5, 1)
+	defer func() { _ = db.Close() }()
+	b.Logf("graph: 2000 nodes, %d edges", edges)
+	ctx := context.Background()
+
+	run := func(q string) {
+		res, err := db.Run(ctx, q, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, _, err := res.Row(); err != nil {
+			b.Fatal(err)
+		}
+		_ = res.Close()
+	}
+
+	cases := []struct {
+		name string
+		q    string
+	}{
+		{"triangle", plTriangleDirected},
+		{"fourcycle", plFourCycleDirected},
+	}
+	for _, c := range cases {
+		for _, fused := range []bool{true, false} {
+			mode := "materialized"
+			if fused {
+				mode = "fused"
+			}
+			b.Run(c.name+"/"+mode, func(b *testing.B) {
+				old := exec.FusePolygonCount
+				exec.FusePolygonCount = fused
+				defer func() { exec.FusePolygonCount = old }()
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					run(c.q)
+				}
+			})
+		}
+	}
 }

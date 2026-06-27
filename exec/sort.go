@@ -54,6 +54,7 @@ func (o *sortOp) materialize() error {
 		keys []value.Value
 	}
 	var buf []keyed
+	env := o.ctx.env(nil)
 	for {
 		row, ok, err := o.input.next()
 		if err != nil {
@@ -63,7 +64,7 @@ func (o *sortOp) materialize() error {
 			break
 		}
 		ks := make([]value.Value, len(o.keys))
-		env := o.ctx.env(row)
+		env.Row = row
 		for i, k := range o.keys {
 			v, err := eval.Eval(k.Expr, env)
 			if err != nil {

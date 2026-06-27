@@ -153,6 +153,10 @@ func (o *aggregateOp) drainGroups(op operator) (map[string]*group, []string, err
 	for i, c := range o.spec.GroupKeys {
 		keyExprs[i] = c.Expr
 	}
+	// One environment reused across every input row: the group representative is
+	// kept separately (g.rep), and Eval never retains the Env, so only its Row
+	// field changes per row.
+	env := o.ctx.env(nil)
 	for {
 		in, ok, err := op.next()
 		if err != nil {
@@ -161,7 +165,7 @@ func (o *aggregateOp) drainGroups(op operator) (map[string]*group, []string, err
 		if !ok {
 			break
 		}
-		env := o.ctx.env(in)
+		env.Row = in
 		keyVals := make([]value.Value, len(keyExprs))
 		for i, e := range keyExprs {
 			v, err := eval.Eval(e, env)

@@ -86,6 +86,14 @@ type Options struct {
 	// Parallelism is a later milestone; this field is accepted and ignored until
 	// then (doc 19 §8).
 	Workers int
+
+	// MaxPoolPages bounds the build pager's buffer pool in pages; 0 keeps the
+	// pager's small built-in default. The four-pass build writes the whole output
+	// file through this pool, so a default-sized pool against a multi-gigabyte
+	// load evicts and re-faults the column and adjacency pages it is still filling.
+	// Raise it to keep the pages being built resident and cut the build's eviction
+	// churn.
+	MaxPoolPages int
 }
 
 func (o *Options) delimiter() rune {

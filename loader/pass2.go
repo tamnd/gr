@@ -205,7 +205,7 @@ func (l *Loader) propColDescs(hdr *NodeHeader, src NodeSource) []propColDesc {
 // Pass2BuildNodeColumns is exported for testing. In production use, Run calls
 // it in sequence after Pass1ScanNodes.
 func (l *Loader) Pass2BuildNodeColumns(fsys vfs.VFS, outputPath string) (*fileBuilder, error) {
-	fb, err := openFileBuilder(fsys, outputPath, l.catalog)
+	fb, err := openFileBuilder(fsys, outputPath, l.catalog, l.opts.MaxPoolPages)
 	if err != nil {
 		return nil, err
 	}

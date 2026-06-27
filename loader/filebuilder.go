@@ -59,11 +59,11 @@ type fileBuilder struct {
 // openFileBuilder creates the output .gr file, computes groupBase, and
 // initializes the global node property column store. It is called after pass 1
 // so the group sizes are final.
-func openFileBuilder(fsys vfs.VFS, path string, cat *CatalogBuilder) (*fileBuilder, error) {
+func openFileBuilder(fsys vfs.VFS, path string, cat *CatalogBuilder, maxPoolPages int) (*fileBuilder, error) {
 	if fsys == nil {
 		fsys = vfs.NewOS()
 	}
-	p, err := pager.Open(fsys, path, pager.Options{Sync: wal.SyncFull})
+	p, err := pager.Open(fsys, path, pager.Options{Sync: wal.SyncFull, MaxPoolPages: maxPoolPages})
 	if err != nil {
 		return nil, fmt.Errorf("loader: open %s: %w", path, err)
 	}

@@ -267,10 +267,8 @@ func (p *ghParser) skipBlock() {
 			p.pushBack(line)
 			return
 		}
-		// Skip tables and doc-strings inside backgrounds.
-		if strings.HasPrefix(line, "|") || strings.HasPrefix(line, `"""`) {
-			continue
-		}
+		// Anything else (step keywords, tables, doc-strings, blank lines) is
+		// part of the block and gets discarded by looping again.
 	}
 }
 

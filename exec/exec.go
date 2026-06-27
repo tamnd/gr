@@ -503,6 +503,13 @@ func (c *compiler) compileRelInner(o plan.Op, peers []string) (operator, []strin
 		}
 		return &projectOp{spec: x, input: input}, nil, nil
 	case *plan.Aggregate:
+		// A grouping-free aggregation over a bare scan whose aggregates run serially
+		// (avg/sum/collect/distinct) fuses onto the scan, dropping the per-node row and
+		// env the general path allocates (see scanAggregateOp). The scan is not compiled
+		// as a child here: the fused operator owns it.
+		if ns := fuseScanAggregate(x); ns != nil {
+			return &scanAggregateOp{aggregateOp: aggregateOp{spec: x, inputPlan: x.Input}, scan: ns}, nil, nil
+		}
 		input, err := c.compile(x.Input)
 		if err != nil {
 			return nil, nil, err

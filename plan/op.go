@@ -460,33 +460,33 @@ type Union struct {
 	All         bool
 }
 
-func (*Unit) op()          {}
-func (*Create) op()        {}
-func (*Merge) op()         {}
-func (*Foreach) op()       {}
-func (*Set) op()           {}
-func (*Remove) op()        {}
-func (*Delete) op()        {}
-func (*Argument) op()      {}
-func (*NodeScan) op()      {}
-func (*NodeIndexSeek) op() {}
-func (*Expand) op()        {}
-func (*Intersect) op()     {}
-func (*Filter) op()        {}
-func (*BindPath) op()      {}
-func (*ShortestPath) op()  {}
-func (*Project) op()       {}
-func (*Aggregate) op()     {}
+func (*Unit) op()           {}
+func (*Create) op()         {}
+func (*Merge) op()          {}
+func (*Foreach) op()        {}
+func (*Set) op()            {}
+func (*Remove) op()         {}
+func (*Delete) op()         {}
+func (*Argument) op()       {}
+func (*NodeScan) op()       {}
+func (*NodeIndexSeek) op()  {}
+func (*Expand) op()         {}
+func (*Intersect) op()      {}
+func (*Filter) op()         {}
+func (*BindPath) op()       {}
+func (*ShortestPath) op()   {}
+func (*Project) op()        {}
+func (*Aggregate) op()      {}
 func (*ExpandCount) op()    {}
 func (*ProductCount) op()   {}
 func (*IntersectCount) op() {}
-func (*Join) op()          {}
-func (*Optional) op()      {}
-func (*Unwind) op()        {}
-func (*Sort) op()          {}
-func (*Skip) op()          {}
-func (*Limit) op()         {}
-func (*Union) op()         {}
+func (*Join) op()           {}
+func (*Optional) op()       {}
+func (*Unwind) op()         {}
+func (*Sort) op()           {}
+func (*Skip) op()           {}
+func (*Limit) op()          {}
+func (*Union) op()          {}
 
 // outputVars returns the set of variable names an operator's rows carry. It is
 // the basis for predicate pushdown (a filter can move below an operator only if

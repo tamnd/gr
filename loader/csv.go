@@ -16,7 +16,6 @@ package loader
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"strings"
@@ -35,12 +34,12 @@ import (
 //
 // The reader is not goroutine-safe; each partition (doc 19 §8.2) must use its own.
 type csvReader struct {
-	r       *bufio.Reader
-	delim   rune // field delimiter, default ','
-	arrDelim rune // array delimiter inside list fields, default ';'
-	lineno  int  // 1-based logical record number (not byte line count)
-	fields  []string
-	buf     strings.Builder
+	r         *bufio.Reader
+	delim     rune // field delimiter, default ','
+	arrDelim  rune // array delimiter inside list fields, default ';'
+	lineno    int  // 1-based logical record number (not byte line count)
+	fields    []string
+	buf       strings.Builder
 	firstLine bool
 }
 
@@ -114,7 +113,6 @@ func (c *csvReader) Next() (bool, error) {
 				// delimiter or newline closes the quote.
 				next, _, nerr := c.r.ReadRune()
 				if nerr == io.EOF {
-					inQuote = false
 					c.fields = append(c.fields, c.buf.String())
 					c.buf.Reset()
 					c.lineno++
@@ -204,15 +202,4 @@ func splitArrayField(field string, arrDelim rune) []string {
 		return nil
 	}
 	return strings.Split(field, string(arrDelim))
-}
-
-// bomReader strips the UTF-8 BOM from the beginning of r if present, then
-// returns a reader that reads the rest. Used for the header-only-file path.
-func bomReader(r io.Reader) io.Reader {
-	br := bufio.NewReader(r)
-	bs, _ := br.Peek(3)
-	if bytes.Equal(bs, []byte{0xEF, 0xBB, 0xBF}) {
-		_, _ = br.Discard(3)
-	}
-	return br
 }

@@ -667,7 +667,8 @@ func (e *DiskEngine) Begin(write bool) (Tx, error) {
 		e.p.BeginWrite()
 	}
 	snap, read := e.oracle.Begin()
-	return &diskTx{e: e, write: write, snap: snap, readSeq: read}, nil
+	t := &diskTx{e: e, write: write, snap: snap, readSeq: read}
+	return t, nil
 }
 
 // Checkpoint folds the adjacency delta into the base CSR, makes everything

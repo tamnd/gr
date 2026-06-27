@@ -11,12 +11,12 @@ import (
 type RejectCode string
 
 const (
-	CodeParse     RejectCode = "parse"        // type parse failure
-	CodeMissingID RejectCode = "missing_id"   // :ID field absent or empty
-	CodeDupID     RejectCode = "dup_id"       // duplicate node id in a space
-	CodeDangling  RejectCode = "dangling"     // relationship with unresolved endpoint
-	CodeUnique    RejectCode = "unique"        // uniqueness constraint violation
-	CodeExistence RejectCode = "existence"    // existence constraint violation
+	CodeParse     RejectCode = "parse"      // type parse failure
+	CodeMissingID RejectCode = "missing_id" // :ID field absent or empty
+	CodeDupID     RejectCode = "dup_id"     // duplicate node id in a space
+	CodeDangling  RejectCode = "dangling"   // relationship with unresolved endpoint
+	CodeUnique    RejectCode = "unique"     // uniqueness constraint violation
+	CodeExistence RejectCode = "existence"  // existence constraint violation
 )
 
 // Reject is one entry in the bad-line file (doc 19 §11.4).

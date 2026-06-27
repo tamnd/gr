@@ -6,8 +6,8 @@ import (
 	"github.com/tamnd/gr/adj"
 	"github.com/tamnd/gr/catalog"
 	"github.com/tamnd/gr/colseg"
-	"github.com/tamnd/gr/column"
 	"github.com/tamnd/gr/colsegstore"
+	"github.com/tamnd/gr/column"
 	"github.com/tamnd/gr/idmap"
 	"github.com/tamnd/gr/node"
 	"github.com/tamnd/gr/rel"
@@ -682,7 +682,7 @@ func (l *Loader) Pass4FinalizeAll(fsys vfs.VFS, outputPath string) error {
 	if err != nil {
 		return err
 	}
-	defer fb.Close()
+	defer func() { _ = fb.Close() }()
 	if err := l.Pass3BuildCSR(fb); err != nil {
 		return err
 	}

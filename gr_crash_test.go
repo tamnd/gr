@@ -63,11 +63,11 @@ func reopenCrashed(t *testing.T, crashed *vfs.Mem, name string) *DB {
 
 // crashMatrix runs a workload, counts its I/O fault points, then re-runs it
 // crashing at every ordinal 0..N-1 with TripCrash. After each crash it:
-//   1. Reopens the file (triggering WAL recovery).
-//   2. Asserts the recovered node count is 0 (no committed data yet) or equal to
-//      what the workload committed before the crash (committed <= expectedMax).
-//   3. Calls assertIntegrity so every crash result passes the structural checker.
-//   4. Reopens a second time to verify idempotent redo.
+//  1. Reopens the file (triggering WAL recovery).
+//  2. Asserts the recovered node count is 0 (no committed data yet) or equal to
+//     what the workload committed before the crash (committed <= expectedMax).
+//  3. Calls assertIntegrity so every crash result passes the structural checker.
+//  4. Reopens a second time to verify idempotent redo.
 //
 // Only TripCrash mode is used here; torn-write variants are in separate tests.
 func crashMatrix(t *testing.T, name string, expectedMax int, workload func(db *DB) (committed int, err error)) {

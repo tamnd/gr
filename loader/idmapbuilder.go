@@ -11,7 +11,7 @@ import "fmt"
 // (kind, group, dense) during finalization; the loader's map is only live for
 // the duration of the load.
 type IDMapEntry struct {
-	Group  LabelGroup
+	Group   LabelGroup
 	DenseID uint64
 }
 

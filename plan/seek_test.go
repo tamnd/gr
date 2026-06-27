@@ -60,7 +60,7 @@ func TestSeekRewriteNoIndex(t *testing.T) {
 func TestSeekRewriteWrongProp(t *testing.T) {
 	b := bound(t, "MATCH (p:Person) WHERE p.name = 'x' RETURN p")
 	want := String(Plan(b))
-	op := SeekRewrite(Plan(b), b, withIndex([2]uint32{1, 2}), nil)  // index on Person.age
+	op := SeekRewrite(Plan(b), b, withIndex([2]uint32{1, 2}), nil) // index on Person.age
 	eq(t, "unchanged", String(op), want)
 }
 
@@ -77,7 +77,7 @@ func TestSeekRewriteRangeNotPinned(t *testing.T) {
 // seek, seeking on the indexed label.
 func TestSeekRewriteResidualLabel(t *testing.T) {
 	b := bound(t, "MATCH (p:Person:Movie) WHERE p.name = 'x' RETURN p")
-	op := SeekRewrite(Plan(b), b, withIndex([2]uint32{2, 1}), nil)  // index on Movie.name
+	op := SeekRewrite(Plan(b), b, withIndex([2]uint32{2, 1}), nil) // index on Movie.name
 	eq(t, "seek", String(op), `Project p
   Filter p.name = "x"
     NodeIndexSeek p:#2&#1(#1 = "x")

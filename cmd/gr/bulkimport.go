@@ -201,4 +201,3 @@ func isBulkImport(args []string) bool {
 	}
 	return false
 }
-

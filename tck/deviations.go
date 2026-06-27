@@ -10,14 +10,14 @@ import (
 // Deviation is one entry in the deviations registry (doc 23 §2.5).
 // It documents an intentional divergence from the TCK expectation.
 type Deviation struct {
-	ID          string // e.g. "DEV-0001"
-	Scenario    string // exact scenario name from the feature file
-	Feature     string // feature file (partial match)
-	GrBehavior  string
-	TCKExpect   string
-	Rationale   string
-	Introduced  string
-	Tracking    string
+	ID         string // e.g. "DEV-0001"
+	Scenario   string // exact scenario name from the feature file
+	Feature    string // feature file (partial match)
+	GrBehavior string
+	TCKExpect  string
+	Rationale  string
+	Introduced string
+	Tracking   string
 }
 
 // Deviations is the loaded deviations registry.

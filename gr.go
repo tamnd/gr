@@ -154,6 +154,14 @@ type Options struct {
 	VFS vfs.VFS
 	// PageSize is used only when creating a new file; 0 means the default.
 	PageSize uint32
+	// MaxPoolPages bounds the buffer pool in pages (doc 05 §3); 0 keeps the
+	// pager's small built-in default. The default is sized for a working set that
+	// fits a few megabytes, so a database whose hot pages exceed that thrashes on
+	// clock eviction and re-reads every miss from disk. An embedder that knows the
+	// database is large should raise this to hold the working set in memory: a
+	// pool of fileSizeBytes/PageSize pages keeps the whole file resident at the
+	// cost of that many bytes of RAM.
+	MaxPoolPages int
 	// Sync is the durability level; 0 means full synchronous (the safe default).
 	Sync wal.SyncLevel
 	// ReadOnly opens the database for queries only.
@@ -224,11 +232,12 @@ func Open(path string, opt Options) (*DB, error) {
 	// §4.2). newQueryMetrics has no engine dependency; the engine-derived hooks are wired below.
 	metrics := newQueryMetrics()
 	eng, err := engine.Open(fsys, path, pager.Options{
-		PageSize: opt.PageSize,
-		Sync:     opt.Sync,
-		ReadOnly: opt.ReadOnly,
-		SaltSeed: opt.SaltSeed,
-		PageIO:   pageIOObserver{metrics},
+		PageSize:     opt.PageSize,
+		MaxPoolPages: opt.MaxPoolPages,
+		Sync:         opt.Sync,
+		ReadOnly:     opt.ReadOnly,
+		SaltSeed:     opt.SaltSeed,
+		PageIO:       pageIOObserver{metrics},
 	})
 	if err != nil {
 		return nil, err

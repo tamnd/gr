@@ -22,11 +22,13 @@ type unwindOp struct {
 	cur    eval.Row
 	items  []value.Value
 	pos    int
-	primed bool // for a leading UNWIND, whether the one empty row was consumed
+	primed bool      // for a leading UNWIND, whether the one empty row was consumed
+	env    *eval.Env // reused per input row, only its Row field changes (see Ctx.env)
 }
 
 func (o *unwindOp) open(ctx *Ctx) error {
 	o.ctx, o.cur, o.items, o.pos, o.primed = ctx, nil, nil, 0, false
+	o.env = ctx.env(nil)
 	if o.input != nil {
 		return o.input.open(ctx)
 	}
@@ -46,7 +48,8 @@ func (o *unwindOp) next() (eval.Row, bool, error) {
 		if err != nil || !ok {
 			return nil, false, err
 		}
-		v, err := eval.Eval(o.expr, o.ctx.env(in))
+		o.env.Row = in
+		v, err := eval.Eval(o.expr, o.env)
 		if err != nil {
 			return nil, false, err
 		}

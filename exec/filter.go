@@ -12,9 +12,14 @@ type filterOp struct {
 	pred  ast.Expr
 	input operator
 	ctx   *Ctx
+	env   *eval.Env // reused per row, only its Row field changes (see Ctx.env)
 }
 
-func (o *filterOp) open(ctx *Ctx) error { o.ctx = ctx; return o.input.open(ctx) }
+func (o *filterOp) open(ctx *Ctx) error {
+	o.ctx = ctx
+	o.env = ctx.env(nil)
+	return o.input.open(ctx)
+}
 
 func (o *filterOp) next() (eval.Row, bool, error) {
 	for {
@@ -22,7 +27,8 @@ func (o *filterOp) next() (eval.Row, bool, error) {
 		if err != nil || !ok {
 			return nil, false, err
 		}
-		v, err := eval.Eval(o.pred, o.ctx.env(row))
+		o.env.Row = row
+		v, err := eval.Eval(o.pred, o.env)
 		if err != nil {
 			return nil, false, err
 		}
@@ -45,11 +51,13 @@ type projectOp struct {
 
 	cols []string
 	seen map[string]bool // distinct dedup set
+	env  *eval.Env       // reused per row, only its Row field changes (see Ctx.env)
 }
 
 func (o *projectOp) open(ctx *Ctx) error {
 	o.ctx = ctx
 	o.cols = colNames(o.spec.Cols)
+	o.env = ctx.env(nil)
 	if o.spec.Distinct {
 		o.seen = make(map[string]bool)
 	}
@@ -62,10 +70,10 @@ func (o *projectOp) next() (eval.Row, bool, error) {
 		if err != nil || !ok {
 			return nil, false, err
 		}
-		env := o.ctx.env(in)
+		o.env.Row = in
 		out := make(eval.Row, len(o.spec.Cols))
 		for _, c := range o.spec.Cols {
-			v, err := eval.Eval(c.Expr, env)
+			v, err := eval.Eval(c.Expr, o.env)
 			if err != nil {
 				return nil, false, err
 			}

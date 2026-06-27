@@ -86,9 +86,8 @@ const dirStride = 40
 // compressed blobs once and caches the result here, so a run lookup indexes plain
 // slices rather than re-reading pages (doc 15 §15.9).
 type base struct {
-	off []uint64 // offsets, length nodeCount+1
-	nbr []uint64 // neighbor node positions
-	edg []uint64 // edge (relationship) positions
+	off []uint64   // offsets, length nodeCount+1
+	nb  []Neighbor // (node position, edge position) pairs, one CSR run per source
 }
 
 // Adj is the adjacency index over a relationship store.
@@ -281,23 +280,74 @@ func (a *Adj) Expand(src uint64, relType uint32, d Dir) ([]Neighbor, error) {
 // deletes — a deleted or not-yet-visible edge is simply one the predicate drops.
 func (a *Adj) ExpandWith(src uint64, relType uint32, d Dir, visible func(edge uint64) bool) ([]Neighbor, error) {
 	s := slot(relType, d)
-	var out []Neighbor
 
 	run, err := a.baseRun(s, src)
 	if err != nil {
 		return nil, err
 	}
-	for _, nb := range run {
-		if visible(nb.Edge) {
-			out = append(out, nb)
+	delta := a.delta[s][src]
+
+	// Both the base run and the delta are stored sorted by (node, edge): the base
+	// is packed sorted at checkpoint and the delta is kept sorted by addDelta's
+	// binary-search insert. Filtering by visibility only drops elements and so
+	// preserves order. So when there is no delta the surviving base is already
+	// sorted and needs no sort, and when there is one a single merge of the two
+	// sorted, visibility-filtered runs yields the sorted result without an
+	// O(n log n) sort over the whole list (doc 04 §12, "no sort step").
+	if len(delta) == 0 {
+		// Common case: no delta. The base run is stored sorted and visibility only
+		// drops elements, so if every edge is visible the run is already the exact
+		// answer. Walk it once and, only if an edge is invisible, fall back to a
+		// filtered copy from that point. With no deletions (the steady state) this
+		// returns the shared CSR run with zero allocation, so a hot scan that expands
+		// millions of nodes makes no per-node garbage and does not feed the collector.
+		// The returned slice aliases CSR memory; callers read it and never append to
+		// it (a write transaction holds the engine's exclusive lock, so no reader runs
+		// beside a checkpoint that could repack the run).
+		for k, nb := range run {
+			if !visible(nb.Edge) {
+				out := make([]Neighbor, 0, len(run))
+				out = append(out, run[:k]...)
+				for _, nb := range run[k+1:] {
+					if visible(nb.Edge) {
+						out = append(out, nb)
+					}
+				}
+				return out, nil
+			}
+		}
+		return run, nil
+	}
+
+	out := make([]Neighbor, 0, len(run)+len(delta))
+	i, j := 0, 0
+	for i < len(run) && j < len(delta) {
+		if !visible(run[i].Edge) {
+			i++
+			continue
+		}
+		if !visible(delta[j].Edge) {
+			j++
+			continue
+		}
+		if cmpNeighbor(run[i], delta[j]) <= 0 {
+			out = append(out, run[i])
+			i++
+		} else {
+			out = append(out, delta[j])
+			j++
 		}
 	}
-	for _, nb := range a.delta[s][src] {
-		if visible(nb.Edge) {
-			out = append(out, nb)
+	for ; i < len(run); i++ {
+		if visible(run[i].Edge) {
+			out = append(out, run[i])
 		}
 	}
-	slices.SortFunc(out, cmpNeighbor)
+	for ; j < len(delta); j++ {
+		if visible(delta[j].Edge) {
+			out = append(out, delta[j])
+		}
+	}
 	return out, nil
 }
 
@@ -352,12 +402,14 @@ func (a *Adj) baseRun(s uint32, src uint64) ([]Neighbor, error) {
 	if b == nil || src+1 >= offLen {
 		return nil, nil
 	}
+	// The base is stored as one AoS run built once at decode time, so a source's run
+	// is a sub-slice of it: returning the view allocates nothing per call. ExpandWith
+	// returns this slice straight through in the no-delta steady state, so the hot
+	// per-edge expand never materializes a neighbor list. The slice aliases cached
+	// memory; callers read it and never append (a checkpoint that repacks the run
+	// holds the engine's exclusive lock, so no reader runs beside it).
 	lo, hi := b.off[src], b.off[src+1]
-	out := make([]Neighbor, 0, hi-lo)
-	for k := lo; k < hi; k++ {
-		out = append(out, Neighbor{Node: b.nbr[k], Edge: b.edg[k]})
-	}
-	return out, nil
+	return b.nb[lo:hi], nil
 }
 
 // openBase decodes and caches a slot's base arrays from its directory cell. It
@@ -404,7 +456,14 @@ func (a *Adj) openBase(s uint32) (*base, uint64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	b := &base{off: off, nbr: nbr, edg: edg}
+	// Build the AoS run once here, at decode time and under no lock, so every later
+	// run lookup for this slot returns a zero-copy sub-slice instead of rebuilding a
+	// neighbor list per call. The two source arrays are dropped after this.
+	nb := make([]Neighbor, len(nbr))
+	for i := range nb {
+		nb[i] = Neighbor{Node: nbr[i], Edge: edg[i]}
+	}
+	b := &base{off: off, nb: nb}
 
 	a.cacheMu.Lock()
 	defer a.cacheMu.Unlock()

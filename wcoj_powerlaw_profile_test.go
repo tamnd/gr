@@ -53,7 +53,7 @@ const plTriangleDirected = "MATCH (a:N)-[:R]->(b:N)-[:R]->(c:N)-[:R]->(a) RETURN
 
 // TestWcojFusedTriangleCount checks the fused triangle count against a brute-force
 // enumeration over a real skewed graph, so the zero-materialization anchor path
-// (fusedIntersectCountOp) is exercised on the same degree distribution graph-bench
+// (intersectCountOp's direct-from-scan merge-intersect) is exercised on the same degree distribution graph-bench
 // feeds it, hubs and all, not just the tiny hand-built fixture. It reads every edge
 // out through the public API, builds the adjacency in the test, counts directed
 // triangles the obvious way, and asserts the engine's count matches.

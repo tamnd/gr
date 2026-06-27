@@ -141,7 +141,7 @@ func (p *Pager) reuse(id format.PageID, t format.PageType) (*Frame, error) {
 	zero(f.Data)
 	format.WriteHeader(f.Data, format.PageHeader{Type: t})
 	f.dirty = true
-	f.ref = true
+	f.ref.Store(true)
 	return f, nil
 }
 

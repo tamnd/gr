@@ -89,6 +89,8 @@ func autoConstraintName(prefix, label, prop string) string {
 func (e *DiskEngine) CreateUniqueConstraint(name, label, prop string, ifNotExists bool) (bool, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.p.BeginWrite()
+	defer e.p.EndWrite()
 	if name == "" {
 		name = autoConstraintName("unique", label, prop)
 	}
@@ -141,6 +143,8 @@ func (e *DiskEngine) CreateUniqueConstraint(name, label, prop string, ifNotExist
 func (e *DiskEngine) CreateExistenceConstraint(name, label, prop string, ifNotExists bool) (bool, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.p.BeginWrite()
+	defer e.p.EndWrite()
 	if name == "" {
 		name = autoConstraintName("exists", label, prop)
 	}
@@ -196,6 +200,8 @@ func (e *DiskEngine) CreateExistenceConstraint(name, label, prop string, ifNotEx
 func (e *DiskEngine) CreateTypeConstraint(name, label, prop string, vt value.Type, ifNotExists bool) (bool, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.p.BeginWrite()
+	defer e.p.EndWrite()
 	if name == "" {
 		name = autoConstraintName("type", label, prop)
 	}
@@ -244,6 +250,8 @@ func (e *DiskEngine) CreateTypeConstraint(name, label, prop string, vt value.Typ
 func (e *DiskEngine) DropConstraint(name string, ifExists bool) (bool, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.p.BeginWrite()
+	defer e.p.EndWrite()
 	if _, ok := e.cat.ConstraintByName(name); !ok {
 		if ifExists {
 			return false, nil

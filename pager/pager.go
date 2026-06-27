@@ -118,16 +118,57 @@ type StorePageIO struct {
 
 // Frame is a cached page. Callers read and mutate Data (the full page image),
 // call Pager.MarkDirty after mutating, and Unpin when done.
+//
+// pin and ref are atomic so the read path can pin a resident frame and set its
+// reference bit while holding only the pool's read lock, and Unpin can release a
+// pin with no lock at all (doc 12 §10). Many morsel-parallel reader goroutines
+// share one snapshot, so a per-read mutex on these counters serializes them; the
+// atomics let concurrent readers of resident pages proceed without parking on a
+// lock. dirty is written only on the write path under the engine's exclusive
+// lock, so it stays a plain field.
 type Frame struct {
 	id    format.PageID
 	Data  []byte
-	pin   int
+	pin   atomic.Int32
 	dirty bool
-	ref   bool // clock reference bit
+	ref   atomic.Bool // clock reference bit
 }
 
 // ID returns the page id of the frame.
 func (f *Frame) ID() format.PageID { return f.id }
+
+// pageTable maps a page id to its resident frame. The pager swaps it atomically
+// (copy-on-write) so a read hit can index it lock-free; see Pager.lookup.
+type pageTable = map[format.PageID]*Frame
+
+// counterShards is the number of cache lines a stripedCounter spreads its writes
+// over. A power of two so the page-id index is a mask, not a divide; 64 is enough
+// to scatter a working set's worth of pages across distinct lines on the core
+// counts gr runs morsels on.
+const counterShards = 64
+
+// stripedCounter is a monotonically increasing counter sharded across cache lines
+// to remove the false sharing a single hot atomic suffers under many writers. Each
+// shard is padded to its own 64-byte line so incrementing one never invalidates
+// another. Add takes a key (a page id) and increments the shard that key hashes to,
+// so reads of distinct pages land on distinct lines; Sum totals the shards and is
+// only called for metrics, off the hot path.
+type stripedCounter struct {
+	shards [counterShards]struct {
+		v atomic.Uint64
+		_ [56]byte // pad atomic.Uint64 (8B) out to a full cache line
+	}
+}
+
+func (c *stripedCounter) Add(key uint64) { c.shards[key&(counterShards-1)].v.Add(1) }
+
+func (c *stripedCounter) Sum() uint64 {
+	var total uint64
+	for i := range c.shards {
+		total += c.shards[i].v.Load()
+	}
+	return total
+}
 
 // Pager is the pager and buffer pool.
 type Pager struct {
@@ -141,18 +182,23 @@ type Pager struct {
 	sync     wal.SyncLevel
 	readOnly bool
 
-	// mu guards the buffer pool (pool, clock, hand) and the per-frame pin and ref
-	// fields against concurrent readers. A write transaction holds the engine's
-	// exclusive lock so it never races a reader, but morsel-parallel execution
-	// runs many reader goroutines against one snapshot, and each ReadPage/Unpin
-	// mutates the shared pool and a frame's pin count, so the read path needs its
-	// own lock below the engine's shared read lock. It is taken only by the leaf
-	// methods (ReadPage, Unpin) and the admit/evict helpers they call; the
-	// write-path helpers (AllocPage, FreePage, popFree, reuse) run under the
-	// engine write lock and reach the pool only through those leaf methods, so
-	// they never hold mu themselves and cannot re-enter it.
+	// lookup is the page table: page id to resident frame. It is an atomically
+	// swapped immutable map so a read hit is lock-free: ReadPage loads the pointer
+	// (a shared-line read that never invalidates another core's cache) and indexes
+	// the map, with no lock and no shared-line write, so every morsel-parallel reader
+	// scales without contending (doc 12 §10). A reader that misses must mutate the
+	// table; it does so under mu by cloning the map, adding the frame, and storing the
+	// new pointer (copy-on-write), so a concurrent reader keeps reading the old map
+	// safely. A write transaction holds the engine's exclusive lock, so no reader runs
+	// beside it and it mutates the live map in place (no clone), keeping a bulk load
+	// O(1) per page.
+	//
+	// mu guards the clock ring (clock, hand) and serializes the table mutators
+	// (admit, evict, the COW store) among writers and missing readers; the lock-free
+	// read hit never takes it. Unpin touches only a frame's own atomic and takes no
+	// lock either.
 	mu       sync.Mutex
-	pool     map[format.PageID]*Frame
+	lookup   atomic.Pointer[pageTable]
 	clock    []*Frame
 	hand     int
 	maxPool  int
@@ -160,11 +206,25 @@ type Pager struct {
 
 	// hits and misses are the cumulative buffer-pool lookup outcomes since open, the page-table
 	// hit rate that is the single most important storage metric (doc 20 §4.1). A hit is a ReadPage
-	// that found the page resident; a miss is one that faulted it from disk. They are bumped under
-	// mu on the ReadPage paths, so a snapshot reads a consistent pair under the one lock the pool
-	// already uses, and the pager never reaches up into the metric registry.
-	hits   uint64
-	misses uint64
+	// that found the page resident; a miss is one that faulted it from disk. hits is striped across
+	// cache lines and indexed by page id: a single shared counter incremented on every hit would
+	// bounce one cache line between every morsel-parallel worker (millions of hits per scan), which
+	// alone serialized the parallel read path; striping by page id spreads the writes so resident-set
+	// reads on distinct pages touch distinct lines (doc 12 §10). PoolStats sums the shards. misses are
+	// rare (one fault per page), so a single counter is fine.
+	hits   stripedCounter
+	misses atomic.Uint64
+
+	// writers counts the write transactions currently holding the engine's exclusive
+	// lock (it is 0 or 1 in practice). A reader pins a frame to keep eviction from
+	// dropping a page it still holds; but evict never recycles a frame's buffer, and
+	// a writer holds the engine's exclusive lock so no reader runs beside it, so among
+	// the morsel-parallel readers an unpinned frame is still safe to read: each holds
+	// the *Frame and copies out of its stable, snapshot-frozen bytes. So ReadPage pins
+	// only while a writer is active (single-threaded, uncontended); a read-only scan
+	// skips the per-frame pin atomic that otherwise ping-pongs one cache line across
+	// every reader core (doc 12 §10). The engine bumps it around its write sections.
+	writers atomic.Int32
 
 	// pagesWritten is the cumulative count of page images Commit has copied into the database file
 	// since open, the write-back volume the checkpoint metrics attribute to a fold (doc 20 §5.4). Each
@@ -231,11 +291,12 @@ func Open(fsys vfs.VFS, path string, opt Options) (*Pager, error) {
 		walPath:  path + "-wal",
 		sync:     opt.Sync,
 		readOnly: opt.ReadOnly,
-		pool:     make(map[format.PageID]*Frame),
 		maxPool:  opt.MaxPoolPages,
 		saltNext: opt.SaltSeed + 1,
 		io:       opt.PageIO,
 	}
+	empty := make(pageTable)
+	p.lookup.Store(&empty)
 
 	if created {
 		if err := p.initNew(opt.PageSize, opt.SaltSeed); err != nil {

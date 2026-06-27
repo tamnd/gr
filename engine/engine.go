@@ -49,6 +49,48 @@ type Neighbor struct {
 	Type Token
 }
 
+// PosNeighbor is one edge for the merge-intersection path (the worst-case-optimal
+// triangle join): like Neighbor but it also carries Pos, the reached node's dense
+// internal position. Pos is the stable global key two adjacency lists are sorted
+// on, so two nodes' neighbor lists can be merge-intersected on Pos without a
+// re-sort. Node and Rel are the external element ids used when a match is emitted.
+type PosNeighbor struct {
+	Pos  uint64
+	Rel  RelID
+	Node NodeID
+	Type Token
+}
+
+// Adjacency is an optional Tx capability: it returns a node's snapshot-visible
+// neighbors as a slice sorted ascending by dense position (PosNeighbor.Pos), the
+// shape the intersection operator merges two of. The caller passes a scratch slice
+// to fill (its capacity is reused, contents overwritten); the returned slice
+// aliases that scratch and is valid until the next call that reuses it, so a
+// caller intersecting two lists passes two distinct buffers. A Tx that does not
+// implement Adjacency falls back to the callback Expand path.
+type Adjacency interface {
+	NeighborsByPos(id NodeID, relType Token, dir Direction, buf []PosNeighbor) ([]PosNeighbor, error)
+}
+
+// AdjacencyReader is an optional Tx capability for callers that make many
+// NeighborsByPos calls in a tight loop (the triangle count's per-edge neighbor
+// fetch). NewNeighborReader returns a stateful reader that binds its liveness
+// cursor and visibility predicate once, so each call allocates neither, unlike the
+// per-call Adjacency path that rebuilds both. A reader is single-goroutine: a
+// parallel operator gives each worker its own and Closes it when the worker ends.
+type AdjacencyReader interface {
+	NewNeighborReader() NeighborReader
+}
+
+// NeighborReader is one worker's reusable neighbor reader (see AdjacencyReader).
+// NeighborsByPos has the same contract as Adjacency.NeighborsByPos; Close releases
+// any page the reader's cursor still holds and must be called when the worker is
+// done.
+type NeighborReader interface {
+	NeighborsByPos(id NodeID, relType Token, dir Direction, buf []PosNeighbor) ([]PosNeighbor, error)
+	Close()
+}
+
 // Predicate is a pushed-down property test for predicate scans (doc 04 §6.6).
 // A nil Predicate matches everything.
 type Predicate func(value.Value) bool

@@ -99,7 +99,7 @@ func TestPagerPinningNeverEvicts(t *testing.T) {
 		}
 	}
 	// The pinned frame must still be resident and the same object.
-	if got, ok := p.pool[pinned.ID()]; !ok || got != pinned {
+	if got, ok := (*p.lookup.Load())[pinned.ID()]; !ok || got != pinned {
 		t.Fatal("pinned frame was evicted")
 	}
 	p.Unpin(pinned)

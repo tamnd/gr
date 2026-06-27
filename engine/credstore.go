@@ -37,6 +37,8 @@ func (e *DiskEngine) CredentialBlob() ([]byte, error) {
 func (e *DiskEngine) SetCredentialBlob(blob []byte) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.p.BeginWrite()
+	defer e.p.EndWrite()
 	oldHead, oldLen, err := e.secs.Get(store.SecCredentials)
 	if err != nil {
 		return err

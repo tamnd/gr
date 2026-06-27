@@ -99,6 +99,24 @@ func (s *Store) Exists(pos uint64) bool {
 	return rec[0]&flagLive != 0
 }
 
+// ExistsVia reports liveness like Exists but reads the record's flag byte in place
+// through a page-retaining cursor, so a scan over a node's position-sorted edges
+// checks a whole rel page's worth of liveness with one pager lookup instead of one
+// per edge (doc 12 §10). ReleaseCursor drops the held page when the scan ends.
+func (s *Store) ExistsVia(pos uint64, c *store.Cursor) bool {
+	if pos >= uint64(s.recs.Count()) {
+		return false
+	}
+	rec, err := s.recs.ElemVia(int(pos), c)
+	if err != nil {
+		return false
+	}
+	return rec[0]&flagLive != 0
+}
+
+// ReleaseCursor releases the page a liveness cursor holds. See ExistsVia.
+func (s *Store) ReleaseCursor(c *store.Cursor) { s.recs.Release(c) }
+
 // Delete marks the relationship at pos deleted. Its position is not reclaimed in M1.
 func (s *Store) Delete(pos uint64) error {
 	rec, err := s.readRec(pos)
